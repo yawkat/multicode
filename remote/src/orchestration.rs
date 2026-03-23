@@ -1154,7 +1154,6 @@ fn build_rsync_base_args(
 
 fn build_rsync_common_args(_options: &RemoteCliOptions, show_progress: bool) -> Vec<String> {
     let mut args = vec![
-        "--ignore-missing-args".to_string(),
         "--recursive".to_string(),
         "--perms".to_string(),
         "--times".to_string(),
@@ -1756,7 +1755,6 @@ mod tests {
                 false,
             ),
             vec![
-                "--ignore-missing-args".to_string(),
                 "--recursive".to_string(),
                 "--perms".to_string(),
                 "--times".to_string(),
@@ -1780,7 +1778,6 @@ mod tests {
             )
             .expect("directory sync args should build"),
             vec![
-                "--ignore-missing-args".to_string(),
                 "--recursive".to_string(),
                 "--perms".to_string(),
                 "--times".to_string(),
@@ -1809,7 +1806,6 @@ mod tests {
                 false,
             ),
             vec![
-                "--ignore-missing-args".to_string(),
                 "--recursive".to_string(),
                 "--perms".to_string(),
                 "--times".to_string(),
@@ -1832,7 +1828,6 @@ mod tests {
                 false
             ),
             vec![
-                "--ignore-missing-args".to_string(),
                 "--recursive".to_string(),
                 "--perms".to_string(),
                 "--times".to_string(),
