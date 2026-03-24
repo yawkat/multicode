@@ -29,6 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          set -x
           stage_root="target/artifacts/linux"
           rm -rf "$stage_root"
           mkdir -p "$stage_root/target/multicode-remote"
@@ -100,17 +101,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          set -x
+          echo "Linux artifact tree:"
+          find target/downloads/linux -maxdepth 5 -print | sort
+          echo "macOS artifact tree:"
+          find target/downloads/macos -maxdepth 5 -print | sort
+          echo "Copying config.toml from Linux assets"
           cp target/downloads/linux/config.toml config.toml
+          echo "Copying staged TUI directory from Linux assets"
           mkdir -p target/multicode-remote
           cp -R target/downloads/linux/target/multicode-remote/tui target/multicode-remote/
+          echo "Copying Linux multicode-remote binary"
           mkdir -p target/x86_64-unknown-linux-gnu/release
           cp target/downloads/linux/target/x86_64-unknown-linux-gnu/release/multicode-remote target/x86_64-unknown-linux-gnu/release/multicode-remote
+          echo "Copying macOS multicode-remote binary"
           mkdir -p target/aarch64-apple-darwin/release
           cp target/downloads/macos/target/aarch64-apple-darwin/release/multicode-remote target/aarch64-apple-darwin/release/multicode-remote
+          echo "Restoring executable bits on restored binaries"
+          chmod +x target/x86_64-unknown-linux-gnu/release/multicode-remote
+          chmod +x target/aarch64-apple-darwin/release/multicode-remote
+          chmod +x target/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui
+          chmod +x target/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui
+          echo "Verifying restored config.toml"
           test -f config.toml
+          echo "Verifying restored Linux multicode-remote binary"
           test -x target/x86_64-unknown-linux-gnu/release/multicode-remote
+          echo "Verifying restored macOS multicode-remote binary"
           test -x target/aarch64-apple-darwin/release/multicode-remote
+          echo "Verifying restored x86_64 Linux TUI binary"
           test -x target/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui
+          echo "Verifying restored aarch64 Linux TUI binary"
           test -x target/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui
 
       - name: Build bundle zip
