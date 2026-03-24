@@ -569,6 +569,223 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
 }
 
 #[test]
+fn docker_remote_flow_syncs_added_skills_and_rewrites_remote_config() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build");
+
+    runtime.block_on(async {
+        ensure_command_available("docker", &(["version"] as [&str; 1]));
+        ensure_command_available("ssh", &(["-V"] as [&str; 1]));
+        ensure_command_available("rsync", &(["--version"] as [&str; 1]));
+        ensure_binary_exists("ssh-keygen");
+
+        let root = TestDir::new();
+        let workspace_skills = root.path().join("workspace-skills");
+        let skill_alpha = workspace_skills.join("skill-alpha");
+        let skill_beta = workspace_skills.join("skill-beta");
+        fs::create_dir_all(&skill_alpha).expect("first skill should exist");
+        fs::create_dir_all(&skill_beta).expect("second skill should exist");
+        fs::write(skill_alpha.join("SKILL.md"), "# Alpha\nAlpha body\n")
+            .expect("first skill file should exist");
+        fs::write(skill_beta.join("SKILL.md"), "# Beta\nBeta body\n")
+            .expect("second skill file should exist");
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root should exist")
+            .to_path_buf();
+        let build_status = StdCommand::new("cargo")
+            .args(["build", "-p", "multicode-tui"])
+            .current_dir(&repo_root)
+            .status()
+            .expect("cargo build for multicode-tui should run");
+        assert!(build_status.success(), "multicode-tui should build for integration test");
+        let probe_binary = repo_root.join("target/debug/multicode-tui");
+        assert!(probe_binary.exists(), "built multicode-tui binary should exist");
+
+        let config_path = root.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "workspace-directory = \"~/agent-work\"\ncreate-ssh-agent = true\n\n[isolation]\nadd-skills-from = [\"./workspace-skills\"]\n\n[handler]\nweb = \"/bin/true {{}}\"\n\n[remote]\nforward-ssh-agent = true\n\n[remote.install]\ncommand = \"mkdir -p ~/agent-work && printf install-ran > ~/.install-marker\"\n",
+            ),
+        )
+        .expect("config should be written");
+
+        let key_path = root.path().join("id_ed25519");
+        let pub_key_path = root.path().join("id_ed25519.pub");
+        let known_hosts = root.path().join("known_hosts");
+        let keygen = StdCommand::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key_path)
+            .status()
+            .expect("ssh-keygen should run");
+        assert!(keygen.success(), "ssh-keygen should succeed");
+        let public_key = fs::read_to_string(&pub_key_path).expect("public key should exist");
+
+        let dockerfile = root.path().join("Dockerfile");
+        fs::write(
+            &dockerfile,
+            r#"FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y openssh-server rsync ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+"#,
+        )
+        .expect("dockerfile should be written");
+
+        let image = format!("multicode-remote-test-added-skills:{}", std::process::id());
+        let build = StdCommand::new("docker")
+            .args(["build", "-t", &image, "."])
+            .current_dir(root.path())
+            .status()
+            .expect("docker build should run");
+        assert!(build.success(), "docker build should succeed");
+
+        let port = reserve_tcp_port();
+        let container_name = format!("multicode-remote-test-added-skills-{}", std::process::id());
+        let run = StdCommand::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &container_name,
+                "-p",
+                &format!("127.0.0.1:{port}:22"),
+                "-e",
+                &format!("AUTHORIZED_KEY={}", public_key.trim()),
+                &image,
+                "/bin/sh",
+                "-lc",
+                "mkdir -p /root/.ssh && chmod 700 /root/.ssh && printf '%s\n' \"$AUTHORIZED_KEY\" > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e",
+            ])
+            .status()
+            .expect("docker run should execute");
+        assert!(run.success(), "docker run should succeed");
+        let _container = DockerContainerGuard { name: container_name.clone() };
+
+        wait_for_ssh(port, &key_path, &known_hosts).await;
+
+        let args = CliArgs {
+            config_path: config_path.clone(),
+            ssh_uri: "root@127.0.0.1".to_string(),
+        };
+        let options = RemoteCliOptions {
+            ssh_port: Some(port),
+            ssh_identity_file: Some(key_path.clone()),
+            ssh_known_hosts_file: Some(known_hosts.clone()),
+            ssh_strict_host_key_checking: false,
+            remote_tui_sanity_check: true,
+        };
+        let deps = RemoteCliDependencies {
+            local_tui_binary_override: Some(probe_binary.clone()),
+            local_tui_stage_root_override: None,
+        };
+
+        let result = run_remote_cli(args, options, deps)
+            .await
+            .expect("remote cli flow should succeed with added skills");
+
+        let remote_skill_tree = Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                &format!("UserKnownHostsFile={}", known_hosts.display()),
+                "-i",
+                &key_path.to_string_lossy(),
+                "-p",
+                &port.to_string(),
+                "root@127.0.0.1",
+                "sh",
+                "-lc",
+                "find /root/agent-work/.multicode/remote/added-skills -maxdepth 3 -type f -name SKILL.md | sort",
+            ])
+            .output()
+            .await
+            .expect("remote skill tree probe should run");
+        assert!(remote_skill_tree.status.success(), "remote skill probe should succeed");
+        let remote_skill_tree_stdout = String::from_utf8_lossy(&remote_skill_tree.stdout);
+        assert!(
+            remote_skill_tree_stdout.contains("./agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha/SKILL.md"),
+            "first skill should exist remotely: {remote_skill_tree_stdout}"
+        );
+        assert!(
+            remote_skill_tree_stdout.contains("./agent-work/.multicode/remote/added-skills/workspace-skills/skill-beta/SKILL.md"),
+            "second skill should exist remotely: {remote_skill_tree_stdout}"
+        );
+
+        let rewritten_config = Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                &format!("UserKnownHostsFile={}", known_hosts.display()),
+                "-i",
+                &key_path.to_string_lossy(),
+                "-p",
+                &port.to_string(),
+                "root@127.0.0.1",
+                "cat",
+                &result.remote_config_path.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .expect("rewritten remote config probe should run");
+        assert!(rewritten_config.status.success(), "rewritten remote config should be readable");
+        let rewritten_config_stdout = String::from_utf8_lossy(&rewritten_config.stdout);
+        assert!(
+            rewritten_config_stdout.contains("add_skills_from = [\"added-skills/workspace-skills\"]"),
+            "rewritten config should point remote opencode at synced skills root: {rewritten_config_stdout}"
+        );
+
+        let remote_skill_alpha = Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                &format!("UserKnownHostsFile={}", known_hosts.display()),
+                "-i",
+                &key_path.to_string_lossy(),
+                "-p",
+                &port.to_string(),
+                "root@127.0.0.1",
+                "cat",
+                "/root/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha/SKILL.md",
+            ])
+            .output()
+            .await
+            .expect("remote alpha skill probe should run");
+        assert!(remote_skill_alpha.status.success(), "first remote skill should be readable");
+        let remote_skill_alpha_stdout = String::from_utf8_lossy(&remote_skill_alpha.stdout);
+        assert!(remote_skill_alpha_stdout.contains("# Alpha"), "first skill content should be readable remotely: {remote_skill_alpha_stdout}");
+
+        let remote_skill_beta = Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                &format!("UserKnownHostsFile={}", known_hosts.display()),
+                "-i",
+                &key_path.to_string_lossy(),
+                "-p",
+                &port.to_string(),
+                "root@127.0.0.1",
+                "cat",
+                "/root/agent-work/.multicode/remote/added-skills/workspace-skills/skill-beta/SKILL.md",
+            ])
+            .output()
+            .await
+            .expect("remote beta skill probe should run");
+        assert!(remote_skill_beta.status.success(), "second remote skill should be readable");
+        let remote_skill_beta_stdout = String::from_utf8_lossy(&remote_skill_beta.stdout);
+        assert!(remote_skill_beta_stdout.contains("# Beta"), "second skill content should be readable remotely: {remote_skill_beta_stdout}");
+    });
+}
+
+#[test]
 fn docker_remote_flow_skips_bidi_upload_when_remote_tree_is_newer() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

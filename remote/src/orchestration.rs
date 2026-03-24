@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -158,10 +158,10 @@ async fn run_remote_session(
         mapping_count = config.config_support_sync_up.len(),
         "syncing config support paths"
     );
-    sync_mappings_up(args, &config.config_support_sync_up, options).await?;
+    sync_skill_mappings_up(args, &config.config_support_sync_up, options).await?;
     info!("syncing rewritten remote config file");
     sync_remote_config_file(args, config, options).await?;
-    sync_mappings_up(args, &config.config_support_sync_up, options).await?;
+    sync_skill_mappings_up(args, &config.config_support_sync_up, options).await?;
     info!(
         mapping_count = config.sync_up.len(),
         "syncing upload-only paths"
@@ -435,11 +435,78 @@ async fn sync_mappings_up(
     mappings: &[ResolvedSyncPathMapping],
     options: &RemoteCliOptions,
 ) -> io::Result<()> {
+    ensure_remote_directory_mapping_parents_exist(args, mappings, options).await?;
     for mapping in mappings {
         ensure_local_sync_source_exists(mapping)?;
         run_rsync_command(
             build_rsync_up_args(&args.ssh_uri, mapping, options, true)?,
             format!("rsync upload for '{}'", mapping.local.display()),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sync_skill_mappings_up(
+    args: &CliArgs,
+    mappings: &[ResolvedSyncPathMapping],
+    options: &RemoteCliOptions,
+) -> io::Result<()> {
+    ensure_remote_directory_mapping_targets_exist(args, mappings, options).await?;
+    for mapping in mappings {
+        ensure_local_sync_source_exists(mapping)?;
+        run_rsync_command(
+            build_rsync_skill_up_args(&args.ssh_uri, mapping, options, true)?,
+            format!("rsync upload for '{}'", mapping.local.display()),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_remote_directory_mapping_parents_exist(
+    args: &CliArgs,
+    mappings: &[ResolvedSyncPathMapping],
+    options: &RemoteCliOptions,
+) -> io::Result<()> {
+    let parents = mappings
+        .iter()
+        .filter(|mapping| mapping.local_is_dir)
+        .map(|mapping| {
+            mapping.remote.parent().ok_or_else(|| {
+                io::Error::other(format!(
+                    "directory sync destination '{}' has no parent",
+                    mapping.remote.display()
+                ))
+            })
+        })
+        .collect::<io::Result<BTreeSet<_>>>()?;
+    for parent in parents {
+        run_ssh_command(
+            args,
+            options,
+            &format!("mkdir -p {}", shell_single_quote(&parent.to_string_lossy())),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_remote_directory_mapping_targets_exist(
+    args: &CliArgs,
+    mappings: &[ResolvedSyncPathMapping],
+    options: &RemoteCliOptions,
+) -> io::Result<()> {
+    let targets = mappings
+        .iter()
+        .filter(|mapping| mapping.local_is_dir)
+        .map(|mapping| mapping.remote.as_path())
+        .collect::<BTreeSet<_>>();
+    for target in targets {
+        run_ssh_command(
+            args,
+            options,
+            &format!("mkdir -p {}", shell_single_quote(&target.to_string_lossy())),
         )
         .await?;
     }
@@ -923,7 +990,9 @@ fn resolve_added_skill_sync_mappings(
             }
             mappings.insert(
                 std::fs::canonicalize(entry.path())?,
-                remote_skills_root.join(remote_relative_dir),
+                remote_skills_root
+                    .join(remote_relative_dir)
+                    .join(entry.file_name()),
             );
         }
     }
@@ -954,7 +1023,7 @@ fn rewrite_remote_config(
                 .remote
                 .parent()
                 .and_then(|parent| parent.strip_prefix(&remote_support_root).ok())
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(normalize_relative_remote_support_path)
                 .ok_or_else(|| {
                     io::Error::other(format!(
                         "remote added-skill path '{}' is outside support root '{}'",
@@ -969,6 +1038,16 @@ fn rewrite_remote_config(
     rewritten_paths.dedup();
     rewritten.isolation.add_skills_from = rewritten_paths;
     Ok(rewritten)
+}
+
+fn normalize_relative_remote_support_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn build_ssh_base_args(ssh_uri: &str, options: &RemoteCliOptions) -> Vec<String> {
@@ -1106,7 +1185,36 @@ fn build_rsync_up_args(
 ) -> io::Result<Vec<String>> {
     let mut args = build_rsync_mapping_args(ssh_uri, mapping, options, show_progress);
     args.push("--update".to_string());
-    args.push("--mkpath".to_string());
+    for exclude in &mapping.exclude {
+        args.push("--exclude".to_string());
+        args.push(exclude.clone());
+    }
+    if mapping.local_is_dir {
+        args.push(ensure_local_dir_suffix(&mapping.local));
+        let remote_dir = mapping
+            .remote
+            .parent()
+            .ok_or_else(|| io::Error::other(format!("directory sync destination '{}' has no parent", mapping.remote.display())))?;
+        args.push(format!(
+            "{ssh_uri}:{}",
+            ensure_remote_dir_suffix(remote_dir)
+        ));
+    } else {
+        args.push("--mkpath".to_string());
+        args.push(mapping.local.to_string_lossy().into_owned());
+        args.push(format!("{ssh_uri}:{}", mapping.remote.to_string_lossy()));
+    }
+    Ok(args)
+}
+
+fn build_rsync_skill_up_args(
+    ssh_uri: &str,
+    mapping: &ResolvedSyncPathMapping,
+    options: &RemoteCliOptions,
+    show_progress: bool,
+) -> io::Result<Vec<String>> {
+    let mut args = build_rsync_mapping_args(ssh_uri, mapping, options, show_progress);
+    args.push("--update".to_string());
     args.push("--delete".to_string());
     for exclude in &mapping.exclude {
         args.push("--exclude".to_string());
@@ -1119,6 +1227,7 @@ fn build_rsync_up_args(
             ensure_remote_dir_suffix(&mapping.remote)
         ));
     } else {
+        args.push("--mkpath".to_string());
         args.push(mapping.local.to_string_lossy().into_owned());
         args.push(format!("{ssh_uri}:{}", mapping.remote.to_string_lossy()));
     }
@@ -1663,7 +1772,7 @@ mod tests {
         assert_eq!(
             resolved.config_support_sync_up[0].remote,
             PathBuf::from(
-                "/home/alice/dev/agent-work/.multicode/remote/added-skills/extra-skills"
+                "/home/alice/dev/agent-work/.multicode/remote/added-skills/extra-skills/sample-skill"
             )
         );
 
@@ -1688,7 +1797,9 @@ mod tests {
             },
             &[ResolvedSyncPathMapping {
                 local: PathBuf::from("/tmp/local-skills/sample-skill"),
-                remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills"),
+                remote: PathBuf::from(
+                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/sample-skill",
+                ),
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
@@ -2097,6 +2208,135 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+    }
+
+    #[tokio::test]
+    async fn build_rsync_up_args_syncs_directories_into_parent_destination() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "multicode-remote-dir-sync-test-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let local_dir = temp_root.join("skill-alpha");
+        std::fs::create_dir_all(&local_dir).expect("local dir should be created");
+        let mapping = ResolvedSyncPathMapping {
+            local: local_dir.clone(),
+            remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha"),
+            exclude: Vec::new(),
+            dereference_symlinks: false,
+            local_is_dir: true,
+        };
+
+        let args = build_rsync_up_args(
+            "alice@example.com",
+            &mapping,
+            &RemoteCliOptions::default(),
+            false,
+        )
+        .expect("directory sync args should build");
+
+        assert!(args.iter().any(|arg| arg == &format!("{}/", local_dir.to_string_lossy())));
+        assert!(!args.iter().any(|arg| arg == "--mkpath"));
+        assert!(args.iter().any(|arg| {
+            arg == "alice@example.com:/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/"
+        }));
+
+        std::fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+    }
+
+    #[tokio::test]
+    async fn build_rsync_skill_up_args_syncs_directories_into_exact_skill_destination() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "multicode-remote-skill-dir-sync-test-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let local_dir = temp_root.join("skill-alpha");
+        std::fs::create_dir_all(&local_dir).expect("local dir should be created");
+        let mapping = ResolvedSyncPathMapping {
+            local: local_dir.clone(),
+            remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha"),
+            exclude: Vec::new(),
+            dereference_symlinks: false,
+            local_is_dir: true,
+        };
+
+        let args = build_rsync_skill_up_args(
+            "alice@example.com",
+            &mapping,
+            &RemoteCliOptions::default(),
+            false,
+        )
+        .expect("skill directory sync args should build");
+
+        assert!(args.iter().any(|arg| arg == &format!("{}/", local_dir.to_string_lossy())));
+        assert!(args.iter().any(|arg| {
+            arg == "alice@example.com:/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha/"
+        }));
+
+        std::fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn ensure_remote_directory_mapping_parents_exist_deduplicates_parents() {
+        let mappings = vec![
+            ResolvedSyncPathMapping {
+                local: PathBuf::from("/tmp/skill-alpha"),
+                remote: PathBuf::from(
+                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha",
+                ),
+                exclude: Vec::new(),
+                dereference_symlinks: false,
+                local_is_dir: true,
+            },
+            ResolvedSyncPathMapping {
+                local: PathBuf::from("/tmp/skill-beta"),
+                remote: PathBuf::from(
+                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-beta",
+                ),
+                exclude: Vec::new(),
+                dereference_symlinks: false,
+                local_is_dir: true,
+            },
+        ];
+
+        let command = mappings
+            .iter()
+            .filter(|mapping| mapping.local_is_dir)
+            .map(|mapping| mapping.remote.parent().expect("remote parent should exist"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(command.len(), 1);
+    }
+
+    #[test]
+    fn ensure_remote_directory_mapping_targets_exist_deduplicates_targets() {
+        let mappings = vec![
+            ResolvedSyncPathMapping {
+                local: PathBuf::from("/tmp/skill-alpha"),
+                remote: PathBuf::from(
+                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha",
+                ),
+                exclude: Vec::new(),
+                dereference_symlinks: false,
+                local_is_dir: true,
+            },
+            ResolvedSyncPathMapping {
+                local: PathBuf::from("/tmp/skill-alpha-copy"),
+                remote: PathBuf::from(
+                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha",
+                ),
+                exclude: Vec::new(),
+                dereference_symlinks: false,
+                local_is_dir: true,
+            },
+        ];
+
+        let command = mappings
+            .iter()
+            .filter(|mapping| mapping.local_is_dir)
+            .map(|mapping| mapping.remote.as_path())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(command.len(), 1);
     }
 
     #[tokio::test]
