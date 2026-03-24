@@ -436,11 +436,19 @@ async fn sync_mappings_up(
     options: &RemoteCliOptions,
 ) -> io::Result<()> {
     for mapping in mappings {
+        ensure_local_sync_source_exists(mapping)?;
         run_rsync_command(
             build_rsync_up_args(&args.ssh_uri, mapping, options, true)?,
             format!("rsync upload for '{}'", mapping.local.display()),
         )
         .await?;
+    }
+    Ok(())
+}
+
+fn ensure_local_sync_source_exists(mapping: &ResolvedSyncPathMapping) -> io::Result<()> {
+    if mapping.local_is_dir && !mapping.local.exists() {
+        std::fs::create_dir_all(&mapping.local)?;
     }
     Ok(())
 }
@@ -915,9 +923,7 @@ fn resolve_added_skill_sync_mappings(
             }
             mappings.insert(
                 std::fs::canonicalize(entry.path())?,
-                remote_skills_root
-                    .join(remote_relative_dir)
-                    .join(entry.file_name()),
+                remote_skills_root.join(remote_relative_dir),
             );
         }
     }
@@ -1657,15 +1663,15 @@ mod tests {
         assert_eq!(
             resolved.config_support_sync_up[0].remote,
             PathBuf::from(
-                "/home/alice/dev/agent-work/.multicode/remote/added-skills/extra-skills/sample-skill"
+                "/home/alice/dev/agent-work/.multicode/remote/added-skills/extra-skills"
             )
         );
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
-    #[tokio::test]
-    async fn rewrite_remote_config_rewrites_add_skills_from_to_remote_support_paths() {
+    #[test]
+    fn rewrite_remote_config_rewrites_add_skills_from_to_remote_support_paths() {
         let remote_workspace_directory = PathBuf::from("/home/alice/dev/agent-work");
         let rewritten = rewrite_remote_config(
             &Config {
@@ -1682,9 +1688,7 @@ mod tests {
             },
             &[ResolvedSyncPathMapping {
                 local: PathBuf::from("/tmp/local-skills/sample-skill"),
-                remote: PathBuf::from(
-                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/sample-skill",
-                ),
+                remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills"),
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
@@ -1910,6 +1914,29 @@ mod tests {
             Some(later)
         ));
         assert!(!should_sync_bidirectional_mapping_up(None, Some(now)));
+    }
+
+    #[test]
+    fn ensure_local_sync_source_exists_creates_missing_directory_sources() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "multicode-remote-missing-sync-source-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let missing = temp_root.join("nested").join("workspace");
+
+        ensure_local_sync_source_exists(&ResolvedSyncPathMapping {
+            local: missing.clone(),
+            remote: PathBuf::from("/remote/workspace"),
+            exclude: Vec::new(),
+            dereference_symlinks: false,
+            local_is_dir: true,
+        })
+        .expect("missing directory source should be created");
+
+        assert!(missing.is_dir());
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[tokio::test]
