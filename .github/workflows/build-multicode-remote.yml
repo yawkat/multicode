@@ -100,8 +100,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp -R target/downloads/linux/* .
-          cp -R target/downloads/macos/* .
+          cp target/downloads/linux/config.toml config.toml
+          mkdir -p target/multicode-remote
+          cp -R target/downloads/linux/target/multicode-remote/tui target/multicode-remote/
+          mkdir -p target/x86_64-unknown-linux-gnu/release
+          cp target/downloads/linux/target/x86_64-unknown-linux-gnu/release/multicode-remote target/x86_64-unknown-linux-gnu/release/multicode-remote
+          mkdir -p target/aarch64-apple-darwin/release
+          cp target/downloads/macos/target/aarch64-apple-darwin/release/multicode-remote target/aarch64-apple-darwin/release/multicode-remote
           test -f config.toml
           test -x target/x86_64-unknown-linux-gnu/release/multicode-remote
           test -x target/aarch64-apple-darwin/release/multicode-remote
