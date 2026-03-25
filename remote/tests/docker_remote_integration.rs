@@ -106,6 +106,268 @@ async fn wait_for_ssh(port: u16, key: &Path, known_hosts: &Path) {
     panic!("ssh server in docker container did not become ready");
 }
 
+#[derive(Clone, Copy)]
+enum BidiExistenceCase {
+    LocalAndRemoteMissing,
+    LocalOnly,
+    RemoteOnly,
+    LocalAndRemotePresent,
+}
+
+impl BidiExistenceCase {
+    fn test_name(self) -> &'static str {
+        match self {
+            Self::LocalAndRemoteMissing => "both-missing",
+            Self::LocalOnly => "local-only",
+            Self::RemoteOnly => "remote-only",
+            Self::LocalAndRemotePresent => "both-present",
+        }
+    }
+}
+
+fn build_probe_binary() -> PathBuf {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root should exist")
+        .to_path_buf();
+    let build_status = StdCommand::new("cargo")
+        .args(["build", "-p", "multicode-tui"])
+        .current_dir(&repo_root)
+        .status()
+        .expect("cargo build for multicode-tui should run");
+    assert!(build_status.success(), "multicode-tui should build for integration test");
+    let probe_binary = repo_root.join("target/debug/multicode-tui");
+    assert!(probe_binary.exists(), "built multicode-tui binary should exist");
+    probe_binary
+}
+
+async fn run_bidi_existence_case(case: BidiExistenceCase) {
+    ensure_command_available("docker", &(["version"] as [&str; 1]));
+    ensure_command_available("ssh", &(["-V"] as [&str; 1]));
+    ensure_command_available("rsync", &(["--version"] as [&str; 1]));
+    ensure_binary_exists("ssh-keygen");
+
+    let root = TestDir::new();
+    let bidi_local = root.path().join("agent-work-local");
+    let probe_binary = build_probe_binary();
+
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"workspace-directory = "~/agent-work"
+create-ssh-agent = true
+
+[isolation]
+
+[handler]
+web = "/bin/true {{}}"
+
+[remote]
+forward-ssh-agent = true
+
+[remote.install]
+command = "printf install-ran > ~/.install-marker"
+
+[[remote.sync-bidi]]
+local = "{}"
+remote = "~/agent-work"
+exclude = [".multicode/remote"]
+"#,
+            bidi_local.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let key_path = root.path().join("id_ed25519");
+    let pub_key_path = root.path().join("id_ed25519.pub");
+    let known_hosts = root.path().join("known_hosts");
+    let keygen = StdCommand::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key_path)
+        .status()
+        .expect("ssh-keygen should run");
+    assert!(keygen.success(), "ssh-keygen should succeed");
+    let public_key = fs::read_to_string(&pub_key_path).expect("public key should exist");
+
+    let dockerfile = root.path().join("Dockerfile");
+    fs::write(
+        &dockerfile,
+        r#"FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y openssh-server rsync ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+"#,
+    )
+    .expect("dockerfile should be written");
+
+    let image = format!("multicode-remote-test-bidi-matrix-{}:{}", case.test_name(), std::process::id());
+    let build = StdCommand::new("docker")
+        .args(["build", "-t", &image, "."])
+        .current_dir(root.path())
+        .status()
+        .expect("docker build should run");
+    assert!(build.success(), "docker build should succeed");
+
+    let port = reserve_tcp_port();
+    let container_name = format!("multicode-remote-test-bidi-matrix-{}-{}", case.test_name(), std::process::id());
+    let run = StdCommand::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            &container_name,
+            "-p",
+            &format!("127.0.0.1:{port}:22"),
+            "-e",
+            &format!("AUTHORIZED_KEY={}", public_key.trim()),
+            &image,
+            "/bin/sh",
+            "-lc",
+            r#"mkdir -p /root/.ssh && chmod 700 /root/.ssh && printf '%s\n' "$AUTHORIZED_KEY" > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e"#,
+        ])
+        .status()
+        .expect("docker run should execute");
+    assert!(run.success(), "docker run should succeed");
+    let _container = DockerContainerGuard { name: container_name.clone() };
+
+    wait_for_ssh(port, &key_path, &known_hosts).await;
+
+    match case {
+        BidiExistenceCase::LocalAndRemoteMissing => {}
+        BidiExistenceCase::LocalOnly => {
+            fs::create_dir_all(&bidi_local).expect("bidi local should exist");
+            fs::write(bidi_local.join("seed.txt"), "local-seed")
+                .expect("local seed file should exist");
+        }
+        BidiExistenceCase::RemoteOnly => {
+            let status = Command::new("ssh")
+                .args([
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    &format!("UserKnownHostsFile={}", known_hosts.display()),
+                    "-i",
+                    &key_path.to_string_lossy(),
+                    "-p",
+                    &port.to_string(),
+                    "root@127.0.0.1",
+                    r#"sh -lc 'mkdir -p /root/agent-work && printf remote-seed > /root/agent-work/seed.txt'"#,
+                ])
+                .status()
+                .await
+                .expect("remote seed setup should run");
+            assert!(status.success(), "remote seed setup should succeed");
+        }
+        BidiExistenceCase::LocalAndRemotePresent => {
+            fs::create_dir_all(&bidi_local).expect("bidi local should exist");
+            fs::write(bidi_local.join("seed.txt"), "local-seed")
+                .expect("local seed file should exist");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let status = Command::new("ssh")
+                .args([
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    &format!("UserKnownHostsFile={}", known_hosts.display()),
+                    "-i",
+                    &key_path.to_string_lossy(),
+                    "-p",
+                    &port.to_string(),
+                    "root@127.0.0.1",
+                    r#"sh -lc 'mkdir -p /root/agent-work && printf remote-seed > /root/agent-work/seed.txt'"#,
+                ])
+                .status()
+                .await
+                .expect("remote seed setup should run");
+            assert!(status.success(), "remote seed setup should succeed");
+        }
+    }
+
+    let args = CliArgs {
+        config_path: config_path.clone(),
+        ssh_uri: "root@127.0.0.1".to_string(),
+    };
+    let options = RemoteCliOptions {
+        ssh_port: Some(port),
+        ssh_identity_file: Some(key_path.clone()),
+        ssh_known_hosts_file: Some(known_hosts.clone()),
+        ssh_strict_host_key_checking: false,
+        remote_tui_sanity_check: true,
+    };
+    let deps = RemoteCliDependencies {
+        local_tui_binary_override: Some(probe_binary.clone()),
+        local_tui_stage_root_override: None,
+    };
+
+    run_remote_cli(args, options, deps)
+        .await
+        .expect("remote cli flow should succeed for bidi existence matrix case");
+
+    let remote_seed = Command::new("ssh")
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            &format!("UserKnownHostsFile={}", known_hosts.display()),
+            "-i",
+            &key_path.to_string_lossy(),
+            "-p",
+            &port.to_string(),
+            "root@127.0.0.1",
+            r#"sh -lc 'if [ -f /root/agent-work/seed.txt ]; then cat /root/agent-work/seed.txt; else true; fi'"#,
+        ])
+        .output()
+        .await
+        .expect("remote seed probe should run");
+    assert!(remote_seed.status.success(), "remote seed probe should succeed");
+    let remote_seed_text = String::from_utf8_lossy(&remote_seed.stdout).trim().to_string();
+
+    let remote_parent_probe = Command::new("ssh")
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            &format!("UserKnownHostsFile={}", known_hosts.display()),
+            "-i",
+            &key_path.to_string_lossy(),
+            "-p",
+            &port.to_string(),
+            "root@127.0.0.1",
+            "test ! -e /root/seed.txt",
+        ])
+        .status()
+        .await
+        .expect("remote parent probe should run");
+    assert!(remote_parent_probe.success(), "bidi sync must not place files in the remote parent directory");
+
+    let local_seed_path = bidi_local.join("seed.txt");
+    let local_seed_text = fs::read_to_string(&local_seed_path).ok().map(|text| text.trim().to_string());
+    assert!(
+        !bidi_local.parent().expect("bidi local parent should exist").join("seed.txt").exists(),
+        "bidi sync must not place files in the local parent directory"
+    );
+
+    match case {
+        BidiExistenceCase::LocalAndRemoteMissing => {
+            assert_eq!(remote_seed_text, "", "remote destination should remain empty when both sides start empty");
+            assert!(!local_seed_path.exists(), "local destination should remain empty when both sides start empty");
+        }
+        BidiExistenceCase::LocalOnly => {
+            assert_eq!(remote_seed_text, "local-seed", "initial upload should seed the exact remote destination from the local directory");
+            assert_eq!(local_seed_text.as_deref(), Some("local-seed"), "local seed should remain in the configured local directory");
+        }
+        BidiExistenceCase::RemoteOnly => {
+            assert_eq!(remote_seed_text, "remote-seed", "remote-only case should preserve the exact remote destination contents");
+            assert_eq!(local_seed_text.as_deref(), Some("remote-seed"), "final sync-down should place remote contents into the configured local directory");
+        }
+        BidiExistenceCase::LocalAndRemotePresent => {
+            assert_eq!(remote_seed_text, "remote-seed", "newer remote content should win within the configured remote destination");
+            assert_eq!(local_seed_text.as_deref(), Some("remote-seed"), "newer remote content should sync down into the configured local directory");
+        }
+    }
+}
+
 #[test]
 fn docker_remote_flow_syncs_and_launches_probe_binary() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -415,156 +677,50 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
 
 
 #[test]
-fn docker_remote_flow_creates_missing_remote_bidi_directory_before_initial_sync() {
+fn docker_remote_flow_bidi_sync_handles_both_missing() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime should build");
 
     runtime.block_on(async {
-        ensure_command_available("docker", &(["version"] as [&str; 1]));
-        ensure_command_available("ssh", &(["-V"] as [&str; 1]));
-        ensure_command_available("rsync", &(["--version"] as [&str; 1]));
-        ensure_binary_exists("ssh-keygen");
+        run_bidi_existence_case(BidiExistenceCase::LocalAndRemoteMissing).await;
+    });
+}
 
-        let root = TestDir::new();
-        let bidi_local = root.path().join("agent-work-local");
-        fs::create_dir_all(&bidi_local).expect("bidi local should exist");
-        fs::write(bidi_local.join("seed.txt"), "seed-data")
-            .expect("local seed file should exist");
+#[test]
+fn docker_remote_flow_bidi_sync_handles_local_only() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build");
 
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repo root should exist")
-            .to_path_buf();
-        let build_status = StdCommand::new("cargo")
-            .args(["build", "-p", "multicode-tui"])
-            .current_dir(&repo_root)
-            .status()
-            .expect("cargo build for multicode-tui should run");
-        assert!(build_status.success(), "multicode-tui should build for integration test");
-        let probe_binary = repo_root.join("target/debug/multicode-tui");
-        assert!(probe_binary.exists(), "built multicode-tui binary should exist");
+    runtime.block_on(async {
+        run_bidi_existence_case(BidiExistenceCase::LocalOnly).await;
+    });
+}
 
-        let config_path = root.path().join("config.toml");
-        fs::write(
-            &config_path,
-            format!(
-                "workspace-directory = \"~/agent-work\"\ncreate-ssh-agent = true\n\n[isolation]\n\n[handler]\nweb = \"/bin/true {{}}\"\n\n[remote]\nforward-ssh-agent = true\n\n[remote.install]\ncommand = \"printf install-ran > ~/.install-marker\"\n\n[[remote.sync-bidi]]\nlocal = \"{}\"\nremote = \"~/agent-work\"\nexclude = [\".multicode/remote\"]\n",
-                bidi_local.display(),
-            ),
-        )
-        .expect("config should be written");
+#[test]
+fn docker_remote_flow_bidi_sync_handles_remote_only() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build");
 
-        let key_path = root.path().join("id_ed25519");
-        let pub_key_path = root.path().join("id_ed25519.pub");
-        let known_hosts = root.path().join("known_hosts");
-        let keygen = StdCommand::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(&key_path)
-            .status()
-            .expect("ssh-keygen should run");
-        assert!(keygen.success(), "ssh-keygen should succeed");
-        let public_key = fs::read_to_string(&pub_key_path).expect("public key should exist");
+    runtime.block_on(async {
+        run_bidi_existence_case(BidiExistenceCase::RemoteOnly).await;
+    });
+}
 
-        let dockerfile = root.path().join("Dockerfile");
-        fs::write(
-            &dockerfile,
-            r#"FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y openssh-server rsync ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh
-CMD ["/usr/sbin/sshd", "-D", "-e"]
-"#,
-        )
-        .expect("dockerfile should be written");
+#[test]
+fn docker_remote_flow_bidi_sync_handles_local_and_remote_present() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build");
 
-        let image = format!("multicode-remote-test-bidi-missing-dir:{}", std::process::id());
-        let build = StdCommand::new("docker")
-            .args(["build", "-t", &image, "."])
-            .current_dir(root.path())
-            .status()
-            .expect("docker build should run");
-        assert!(build.success(), "docker build should succeed");
-
-        let port = reserve_tcp_port();
-        let container_name = format!("multicode-remote-test-bidi-missing-dir-{}", std::process::id());
-        let run = StdCommand::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &container_name,
-                "-p",
-                &format!("127.0.0.1:{port}:22"),
-                "-e",
-                &format!("AUTHORIZED_KEY={}", public_key.trim()),
-                &image,
-                "/bin/sh",
-                "-lc",
-                "mkdir -p /root/.ssh && chmod 700 /root/.ssh && printf '%s\n' \"$AUTHORIZED_KEY\" > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e",
-            ])
-            .status()
-            .expect("docker run should execute");
-        assert!(run.success(), "docker run should succeed");
-        let _container = DockerContainerGuard { name: container_name.clone() };
-
-        wait_for_ssh(port, &key_path, &known_hosts).await;
-
-        let missing_before = Command::new("ssh")
-            .args([
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                &format!("UserKnownHostsFile={}", known_hosts.display()),
-                "-i",
-                &key_path.to_string_lossy(),
-                "-p",
-                &port.to_string(),
-                "root@127.0.0.1",
-                "test ! -e /root/agent-work",
-            ])
-            .status()
-            .await
-            .expect("missing remote workdir probe should run");
-        assert!(missing_before.success(), "remote bidi directory should be absent before running cli");
-
-        let args = CliArgs {
-            config_path: config_path.clone(),
-            ssh_uri: "root@127.0.0.1".to_string(),
-        };
-        let options = RemoteCliOptions {
-            ssh_port: Some(port),
-            ssh_identity_file: Some(key_path.clone()),
-            ssh_known_hosts_file: Some(known_hosts.clone()),
-            ssh_strict_host_key_checking: false,
-            remote_tui_sanity_check: true,
-        };
-        let deps = RemoteCliDependencies {
-            local_tui_binary_override: Some(probe_binary.clone()),
-            local_tui_stage_root_override: None,
-        };
-
-        let result = run_remote_cli(args, options, deps).await;
-        assert!(result.is_ok(), "remote cli flow should succeed when remote bidi dir is initially missing: {result:?}");
-
-        let remote_seed = Command::new("ssh")
-            .args([
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                &format!("UserKnownHostsFile={}", known_hosts.display()),
-                "-i",
-                &key_path.to_string_lossy(),
-                "-p",
-                &port.to_string(),
-                "root@127.0.0.1",
-                "cat /root/agent-work/seed.txt",
-            ])
-            .output()
-            .await
-            .expect("remote seed file probe should run");
-        assert!(remote_seed.status.success(), "remote bidi directory should be created and seeded");
-        assert_eq!(String::from_utf8_lossy(&remote_seed.stdout).trim(), "seed-data");
+    runtime.block_on(async {
+        run_bidi_existence_case(BidiExistenceCase::LocalAndRemotePresent).await;
     });
 }
 
@@ -782,178 +938,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         assert!(remote_skill_beta.status.success(), "second remote skill should be readable");
         let remote_skill_beta_stdout = String::from_utf8_lossy(&remote_skill_beta.stdout);
         assert!(remote_skill_beta_stdout.contains("# Beta"), "second skill content should be readable remotely: {remote_skill_beta_stdout}");
-    });
-}
-
-#[test]
-fn docker_remote_flow_skips_bidi_upload_when_remote_tree_is_newer() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime should build");
-
-    runtime.block_on(async {
-        ensure_command_available("docker", &(["version"] as [&str; 1]));
-        ensure_command_available("ssh", &(["-V"] as [&str; 1]));
-        ensure_command_available("rsync", &(["--version"] as [&str; 1]));
-        ensure_binary_exists("ssh-keygen");
-
-        let root = TestDir::new();
-        let bidi_local = root.path().join("agent-work-local");
-        let bin_dir = root.path().join("bin");
-        fs::create_dir_all(&bidi_local).expect("bidi local should exist");
-        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
-        let shared_file = bidi_local.join("shared.txt");
-        fs::write(&shared_file, "local-v1").expect("local seed file should exist");
-
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repo root should exist")
-            .to_path_buf();
-        let build_status = StdCommand::new("cargo")
-            .args(["build", "-p", "multicode-tui"])
-            .current_dir(&repo_root)
-            .status()
-            .expect("cargo build for multicode-tui should run");
-        assert!(build_status.success(), "multicode-tui should build for integration test");
-        let probe_binary = repo_root.join("target/debug/multicode-tui");
-        assert!(probe_binary.exists(), "built multicode-tui binary should exist");
-
-        let config_path = root.path().join("config.toml");
-        fs::write(
-            &config_path,
-            format!(
-                "workspace-directory = \"~/agent-work\"\ncreate-ssh-agent = true\n\n[isolation]\n\n[handler]\nweb = \"/bin/true {{}}\"\n\n[remote]\nforward-ssh-agent = true\n\n[remote.install]\ncommand = \"mkdir -p ~/agent-work && printf install-ran > ~/.install-marker\"\n\n[[remote.sync-bidi]]\nlocal = \"{}\"\nremote = \"~/agent-work\"\nexclude = [\".multicode/remote\"]\n",
-                bidi_local.display(),
-            ),
-        )
-        .expect("config should be written");
-
-        let key_path = root.path().join("id_ed25519");
-        let pub_key_path = root.path().join("id_ed25519.pub");
-        let known_hosts = root.path().join("known_hosts");
-        let keygen = StdCommand::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(&key_path)
-            .status()
-            .expect("ssh-keygen should run");
-        assert!(keygen.success(), "ssh-keygen should succeed");
-        let public_key = fs::read_to_string(&pub_key_path).expect("public key should exist");
-
-        let dockerfile = root.path().join("Dockerfile");
-        fs::write(
-            &dockerfile,
-            r#"FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y openssh-server rsync ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh
-CMD ["/usr/sbin/sshd", "-D", "-e"]
-"#,
-        )
-        .expect("dockerfile should be written");
-
-        let image = format!("multicode-remote-test-bidi-newer:{}", std::process::id());
-        let build = StdCommand::new("docker")
-            .args(["build", "-t", &image, "."])
-            .current_dir(root.path())
-            .status()
-            .expect("docker build should run");
-        assert!(build.success(), "docker build should succeed");
-
-        let port = reserve_tcp_port();
-        let container_name = format!("multicode-remote-test-bidi-newer-{}", std::process::id());
-        let run = StdCommand::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &container_name,
-                "-p",
-                &format!("127.0.0.1:{port}:22"),
-                "-e",
-                &format!("AUTHORIZED_KEY={}", public_key.trim()),
-                &image,
-                "/bin/sh",
-                "-lc",
-                "mkdir -p /root/.ssh && chmod 700 /root/.ssh && printf '%s\n' \"$AUTHORIZED_KEY\" > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e",
-            ])
-            .status()
-            .expect("docker run should execute");
-        assert!(run.success(), "docker run should succeed");
-        let _container = DockerContainerGuard { name: container_name.clone() };
-
-        wait_for_ssh(port, &key_path, &known_hosts).await;
-
-        let args = CliArgs {
-            config_path: config_path.clone(),
-            ssh_uri: "root@127.0.0.1".to_string(),
-        };
-        let options = RemoteCliOptions {
-            ssh_port: Some(port),
-            ssh_identity_file: Some(key_path.clone()),
-            ssh_known_hosts_file: Some(known_hosts.clone()),
-            ssh_strict_host_key_checking: false,
-            remote_tui_sanity_check: true,
-        };
-        let deps = RemoteCliDependencies {
-            local_tui_binary_override: Some(probe_binary.clone()),
-            local_tui_stage_root_override: None,
-        };
-
-        run_remote_cli(args.clone(), options.clone(), deps.clone())
-            .await
-            .expect("initial remote cli flow should succeed");
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let remote_update = Command::new("ssh")
-            .args([
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                &format!("UserKnownHostsFile={}", known_hosts.display()),
-                "-i",
-                &key_path.to_string_lossy(),
-                "-p",
-                &port.to_string(),
-                "root@127.0.0.1",
-                "rm -f /root/agent-work/shared.txt && printf remote-v2 > /root/agent-work/remote-only.txt",
-            ])
-            .status()
-            .await
-            .expect("remote update should run");
-        assert!(remote_update.success(), "remote update should succeed");
-
-        run_remote_cli(args, options, deps)
-            .await
-            .expect("second remote cli flow should succeed");
-
-        let remote_probe = Command::new("ssh")
-            .args([
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                &format!("UserKnownHostsFile={}", known_hosts.display()),
-                "-i",
-                &key_path.to_string_lossy(),
-                "-p",
-                &port.to_string(),
-                "root@127.0.0.1",
-                "test ! -e /root/agent-work/shared.txt && cat /root/agent-work/remote-only.txt",
-            ])
-            .output()
-            .await
-            .expect("remote probe should run");
-        assert!(remote_probe.status.success(), "remote tree should keep newer remote state");
-        assert_eq!(String::from_utf8_lossy(&remote_probe.stdout).trim(), "remote-v2");
-
-        assert!(
-            !shared_file.exists(),
-            "final sync-down should propagate the remote deletion locally"
-        );
-        assert_eq!(
-            fs::read_to_string(bidi_local.join("remote-only.txt"))
-                .expect("remote-only file should sync down locally"),
-            "remote-v2"
-        );
     });
 }
 

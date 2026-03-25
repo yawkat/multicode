@@ -108,6 +108,11 @@ impl RemoteArchitecture {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectorySyncTarget {
+    ExactDestination,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSyncPathMapping {
     local: PathBuf,
@@ -115,6 +120,7 @@ struct ResolvedSyncPathMapping {
     exclude: Vec<String>,
     dereference_symlinks: bool,
     local_is_dir: bool,
+    directory_sync_target: DirectorySyncTarget,
 }
 
 pub async fn run_remote_cli(
@@ -435,7 +441,7 @@ async fn sync_mappings_up(
     mappings: &[ResolvedSyncPathMapping],
     options: &RemoteCliOptions,
 ) -> io::Result<()> {
-    ensure_remote_directory_mapping_parents_exist(args, mappings, options).await?;
+    ensure_remote_directory_sync_destinations_exist(args, mappings, options).await?;
     for mapping in mappings {
         ensure_local_sync_source_exists(mapping)?;
         run_rsync_command(
@@ -452,47 +458,16 @@ async fn sync_skill_mappings_up(
     mappings: &[ResolvedSyncPathMapping],
     options: &RemoteCliOptions,
 ) -> io::Result<()> {
-    ensure_remote_directory_mapping_targets_exist(args, mappings, options).await?;
-    for mapping in mappings {
-        ensure_local_sync_source_exists(mapping)?;
-        run_rsync_command(
-            build_rsync_skill_up_args(&args.ssh_uri, mapping, options, true)?,
-            format!("rsync upload for '{}'", mapping.local.display()),
-        )
-        .await?;
-    }
-    Ok(())
+    sync_mappings_up(args, mappings, options).await
 }
 
-async fn ensure_remote_directory_mapping_parents_exist(
-    args: &CliArgs,
-    mappings: &[ResolvedSyncPathMapping],
-    options: &RemoteCliOptions,
-) -> io::Result<()> {
-    let parents = mappings
-        .iter()
-        .filter(|mapping| mapping.local_is_dir)
-        .map(|mapping| {
-            mapping.remote.parent().ok_or_else(|| {
-                io::Error::other(format!(
-                    "directory sync destination '{}' has no parent",
-                    mapping.remote.display()
-                ))
-            })
-        })
-        .collect::<io::Result<BTreeSet<_>>>()?;
-    for parent in parents {
-        run_ssh_command(
-            args,
-            options,
-            &format!("mkdir -p {}", shell_single_quote(&parent.to_string_lossy())),
-        )
-        .await?;
+fn remote_directory_sync_destination(mapping: &ResolvedSyncPathMapping) -> io::Result<&Path> {
+    match mapping.directory_sync_target {
+        DirectorySyncTarget::ExactDestination => Ok(mapping.remote.as_path()),
     }
-    Ok(())
 }
 
-async fn ensure_remote_directory_mapping_targets_exist(
+async fn ensure_remote_directory_sync_destinations_exist(
     args: &CliArgs,
     mappings: &[ResolvedSyncPathMapping],
     options: &RemoteCliOptions,
@@ -500,8 +475,8 @@ async fn ensure_remote_directory_mapping_targets_exist(
     let targets = mappings
         .iter()
         .filter(|mapping| mapping.local_is_dir)
-        .map(|mapping| mapping.remote.as_path())
-        .collect::<BTreeSet<_>>();
+        .map(remote_directory_sync_destination)
+        .collect::<io::Result<BTreeSet<_>>>()?;
     for target in targets {
         run_ssh_command(
             args,
@@ -530,6 +505,12 @@ async fn sync_bidi_mappings_up_if_local_is_not_older(
         latest_local_sync_mappings_modified_time(mappings),
         latest_remote_sync_mappings_modified_time(args, layout, mappings, options),
     )?;
+    info!(
+        mapping_count = mappings.len(),
+        local_latest = ?local_latest,
+        remote_latest = ?remote_latest,
+        "checked bidirectional sync modification times"
+    );
     if should_sync_bidirectional_mapping_up(local_latest, remote_latest) {
         sync_mappings_up(args, mappings, options).await?;
     } else {
@@ -960,6 +941,7 @@ fn resolve_sync_mappings(
                 exclude: mapping.exclude.clone(),
                 dereference_symlinks: mapping.dereference_symlinks,
                 local_is_dir,
+                directory_sync_target: DirectorySyncTarget::ExactDestination,
             })
         })
         .collect()
@@ -1005,6 +987,7 @@ fn resolve_added_skill_sync_mappings(
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         })
         .collect())
 }
@@ -1185,36 +1168,6 @@ fn build_rsync_up_args(
 ) -> io::Result<Vec<String>> {
     let mut args = build_rsync_mapping_args(ssh_uri, mapping, options, show_progress);
     args.push("--update".to_string());
-    for exclude in &mapping.exclude {
-        args.push("--exclude".to_string());
-        args.push(exclude.clone());
-    }
-    if mapping.local_is_dir {
-        args.push(ensure_local_dir_suffix(&mapping.local));
-        let remote_dir = mapping
-            .remote
-            .parent()
-            .ok_or_else(|| io::Error::other(format!("directory sync destination '{}' has no parent", mapping.remote.display())))?;
-        args.push(format!(
-            "{ssh_uri}:{}",
-            ensure_remote_dir_suffix(remote_dir)
-        ));
-    } else {
-        args.push("--mkpath".to_string());
-        args.push(mapping.local.to_string_lossy().into_owned());
-        args.push(format!("{ssh_uri}:{}", mapping.remote.to_string_lossy()));
-    }
-    Ok(args)
-}
-
-fn build_rsync_skill_up_args(
-    ssh_uri: &str,
-    mapping: &ResolvedSyncPathMapping,
-    options: &RemoteCliOptions,
-    show_progress: bool,
-) -> io::Result<Vec<String>> {
-    let mut args = build_rsync_mapping_args(ssh_uri, mapping, options, show_progress);
-    args.push("--update".to_string());
     args.push("--delete".to_string());
     for exclude in &mapping.exclude {
         args.push("--exclude".to_string());
@@ -1224,7 +1177,7 @@ fn build_rsync_skill_up_args(
         args.push(ensure_local_dir_suffix(&mapping.local));
         args.push(format!(
             "{ssh_uri}:{}",
-            ensure_remote_dir_suffix(&mapping.remote)
+            ensure_remote_dir_suffix(remote_directory_sync_destination(mapping)?)
         ));
     } else {
         args.push("--mkpath".to_string());
@@ -1803,6 +1756,7 @@ mod tests {
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
+                directory_sync_target: DirectorySyncTarget::ExactDestination,
             }],
             &remote_workspace_directory,
         )
@@ -2042,6 +1996,7 @@ mod tests {
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         })
         .expect("missing directory source should be created");
 
@@ -2128,6 +2083,7 @@ mod tests {
             exclude: vec!["custom/skip".to_string()],
             dereference_symlinks: false,
             local_is_dir: true,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         };
         assert_eq!(
             recency_excludes(&mapping),
@@ -2143,6 +2099,7 @@ mod tests {
             exclude: vec!["custom/skip".to_string()],
             dereference_symlinks: false,
             local_is_dir: false,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         };
         assert_eq!(recency_excludes(&mapping), vec!["custom/skip".to_string()]);
     }
@@ -2184,6 +2141,7 @@ mod tests {
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: false,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         };
 
         let args = build_rsync_up_args(
@@ -2211,7 +2169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_rsync_up_args_syncs_directories_into_parent_destination() {
+    async fn build_rsync_up_args_syncs_directories_into_exact_destination() {
         let temp_root = std::env::temp_dir().join(format!(
             "multicode-remote-dir-sync-test-{}-{}",
             std::process::id(),
@@ -2225,6 +2183,7 @@ mod tests {
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         };
 
         let args = build_rsync_up_args(
@@ -2238,39 +2197,6 @@ mod tests {
         assert!(args.iter().any(|arg| arg == &format!("{}/", local_dir.to_string_lossy())));
         assert!(!args.iter().any(|arg| arg == "--mkpath"));
         assert!(args.iter().any(|arg| {
-            arg == "alice@example.com:/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/"
-        }));
-
-        std::fs::remove_dir_all(&temp_root).expect("temp root should be removed");
-    }
-
-    #[tokio::test]
-    async fn build_rsync_skill_up_args_syncs_directories_into_exact_skill_destination() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "multicode-remote-skill-dir-sync-test-{}-{}",
-            std::process::id(),
-            Uuid::new_v4()
-        ));
-        let local_dir = temp_root.join("skill-alpha");
-        std::fs::create_dir_all(&local_dir).expect("local dir should be created");
-        let mapping = ResolvedSyncPathMapping {
-            local: local_dir.clone(),
-            remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha"),
-            exclude: Vec::new(),
-            dereference_symlinks: false,
-            local_is_dir: true,
-        };
-
-        let args = build_rsync_skill_up_args(
-            "alice@example.com",
-            &mapping,
-            &RemoteCliOptions::default(),
-            false,
-        )
-        .expect("skill directory sync args should build");
-
-        assert!(args.iter().any(|arg| arg == &format!("{}/", local_dir.to_string_lossy())));
-        assert!(args.iter().any(|arg| {
             arg == "alice@example.com:/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha/"
         }));
 
@@ -2278,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_remote_directory_mapping_parents_exist_deduplicates_parents() {
+    fn ensure_remote_directory_sync_destinations_exist_deduplicates_targets() {
         let mappings = vec![
             ResolvedSyncPathMapping {
                 local: PathBuf::from("/tmp/skill-alpha"),
@@ -2288,6 +2214,7 @@ mod tests {
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
+                directory_sync_target: DirectorySyncTarget::ExactDestination,
             },
             ResolvedSyncPathMapping {
                 local: PathBuf::from("/tmp/skill-beta"),
@@ -2297,6 +2224,7 @@ mod tests {
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
+                directory_sync_target: DirectorySyncTarget::ExactDestination,
             },
         ];
 
@@ -2319,6 +2247,7 @@ mod tests {
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
+                directory_sync_target: DirectorySyncTarget::ExactDestination,
             },
             ResolvedSyncPathMapping {
                 local: PathBuf::from("/tmp/skill-alpha-copy"),
@@ -2328,6 +2257,7 @@ mod tests {
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
+                directory_sync_target: DirectorySyncTarget::ExactDestination,
             },
         ];
 
@@ -2455,6 +2385,7 @@ mod tests {
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         }];
 
         let actual = rewrite_review_path_to_local_sync_root(
@@ -2473,6 +2404,7 @@ mod tests {
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
+            directory_sync_target: DirectorySyncTarget::ExactDestination,
         }];
 
         let actual = rewrite_review_path_to_local_sync_root(&mappings, "/srv/other/path/repo");
