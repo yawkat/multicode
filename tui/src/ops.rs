@@ -155,15 +155,15 @@ pub(crate) async fn validate_workspace_link_target(
 }
 
 pub(crate) fn attach_cli_args(opencode_command: &str, target: &AttachTarget) -> Vec<String> {
-    let mut args = vec![opencode_command.to_string(), "attach".to_string()];
-    if let Some(session_id) = target.session_id.as_deref() {
-        args.push("--session".to_string());
-        args.push(session_id.to_string());
-    }
-    args.push(target.uri.clone());
-    args
+    vec![
+        opencode_command.to_string(),
+        "attach".to_string(),
+        "--print-logs".to_string(),
+        target.uri.clone(),
+    ]
 }
 
+#[cfg(test)]
 pub(crate) fn tmux_session_command(
     command: Vec<String>,
     original_term: Option<&str>,
@@ -179,22 +179,17 @@ pub(crate) fn tmux_session_command(
 
 pub(crate) async fn attach_in_tmux(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    opencode_command: &str,
-    target: &AttachTarget,
+    _opencode_command: &str,
+    _target: &AttachTarget,
     workspace_key: &str,
     custom_description: &str,
+    env: &[(String, String)],
+    command: Vec<String>,
 ) -> io::Result<()> {
-    let original_term = std::env::var("TERM").ok();
-    let attach_command = vec![
-        format!("OPENCODE_SERVER_USERNAME={}", target.username),
-        format!("OPENCODE_SERVER_PASSWORD={}", target.password),
-    ];
-    let mut attach_command = tmux_session_command(attach_command, original_term.as_deref());
-    attach_command.extend(attach_cli_args(opencode_command, target));
     run_tmux_new_session_command(
         terminal,
-        &[],
-        attach_command,
+        env,
+        command,
         workspace_key,
         custom_description,
     )
@@ -216,30 +211,44 @@ pub(crate) async fn run_tmux_new_session_command(
 
     let mut run_error = None;
 
+    if let Err(err) = ensure_tmux_server_persistence().await {
+        tracing::warn!(error = ?err, "failed to configure tmux server persistence");
+    }
+
     let mut create_command = vec![
         "new-session".to_string(),
         "-d".to_string(),
         "-s".to_string(),
         session_name.clone(),
-        "env".to_string(),
     ];
-    create_command.extend(env.iter().map(|(name, value)| format!("{name}={value}")));
-    create_command.extend(command.clone());
+    if !env.is_empty() {
+        create_command.push("env".to_string());
+        create_command.extend(env.iter().map(|(name, value)| format!("{name}={value}")));
+    }
+    let create_command_for_log = {
+        let mut command_for_log = create_command.clone();
+        if !env.is_empty() {
+            command_for_log.splice(
+                4..(4 + 1 + env.len()),
+                [
+                    "env".to_string(),
+                    format!("<{} inherited env vars>", env.len()),
+                ],
+            );
+        }
+        command_for_log.extend(build_tmux_detached_command_wrapper(&command));
+        command_for_log
+    };
     tracing::info!(
-        command = %format_command_line("tmux", &create_command),
+        command = %format_command_line("tmux", &create_command_for_log),
         "starting application via tmux new-session"
     );
 
     let mut create_process = Command::new("tmux");
     create_process.env("TERM", "xterm-256color");
     let create_result = create_process
-        .arg("new-session")
-        .arg("-d")
-        .arg("-s")
-        .arg(&session_name)
-        .arg("env")
-        .args(env.iter().map(|(name, value)| format!("{name}={value}")))
-        .args(command)
+        .args(&create_command)
+        .args(build_tmux_detached_command_wrapper(&command))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -320,6 +329,57 @@ pub(crate) async fn run_tmux_new_session_command(
         (Some(err), Ok(())) => Err(err),
         (None, Ok(())) => Ok(()),
     }
+}
+
+async fn ensure_tmux_server_persistence() -> io::Result<()> {
+    let start_status = Command::new("tmux")
+        .arg("start-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+
+    if !start_status.success() {
+        return Err(io::Error::other(format!(
+            "tmux start-server exited with status {start_status}"
+        )));
+    }
+
+    for (scope, option, value) in [
+        ("-s", "exit-empty", "off"),
+        ("-g", "destroy-unattached", "off"),
+    ] {
+        let status = Command::new("tmux")
+            .arg("set-option")
+            .arg(scope)
+            .arg(option)
+            .arg(value)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "tmux set-option {scope} {option} {value} exited with status {status}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn build_tmux_detached_command_wrapper(command: &[String]) -> Vec<String> {
+    let mut wrapped = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "trap '' HUP; exec \"$@\"".to_string(),
+        "sh".to_string(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    wrapped
 }
 
 pub(crate) async fn set_tmux_session_option(

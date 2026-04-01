@@ -398,6 +398,7 @@ impl CombinedService {
 
     pub async fn stop_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
+        self.ensure_workspace_directory_exists(&key)?;
         let workspace = self.manager.get_workspace(&key)?;
         let workspace_rx = workspace.subscribe();
         let unit = workspace_rx
@@ -436,22 +437,20 @@ impl CombinedService {
             .await
     }
 
-    /// Build a command to run a tool in an isolate, such as a user-defined exec-type tool, or the review tool.
-    pub async fn build_pty_tool_command(
+    pub async fn build_pty_tool_command_with_env(
         &self,
         key: &str,
         command: Vec<String>,
+        extra_inherited_env: Vec<(String, String)>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
         let key = validate_workspace_key(key)?;
+        self.ensure_workspace_directory_exists(&key)?;
         self.ensure_workspace_not_archived(&key)?;
         if command.is_empty() {
             return Err(CombinedServiceError::InvalidToolExecution(
                 "PTY tool command must not be empty".to_string(),
             ));
         }
-
-        let workspace_path = self.workspace_directory_path.join(&key);
-        tokio::fs::create_dir_all(&workspace_path).await?;
 
         let unit = generate_transient_unit_name();
         let mut args = vec![
@@ -460,9 +459,7 @@ impl CombinedService {
             "--collect".to_string(),
             "--pty".to_string(),
         ];
-        let inherited_env = self
-            .sandbox_env_pairs(Vec::<(String, String)>::new())
-            .await?;
+        let inherited_env = self.sandbox_env_pairs(extra_inherited_env).await?;
         append_systemd_run_inherit_env(&mut args, &inherited_env);
         args.push("--unit".to_string());
         args.push(unit);
@@ -476,12 +473,23 @@ impl CombinedService {
         })
     }
 
+    /// Build a command to run a tool in an isolate, such as a user-defined exec-type tool, or the review tool.
+    pub async fn build_pty_tool_command(
+        &self,
+        key: &str,
+        command: Vec<String>,
+    ) -> Result<SpawnCommand, CombinedServiceError> {
+        self.build_pty_tool_command_with_env(key, command, Vec::new())
+            .await
+    }
+
     pub async fn archive_workspace(
         &self,
         key: &str,
         progress_tx: tokio::sync::watch::Sender<String>,
     ) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
+        self.ensure_workspace_directory_exists(&key)?;
         let workspace = self.manager.get_workspace(&key)?;
         let snapshot = workspace.subscribe().borrow().clone();
         if snapshot.persistent.archived {
@@ -548,6 +556,7 @@ impl CombinedService {
         progress_tx: tokio::sync::watch::Sender<String>,
     ) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
+        self.ensure_workspace_directory_exists(&key)?;
         let workspace = self.manager.get_workspace(&key)?;
 
         let workspace_path = self.workspace_directory_path.join(&key);
@@ -649,6 +658,7 @@ impl CombinedService {
         self.append_bwrap_sandbox_args(&mut args, key).await?;
         args.push(self.opencode_command.clone());
         args.push("serve".to_string());
+        args.push("--print-logs".to_string());
         args.push("--hostname".to_string());
         args.push("127.0.0.1".to_string());
         args.push("--port".to_string());
@@ -682,7 +692,6 @@ impl CombinedService {
         extra_env: Vec<(String, String)>,
     ) -> Result<Vec<(String, String)>, CombinedServiceError> {
         let mut env = self.github_git_credentials_env_vars();
-        env.extend(extra_env);
         env.extend(
             self.expanded_isolation
                 .inherit_env
@@ -693,6 +702,8 @@ impl CombinedService {
                         .map(|env_value| (env_name.clone(), env_value))
                 }),
         );
+        env.extend(self.expanded_isolation.set_env.clone());
+        env.extend(extra_env);
         Ok(env)
     }
 
@@ -924,6 +935,20 @@ impl CombinedService {
         Ok(())
     }
 
+    fn ensure_workspace_directory_exists(&self, key: &str) -> Result<(), CombinedServiceError> {
+        let workspace_path = self.workspace_directory_path.join(key);
+        match std::fs::metadata(&workspace_path) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(CombinedServiceError::Manager(
+                WorkspaceManagerError::WorkspaceNotFound(key.to_string()),
+            )),
+            Err(err) if err.kind() == ErrorKind::NotFound => Err(CombinedServiceError::Manager(
+                WorkspaceManagerError::WorkspaceNotFound(key.to_string()),
+            )),
+            Err(err) => return Err(CombinedServiceError::Io(err)),
+        }
+    }
+
     async fn ensure_no_archive_conflict(&self, key: &str) -> Result<(), CombinedServiceError> {
         for format in [
             WorkspaceArchiveFormat::TarZstd,
@@ -988,14 +1013,7 @@ async fn github_git_credentials_env_from_config(
     }
 
     let token = github_status_service.resolved_github_token().await?;
-    let username = github_status_service
-        .authenticated_login()
-        .await?
-        .ok_or_else(|| {
-            CombinedServiceError::GithubGitCredentials(
-                "GitHub authenticated login unavailable for git credentials".to_string(),
-            )
-        })?;
+    let username = "x-access-token".to_string();
     Ok(Some(GithubGitCredentialsEnv { username, token }))
 }
 
@@ -1442,6 +1460,7 @@ populate-git-credentials = true
 
             let _home_guard = EnvVarGuard::set("HOME", &home);
             let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+            let _user_guard = EnvVarGuard::set("USER", Path::new("alice"));
 
             let config_path = root.path().join("config.toml");
             fs::write(&config_path, config_with_isolation("~/workspaces"))
@@ -1799,11 +1818,12 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
 
             let service = CombinedService::from_config(config)
                 .await
-                .expect_err("startup should fail without live GitHub username lookup in test env");
-            assert!(matches!(
-                service,
-                CombinedServiceError::GithubStatusService(_)
-            ));
+                .expect("combined service should start without GitHub login lookup");
+            let env_vars = service.github_git_credentials_env_vars();
+            assert!(env_vars.contains(&(
+                "MULTICODE_GITHUB_USERNAME".to_string(),
+                "x-access-token".to_string(),
+            )));
         });
     }
 
@@ -1821,49 +1841,15 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
             let root = TestDir::new();
             let home = root.path().join("home");
             let runtime_dir = root.path().join("runtime");
-            let github_api_dir = root.path().join("github-api");
-            let github_server = github_api_dir.join("server.py");
-            let github_port = 38492;
             fs::create_dir_all(&home).expect("home should exist");
             fs::create_dir_all(&runtime_dir).expect("runtime should exist");
-            fs::create_dir_all(&github_api_dir).expect("github api dir should exist");
             let workspace_directory = home.join("workspaces");
             fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
-
-            fs::write(
-                &github_server,
-                format!(
-                    r#"from http.server import BaseHTTPRequestHandler, HTTPServer
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/user":
-            body = b'{{"login":"sandbox-user","id":1,"node_id":"MDQ6VXNlcjE=","avatar_url":"https://example.com/avatar","gravatar_id":"","url":"https://api.github.com/users/sandbox-user","html_url":"https://github.com/sandbox-user","followers_url":"https://api.github.com/users/sandbox-user/followers","following_url":"https://api.github.com/users/sandbox-user/following{{/other_user}}","gists_url":"https://api.github.com/users/sandbox-user/gists{{/gist_id}}","starred_url":"https://api.github.com/users/sandbox-user/starred{{/owner}}{{/repo}}","subscriptions_url":"https://api.github.com/users/sandbox-user/subscriptions","organizations_url":"https://api.github.com/users/sandbox-user/orgs","repos_url":"https://api.github.com/users/sandbox-user/repos","events_url":"https://api.github.com/users/sandbox-user/events{{/privacy}}","received_events_url":"https://api.github.com/users/sandbox-user/received_events","type":"User","site_admin":false,"name":"Sandbox User","company":null,"blog":"","location":null,"email":null,"hireable":null,"bio":null,"twitter_username":null,"public_repos":0,"public_gists":0,"followers":0,"following":0,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","private_gists":0,"total_private_repos":0,"owned_private_repos":0,"disk_usage":0,"collaborators":0,"two_factor_authentication":false}}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
-    def log_message(self, format, *args):
-        pass
-HTTPServer(("127.0.0.1", {github_port}), Handler).serve_forever()
-"#
-                ),
-            )
-            .expect("github server script should be written");
-            let mut github_process = std::process::Command::new("python3")
-                .arg(&github_server)
-                .spawn()
-                .expect("github api server should start");
-            std::thread::sleep(std::time::Duration::from_millis(250));
 
             let _home_guard = EnvVarGuard::set("HOME", &home);
             let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
             unsafe {
                 std::env::set_var("MULTICODE_GITHUB_TEST_TOKEN", "secret-token");
-                std::env::set_var("GITHUB_API_URL", format!("http://127.0.0.1:{github_port}"));
             }
 
             let config: Config = toml::from_str(
@@ -1887,7 +1873,7 @@ token = {{ env = "MULTICODE_GITHUB_TEST_TOKEN" }}
             let env_vars = service.github_git_credentials_env_vars();
             assert!(env_vars.contains(&(
                 "MULTICODE_GITHUB_USERNAME".to_string(),
-                "sandbox-user".to_string(),
+                "x-access-token".to_string(),
             )));
             assert!(env_vars.contains(&(
                 "MULTICODE_GITHUB_TOKEN".to_string(),
@@ -1908,10 +1894,7 @@ token = {{ env = "MULTICODE_GITHUB_TEST_TOKEN" }}
 
             unsafe {
                 std::env::remove_var("MULTICODE_GITHUB_TEST_TOKEN");
-                std::env::remove_var("GITHUB_API_URL");
             }
-            let _ = github_process.kill();
-            let _ = github_process.wait();
         });
     }
 
@@ -2051,6 +2034,7 @@ cpu = "400%"
                 &[
                     service.opencode_command(),
                     "serve",
+                    "--print-logs",
                     "--hostname",
                     "127.0.0.1",
                     "--port",
@@ -3168,6 +3152,60 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
     }
 
     #[test]
+    fn build_exec_tool_command_rejects_missing_workspace_directory() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            fs::create_dir_all(&home).expect("home should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime should exist");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                r#"workspace-directory = "~/workspaces"
+
+[isolation]
+"#,
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+
+            service
+                .create_workspace("alpha")
+                .await
+                .expect("workspace should be created");
+            fs::remove_dir_all(workspace_directory.join("alpha"))
+                .expect("workspace directory should be removed for test");
+
+            let err = service
+                .build_exec_tool_command("alpha", "/bin/bash")
+                .await
+                .expect_err("missing workspace path must be rejected");
+            assert!(matches!(
+                err,
+                CombinedServiceError::Manager(crate::WorkspaceManagerError::WorkspaceNotFound(key)) if key == "alpha"
+            ));
+        });
+    }
+
+    #[test]
     fn build_exec_tool_args_does_not_inherit_term_without_config() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3299,6 +3337,79 @@ inherit-env = ["TERM", "COLORTERM"]
                     .inherited_env
                     .contains(&("COLORTERM".to_string(), "truecolor".to_string()))
             );
+        });
+    }
+
+    #[test]
+    fn build_systemd_bwrap_args_does_not_inject_configured_set_env_variables() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            fs::create_dir_all(&home).expect("home should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime should exist");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                r#"workspace-directory = "~/workspaces"
+
+[isolation]
+inherit-env = ["HOME"]
+
+[isolation.set-env]
+TMPDIR = "/opt/opencode-tmp/${USER}"
+RUST_LOG = "debug"
+"#,
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+
+            service
+                .create_workspace("alpha")
+                .await
+                .expect("workspace should be created");
+
+            let command = service
+                .build_systemd_bwrap_command(
+                    "alpha",
+                    "test-password",
+                    33111,
+                    "multicode-test.service",
+                )
+                .await
+                .expect("command args should be built");
+            let args = command.args;
+
+            assert!(!contains_sequence(&args, &["--setenv", "TMPDIR"]));
+            assert!(!contains_sequence(&args, &["--setenv", "RUST_LOG"]));
+            let expected_tmpdir = format!(
+                "/opt/opencode-tmp/{}",
+                std::env::var("USER").unwrap_or_else(|_| "alice".to_string())
+            );
+            assert!(!command.inherited_env.contains(&(
+                "TMPDIR".to_string(),
+                expected_tmpdir,
+            )));
+            assert!(!command
+                .inherited_env
+                .contains(&("RUST_LOG".to_string(), "debug".to_string())));
         });
     }
 

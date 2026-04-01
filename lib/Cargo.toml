@@ -25,6 +25,7 @@ tracing = "0"
 tracing-subscriber = { version = "0", features = ["fmt", "ansi"] }
 shell-words = "1"
 size = "0"
+libc = "0"
 
 [build-dependencies]
 openapiv3 = "2"

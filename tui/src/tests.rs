@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_cli_args_appends_session_when_present() {
+    fn attach_cli_args_uses_sanitized_uri_without_session() {
         let target = AttachTarget {
             uri: "http://127.0.0.1:3000/".to_string(),
             username: "opencode".to_string(),
@@ -167,8 +167,7 @@ mod tests {
             vec![
                 "opencode".to_string(),
                 "attach".to_string(),
-                "--session".to_string(),
-                "ses-root-latest".to_string(),
+                "--print-logs".to_string(),
                 "http://127.0.0.1:3000/".to_string(),
             ]
         );
@@ -188,6 +187,7 @@ mod tests {
             vec![
                 "opencode".to_string(),
                 "attach".to_string(),
+                "--print-logs".to_string(),
                 "http://127.0.0.1:3000/".to_string(),
             ]
         );
