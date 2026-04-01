@@ -145,6 +145,8 @@ pub struct IsolationConfig {
     pub add_skills_from: Vec<String>,
     #[serde(default, alias = "inherit-env")]
     pub inherit_env: Vec<String>,
+    #[serde(default, alias = "set-env")]
+    pub set_env: BTreeMap<String, String>,
     #[serde(default, alias = "memory-high")]
     pub memory_high: Option<String>,
     #[serde(default, alias = "memory-max")]
@@ -167,6 +169,7 @@ pub(super) struct ExpandedIsolationConfig {
     pub(super) tmpfs: Vec<PathBuf>,
     pub(super) added_skills: Vec<AddedSkillMount>,
     pub(super) inherit_env: Vec<String>,
+    pub(super) set_env: Vec<(String, String)>,
     pub(super) memory_high_bytes: Option<u64>,
     pub(super) memory_max_bytes: Option<u64>,
     pub(super) cpu: Option<String>,
@@ -184,6 +187,13 @@ impl ExpandedIsolationConfig {
             tmpfs: expand_isolation_paths(&config.tmpfs, "tmpfs")?,
             added_skills: resolve_added_skill_mounts(&config.add_skills_from, config_path)?,
             inherit_env: config.inherit_env.clone(),
+            set_env: config
+                .set_env
+                .iter()
+                .map(|(name, value)| {
+                    expand_set_env_value(value).map(|expanded| (name.clone(), expanded))
+                })
+                .collect::<Result<_, _>>()?,
             memory_high_bytes: parse_optional_size_bytes(
                 config.memory_high.as_deref(),
                 "memory_high",
@@ -337,6 +347,15 @@ fn expand_isolation_paths(
             Ok(path)
         })
         .collect()
+}
+
+fn expand_set_env_value(value: &str) -> Result<String, CombinedServiceError> {
+    let mut expanded = shellexpand::tilde(value).into_owned();
+    for (name, env_value) in env::vars() {
+        expanded = expanded.replace(&format!("${{{name}}}"), &env_value);
+        expanded = expanded.replace(&format!("${name}"), &env_value);
+    }
+    Ok(expanded)
 }
 
 fn resolve_added_skill_mounts(

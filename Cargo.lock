@@ -1755,6 +1755,7 @@ version = "0.1.0"
 dependencies = [
  "diesel",
  "diesel_migrations",
+ "libc",
  "libsqlite3-sys",
  "octocrab",
  "openapiv3",

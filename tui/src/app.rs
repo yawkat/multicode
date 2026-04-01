@@ -643,12 +643,42 @@ impl TuiState {
                     .get(&key)
                     .map(|snapshot| snapshot.persistent.description.clone())
                     .unwrap_or_default();
+                let attach_command = match self
+                    .service
+                    .build_pty_tool_command_with_env(
+                        &key,
+                        attach_cli_args(self.service.opencode_command(), &target),
+                        vec![
+                            (
+                                "OPENCODE_SERVER_USERNAME".to_string(),
+                                target.username.clone(),
+                            ),
+                            (
+                                "OPENCODE_SERVER_PASSWORD".to_string(),
+                                target.password.clone(),
+                            ),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(command) => command,
+                    Err(err) => {
+                        self.status =
+                            format!("Failed to prepare attach command for workspace '{key}': {err:?}");
+                        return;
+                    }
+                };
+                let mut tmux_command = vec!["systemd-run".to_string()];
+                let inherited_env = attach_command.inherited_env;
+                tmux_command.extend(attach_command.args);
                 match attach_in_tmux(
                     terminal,
                     self.service.opencode_command(),
                     &target,
                     &key,
                     &custom_description,
+                    &inherited_env,
+                    tmux_command,
                 )
                 .await
                 {
@@ -805,13 +835,10 @@ impl TuiState {
                     "-d".to_string(),
                     "-s".to_string(),
                     "<session>".to_string(),
-                    "env".to_string(),
                 ];
-                debug_command.extend(
-                    inherited_env
-                        .iter()
-                        .map(|(name, value)| format!("{name}={value}")),
-                );
+                if !inherited_env.is_empty() {
+                    debug_command.push(format!("<{} inherited env vars>", inherited_env.len()));
+                }
                 debug_command.extend(tmux_command.clone());
                 debug_command
             }),
@@ -1110,21 +1137,51 @@ impl TuiState {
                                 return;
                             }
                             match self.snapshot_attach_target(&key) {
-                                Ok(target) => {
-                                    let custom_description = self
-                                        .snapshots
-                                        .get(&key)
-                                        .map(|snapshot| snapshot.persistent.description.clone())
-                                        .unwrap_or_default();
-                                    match attach_in_tmux(
-                                        terminal,
-                                        self.service.opencode_command(),
-                                        &target,
-                                        &key,
-                                        &custom_description,
-                                    )
-                                    .await
-                                    {
+            Ok(target) => {
+                let custom_description = self
+                    .snapshots
+                    .get(&key)
+                    .map(|snapshot| snapshot.persistent.description.clone())
+                    .unwrap_or_default();
+                let attach_command = match self
+                    .service
+                    .build_pty_tool_command_with_env(
+                        &key,
+                        attach_cli_args(self.service.opencode_command(), &target),
+                        vec![
+                            (
+                                "OPENCODE_SERVER_USERNAME".to_string(),
+                                target.username.clone(),
+                            ),
+                            (
+                                "OPENCODE_SERVER_PASSWORD".to_string(),
+                                target.password.clone(),
+                            ),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(command) => command,
+                    Err(err) => {
+                        self.status =
+                            format!("Failed to prepare attach command for workspace '{key}': {err:?}");
+                        return;
+                    }
+                };
+                let mut tmux_command = vec!["systemd-run".to_string()];
+                let inherited_env = attach_command.inherited_env;
+                tmux_command.extend(attach_command.args);
+                match attach_in_tmux(
+                    terminal,
+                    self.service.opencode_command(),
+                    &target,
+                    &key,
+                    &custom_description,
+                    &inherited_env,
+                    tmux_command,
+                )
+                .await
+                {
                                         Ok(_) => {
                                             self.status = format!(
                                                 "Detached from workspace '{key}' opencode client"

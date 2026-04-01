@@ -167,6 +167,7 @@ mod tests {
             vec![
                 "opencode".to_string(),
                 "attach".to_string(),
+                "--print-logs".to_string(),
                 "--session".to_string(),
                 "ses-root-latest".to_string(),
                 "http://127.0.0.1:3000/".to_string(),
@@ -188,6 +189,7 @@ mod tests {
             vec![
                 "opencode".to_string(),
                 "attach".to_string(),
+                "--print-logs".to_string(),
                 "http://127.0.0.1:3000/".to_string(),
             ]
         );

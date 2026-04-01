@@ -205,17 +205,30 @@ async fn run_remote_session(
 
     info!("launching remote multicode-tui session");
     let stdout_logging_guard = logging::suppress_stdout_logging();
+    let remote_socket = PathBuf::from("/tmp/multicode-remote.sock");
+    let mut ssh_args = build_ssh_base_args(&args.ssh_uri, options);
+    let destination = ssh_args.pop().expect("ssh destination should exist");
+    ssh_args.push("-o".to_string());
+    ssh_args.push("ExitOnForwardFailure=yes".to_string());
+    ssh_args.push("-o".to_string());
+    ssh_args.push("StreamLocalBindUnlink=yes".to_string());
+    ssh_args.push("-o".to_string());
+    ssh_args.push("StreamLocalBindMask=0177".to_string());
+    ssh_args.push("-tt".to_string());
+    ssh_args.push("-R".to_string());
+    ssh_args.push(format!(
+        "{}:{}",
+        remote_socket.to_string_lossy(),
+        relay.local_socket_path.to_string_lossy()
+    ));
+    ssh_args.push(destination);
+    ssh_args.push(build_remote_tui_command_with_relay_and_options(
+        config,
+        Some(remote_socket.as_path()),
+        options,
+    ));
     let status = Command::new("ssh")
-        .args(build_ssh_interactive_args_with_forwarding(
-            &args.ssh_uri,
-            &[(&relay.local_socket_path, &relay.remote_socket_path)],
-            options,
-        ))
-        .arg(build_remote_tui_command_with_relay_and_options(
-            config,
-            Some(relay.remote_socket_path.as_path()),
-            options,
-        ))
+        .args(&ssh_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -268,24 +281,22 @@ struct RemoteLayout {
 
 async fn prepare_relay(
     args: &CliArgs,
-    config: &ResolvedRuntimeConfig,
+    _config: &ResolvedRuntimeConfig,
     options: &RemoteCliOptions,
 ) -> io::Result<RelayPaths> {
-    let layout = remote_layout(config)?;
-    let local_socket_path = std::env::temp_dir().join(format!(
+    let local_socket_path = Path::new("/tmp").join(format!(
         "multicode-remote-{}-{}.sock",
         std::process::id(),
         Uuid::new_v4()
     ));
-    let remote_socket_path = layout
-        .remote_relay_dir
-        .join(format!("{}.sock", Uuid::new_v4()));
+    let remote_socket_path = PathBuf::from("/tmp/multicode-remote.sock");
     let _ = tokio::fs::remove_file(&local_socket_path).await;
     run_ssh_command(
         args,
         options,
         &format!(
-            "rm -f {}",
+            "rm -f {} || (sudo -n rm -f {} || true)",
+            shell_single_quote(&remote_socket_path.to_string_lossy()),
             shell_single_quote(&remote_socket_path.to_string_lossy())
         ),
     )
@@ -308,17 +319,22 @@ async fn ensure_remote_runtime_directories(
         remote_workspace_directory = %config.remote_workspace_directory.display(),
         "creating remote runtime directories"
     );
-    run_ssh_command(
-        args,
-        options,
-        &format!(
-            "mkdir -p {} {} {}",
-            shell_single_quote(&layout.root.to_string_lossy()),
-            shell_single_quote(&layout.remote_relay_dir.to_string_lossy()),
-            shell_single_quote(&config.remote_workspace_directory.to_string_lossy()),
-        ),
-    )
-    .await
+    run_ssh_command(args, options, &build_runtime_directories_command(config)?).await
+}
+
+fn build_runtime_directories_command(config: &ResolvedRuntimeConfig) -> io::Result<String> {
+    let layout = remote_layout(config)?;
+    let support_parent = layout
+        .root
+        .parent()
+        .ok_or_else(|| io::Error::other("remote runtime root has no parent directory"))?;
+    let support = shell_single_quote(&support_parent.to_string_lossy());
+    let root = shell_single_quote(&layout.root.to_string_lossy());
+    let relay = shell_single_quote(&layout.remote_relay_dir.to_string_lossy());
+    let workspace = shell_single_quote(&config.remote_workspace_directory.to_string_lossy());
+    Ok(format!(
+        "if sudo -n true >/dev/null 2>&1; then sudo mkdir -p {workspace} {support} {root} {relay} && sudo chown \"$(id -un):$(id -gn)\" {workspace} {support} {root} {relay}; else mkdir -p {workspace} {support} {root} {relay}; fi; test -w {workspace} && test -w {support} && test -w {root} && test -w {relay}"
+    ))
 }
 
 fn spawn_relay_listener(
@@ -443,7 +459,13 @@ async fn sync_mappings_up(
 ) -> io::Result<()> {
     ensure_remote_directory_sync_destinations_exist(args, mappings, options).await?;
     for mapping in mappings {
-        ensure_local_sync_source_exists(mapping)?;
+        if !ensure_local_sync_source_exists(mapping)? {
+            warn!(
+                local = %mapping.local.display(),
+                "skipping sync-up mapping because local source path is missing"
+            );
+            continue;
+        }
         run_rsync_command(
             build_rsync_up_args(&args.ssh_uri, mapping, options, true)?,
             format!("rsync upload for '{}'", mapping.local.display()),
@@ -451,6 +473,19 @@ async fn sync_mappings_up(
         .await?;
     }
     Ok(())
+}
+
+fn ensure_local_sync_source_exists(mapping: &ResolvedSyncPathMapping) -> io::Result<bool> {
+    if mapping.local.exists() {
+        return Ok(true);
+    }
+
+    if mapping.local_is_dir {
+        std::fs::create_dir_all(&mapping.local)?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 async fn sync_skill_mappings_up(
@@ -484,13 +519,6 @@ async fn ensure_remote_directory_sync_destinations_exist(
             &format!("mkdir -p {}", shell_single_quote(&target.to_string_lossy())),
         )
         .await?;
-    }
-    Ok(())
-}
-
-fn ensure_local_sync_source_exists(mapping: &ResolvedSyncPathMapping) -> io::Result<()> {
-    if mapping.local_is_dir && !mapping.local.exists() {
-        std::fs::create_dir_all(&mapping.local)?;
     }
     Ok(())
 }
@@ -1101,12 +1129,9 @@ fn build_ssh_interactive_args_with_forwarding(
 }
 
 fn build_install_command(config: &ResolvedRuntimeConfig) -> String {
-    let layout =
-        remote_layout(config).expect("resolved runtime config should produce remote layout");
     format!(
-        "mkdir -p {} && cd {} && {}",
-        shell_single_quote(&layout.root.to_string_lossy()),
-        shell_single_quote(&layout.root.to_string_lossy()),
+        "cd {} && {}",
+        shell_single_quote(&config.remote_home_directory.to_string_lossy()),
         config.install_command
     )
 }
@@ -1136,17 +1161,28 @@ fn build_remote_tui_command_with_relay_and_options(
         argv.push(shell_single_quote("--github-token-env"));
         argv.push(shell_single_quote("GITHUB_MCP_TOKEN"));
     }
-    let mut command = format!("exec {}", argv.join(" "));
+    let mut export_pairs = config
+        .rewritten_remote_config
+        .isolation
+        .set_env
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
     if let Some(github_token) = &config.github_token {
-        command = format!(
-            "export GITHUB_MCP_TOKEN={} && {}",
-            shell_single_quote(github_token),
-            command
-        );
+        export_pairs.push(("GITHUB_MCP_TOKEN", github_token.as_str()));
+    }
+    let mut command = format!("exec {}", argv.join(" "));
+    if !export_pairs.is_empty() {
+        let exports = export_pairs
+            .into_iter()
+            .map(|(name, value)| format!("export {name}={}", shell_single_quote(value)))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        command = format!("{exports} && {command}");
     }
     if options.remote_tui_sanity_check {
         format!(
-            "cd {} && printf 'pwd=%s\\nargv=%s\\n' \"$(pwd)\" {} > launch-wrapper.log && sh -lc {} > launch.stdout 2> launch.stderr",
+            "cd {} && printf 'pwd=%s\\nargv=%s\\n' \"$(pwd)\" {} > launch-wrapper.log && env > launch.env && sh -lc {} > launch.stdout 2> launch.stderr",
             shell_single_quote(&layout.root.to_string_lossy()),
             shell_single_quote(&argv.join(" ")),
             shell_single_quote(&command),
@@ -1344,6 +1380,11 @@ fn expand_path(value: &str) -> io::Result<PathBuf> {
 
 fn expand_remote_path(value: &str, remote_home_directory: &Path) -> io::Result<PathBuf> {
     let home = remote_home_directory.to_string_lossy().into_owned();
+    let remote_user = remote_home_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
     let trimmed = value.trim();
     let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
         trimmed.replacen('~', &home, 1)
@@ -1351,6 +1392,8 @@ fn expand_remote_path(value: &str, remote_home_directory: &Path) -> io::Result<P
         shellexpand::env_with_context_no_errors(trimmed, |name: &str| {
             if name == "HOME" {
                 Some(home.clone())
+            } else if name == "USER" || name == "LOGNAME" {
+                Some(remote_user.clone())
             } else {
                 None
             }
@@ -1551,6 +1594,20 @@ mod tests {
         assert!(command.contains("export GITHUB_MCP_TOKEN='abc'\\''123' && exec"));
         assert!(command.contains("'--github-token-env' 'GITHUB_MCP_TOKEN'"));
 
+        resolved
+            .rewritten_remote_config
+            .isolation
+            .set_env
+            .insert("TMPDIR".to_string(), "/opt/opencode-tmp".to_string());
+        let command_with_set_env = build_remote_tui_command_with_relay_and_options(
+            &resolved,
+            None,
+            &RemoteCliOptions::default(),
+        );
+        assert!(command_with_set_env.contains("export TMPDIR='/opt/opencode-tmp'"));
+        assert!(command_with_set_env.contains("export GITHUB_MCP_TOKEN='abc'\\''123'"));
+        assert!(command_with_set_env.contains("&& exec"));
+
         resolved.github_token = None;
         let command_without_token = build_remote_tui_command_with_relay_and_options(
             &resolved,
@@ -1721,7 +1778,10 @@ mod tests {
         .expect("config should resolve");
 
         assert_eq!(resolved.config_support_sync_up.len(), 1);
-        assert_eq!(resolved.config_support_sync_up[0].local, skill_dir);
+        assert_eq!(
+            resolved.config_support_sync_up[0].local,
+            std::fs::canonicalize(&skill_dir).expect("skill dir should canonicalize")
+        );
         assert_eq!(
             resolved.config_support_sync_up[0].remote,
             PathBuf::from(
@@ -1750,9 +1810,7 @@ mod tests {
             },
             &[ResolvedSyncPathMapping {
                 local: PathBuf::from("/tmp/local-skills/sample-skill"),
-                remote: PathBuf::from(
-                    "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/sample-skill",
-                ),
+                remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/sample-skill"),
                 exclude: Vec::new(),
                 dereference_symlinks: false,
                 local_is_dir: true,
@@ -1780,6 +1838,13 @@ mod tests {
         .expect("config should resolve");
         let layout = remote_layout(&resolved).expect("layout should derive from workspace mapping");
         assert!(build_install_command(&resolved).contains("./install-deps.sh"));
+        let runtime_dirs_command =
+            build_runtime_directories_command(&resolved).expect("runtime command should build");
+        assert!(runtime_dirs_command.contains("if sudo -n true"));
+        assert!(runtime_dirs_command.contains("then sudo mkdir -p"));
+        assert!(runtime_dirs_command.contains("sudo chown \"$(id -un):$(id -gn)\""));
+        assert!(runtime_dirs_command.contains("test -w"));
+        assert!(runtime_dirs_command.contains(".multicode"));
         assert_eq!(
             layout.root,
             PathBuf::from("/home/alice/dev/agent-work/.multicode/remote")
@@ -1804,9 +1869,8 @@ mod tests {
         assert!(
             remote_tui_command
                 .contains("cd '/home/alice/dev/agent-work/.multicode/remote' && exec")
-                || remote_tui_command.contains(
-                    "cd '/home/alice/dev/agent-work/.multicode/remote' && export GITHUB_MCP_TOKEN="
-                )
+                || remote_tui_command
+                    .contains("cd '/home/alice/dev/agent-work/.multicode/remote' && export")
         );
         assert!(
             remote_tui_command
@@ -1869,7 +1933,6 @@ mod tests {
                 "-e".to_string(),
                 "ssh -o StrictHostKeyChecking=yes".to_string(),
                 "--update".to_string(),
-                "--mkpath".to_string(),
                 "--delete".to_string(),
                 "--exclude".to_string(),
                 "target".to_string(),
@@ -1924,6 +1987,26 @@ mod tests {
                 "alice@example.com:/home/alice/dev/agent-work/".to_string(),
                 "/tmp/agent-work/".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_runtime_config_expands_user_variable_in_workspace_path() {
+        let mut config = sample_full_config();
+        config.workspace_directory = "/opt/multicode/dev/agent-work/${USER}".to_string();
+
+        let resolved = resolve_runtime_config(
+            &config,
+            None,
+            Path::new("/home/alice"),
+            RemoteArchitecture::X86_64,
+        )
+        .await
+        .expect("config should resolve");
+
+        assert_eq!(
+            resolved.remote_workspace_directory,
+            PathBuf::from("/opt/multicode/dev/agent-work/alice")
         );
     }
 
@@ -2115,7 +2198,7 @@ mod tests {
             Path::new(".multicode/remote/relay/file.sock"),
             &exclude
         ));
-        assert!(!tree_scan::is_excluded_relative_path(
+        assert!(tree_scan::is_excluded_relative_path(
             Path::new(".multicode"),
             &exclude
         ));
