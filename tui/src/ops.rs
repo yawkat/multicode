@@ -155,12 +155,17 @@ pub(crate) async fn validate_workspace_link_target(
 }
 
 pub(crate) fn attach_cli_args(opencode_command: &str, target: &AttachTarget) -> Vec<String> {
-    vec![
+    let mut args = vec![
         opencode_command.to_string(),
         "attach".to_string(),
         "--print-logs".to_string(),
-        target.uri.clone(),
-    ]
+    ];
+    if let Some(session_id) = target.session_id.as_deref() {
+        args.push("--session".to_string());
+        args.push(session_id.to_string());
+    }
+    args.push(target.uri.clone());
+    args
 }
 
 #[cfg(test)]
