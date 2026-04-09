@@ -48,7 +48,7 @@ image = "ghcr.io/example/multicode-java25:latest"
 
 [isolation]
 writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
-readable = ["~/.config/opencode", "~/.local/share/opencode/auth.json"]
+readable = ["~/.gitconfig", "~/.config/opencode", "~/.local/share/opencode/auth.json"]
 isolated = ["~/.local/share/opencode", "~/.local/state/opencode"]
 tmpfs = ["/tmp"]
 inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR", "GITHUB_MCP_TOKEN"]
@@ -60,6 +60,9 @@ Mounting `~/.config/opencode` read-only lets the container see the same profiles
 skills, and other OpenCode configuration as the host. This is useful if you manage local
 profiles with tools like `ocp`. Keep `~/.local/share/opencode` and `~/.local/state/opencode`
 isolated so session state remains per-workspace.
+
+Mounting `~/.gitconfig` read-only lets the container see your global git identity and defaults.
+Repo-local `.git/config` settings still override the global file.
 
 ## Git / GitHub integration
 

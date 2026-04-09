@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     combined::{CombinedServiceError, SpawnCommand},
-    config::{ExpandedIsolationConfig, RuntimeConfig, path_looks_like_file},
+    config::{ExpandedIsolationConfig, RuntimeConfig, expand_shell_path, path_looks_like_file},
 };
 use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
 
@@ -897,6 +897,7 @@ impl AppleContainerRuntime {
                     }),
             );
         }
+        mount_specs.extend(self.implicit_readable_mounts(&mount_specs));
         mount_specs.sort_by(|a, b| {
             a.depth()
                 .cmp(&b.depth())
@@ -927,6 +928,24 @@ impl AppleContainerRuntime {
         }
 
         Ok(())
+    }
+
+    fn implicit_readable_mounts(&self, existing_mounts: &[MountSpec]) -> Vec<MountSpec> {
+        let Some(gitconfig) = expand_shell_path("~/.gitconfig")
+            .ok()
+            .filter(|path| path.is_absolute() && path.is_file())
+        else {
+            return Vec::new();
+        };
+
+        if existing_mounts
+            .iter()
+            .any(|mount| mount.target == gitconfig)
+        {
+            return Vec::new();
+        }
+
+        vec![MountSpec::new(gitconfig, None, MountKind::Readable)]
     }
 
     async fn build_aggregated_skill_mount(
@@ -1576,6 +1595,55 @@ mod tests {
                     "31337"
                 ]
             ));
+        });
+    }
+
+    #[test]
+    fn apple_container_implicitly_mounts_host_gitconfig() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            let home = root.path().join("home");
+            let gitconfig = home.join(".gitconfig");
+            fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+            fs::create_dir_all(&home).expect("home should exist");
+            fs::write(&gitconfig, "[user]\nname = Test User\n").expect("gitconfig should exist");
+
+            let previous_home = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", &home);
+            }
+
+            let runtime = apple_runtime(&root, IsolationConfig::default());
+            let command = runtime
+                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[])
+                .await
+                .expect("command should build");
+
+            if let Some(previous_home) = previous_home {
+                unsafe {
+                    std::env::set_var("HOME", previous_home);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("HOME");
+                }
+            }
+
+            let gitconfig_mount = format!(
+                "type=bind,source={},target={},readonly",
+                gitconfig.to_string_lossy(),
+                gitconfig.to_string_lossy()
+            );
+            assert!(
+                command.args.iter().any(|arg| arg == &gitconfig_mount),
+                "apple backend should implicitly mount ~/.gitconfig read-only"
+            );
         });
     }
 

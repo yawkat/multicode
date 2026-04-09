@@ -466,27 +466,7 @@ impl CombinedService {
     }
 
     fn github_git_credentials_env_vars(&self) -> Vec<(String, String)> {
-        let Some(github_git_credentials_env) = &self.github_git_credentials_env else {
-            return Vec::new();
-        };
-
-        let helper = r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#;
-        vec![
-            (
-                "MULTICODE_GITHUB_USERNAME".to_string(),
-                github_git_credentials_env.username.clone(),
-            ),
-            (
-                "MULTICODE_GITHUB_TOKEN".to_string(),
-                github_git_credentials_env.token.clone(),
-            ),
-            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-            (
-                "GIT_CONFIG_KEY_0".to_string(),
-                "credential.helper".to_string(),
-            ),
-            ("GIT_CONFIG_VALUE_0".to_string(), helper.to_string()),
-        ]
+        github_git_credentials_env_vars(self.github_git_credentials_env.as_ref())
     }
 
     async fn compress_directory_to_archive(
@@ -673,6 +653,40 @@ fn resolve_container_opencode_command(
             )
         })
         .unwrap_or_else(|| "opencode".to_string())
+}
+
+fn github_git_credentials_env_vars(
+    github_git_credentials_env: Option<&GithubGitCredentialsEnv>,
+) -> Vec<(String, String)> {
+    let Some(github_git_credentials_env) = github_git_credentials_env else {
+        return Vec::new();
+    };
+
+    let helper = r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#;
+    vec![
+        (
+            "MULTICODE_GITHUB_USERNAME".to_string(),
+            github_git_credentials_env.username.clone(),
+        ),
+        (
+            "MULTICODE_GITHUB_TOKEN".to_string(),
+            github_git_credentials_env.token.clone(),
+        ),
+        (
+            "GH_TOKEN".to_string(),
+            github_git_credentials_env.token.clone(),
+        ),
+        (
+            "GITHUB_TOKEN".to_string(),
+            github_git_credentials_env.token.clone(),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "credential.helper".to_string(),
+        ),
+        ("GIT_CONFIG_VALUE_0".to_string(), helper.to_string()),
+    ]
 }
 
 async fn github_git_credentials_env_from_config(
@@ -1525,110 +1539,29 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
 
     #[test]
     fn github_git_credentials_env_vars_include_helper_and_secrets() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime should build");
-
-        runtime.block_on(async {
-            let _env_lock = ENV_VAR_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let root = TestDir::new();
-            let home = root.path().join("home");
-            let runtime_dir = root.path().join("runtime");
-            let github_api_dir = root.path().join("github-api");
-            let github_server = github_api_dir.join("server.py");
-            let github_port = 38492;
-            fs::create_dir_all(&home).expect("home should exist");
-            fs::create_dir_all(&runtime_dir).expect("runtime should exist");
-            fs::create_dir_all(&github_api_dir).expect("github api dir should exist");
-            let workspace_directory = home.join("workspaces");
-            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
-
-            fs::write(
-                &github_server,
-                format!(
-                    r#"from http.server import BaseHTTPRequestHandler, HTTPServer
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/user":
-            body = b'{{"login":"sandbox-user","id":1,"node_id":"MDQ6VXNlcjE=","avatar_url":"https://example.com/avatar","gravatar_id":"","url":"https://api.github.com/users/sandbox-user","html_url":"https://github.com/sandbox-user","followers_url":"https://api.github.com/users/sandbox-user/followers","following_url":"https://api.github.com/users/sandbox-user/following{{/other_user}}","gists_url":"https://api.github.com/users/sandbox-user/gists{{/gist_id}}","starred_url":"https://api.github.com/users/sandbox-user/starred{{/owner}}{{/repo}}","subscriptions_url":"https://api.github.com/users/sandbox-user/subscriptions","organizations_url":"https://api.github.com/users/sandbox-user/orgs","repos_url":"https://api.github.com/users/sandbox-user/repos","events_url":"https://api.github.com/users/sandbox-user/events{{/privacy}}","received_events_url":"https://api.github.com/users/sandbox-user/received_events","type":"User","site_admin":false,"name":"Sandbox User","company":null,"blog":"","location":null,"email":null,"hireable":null,"bio":null,"twitter_username":null,"public_repos":0,"public_gists":0,"followers":0,"following":0,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","private_gists":0,"total_private_repos":0,"owned_private_repos":0,"disk_usage":0,"collaborators":0,"two_factor_authentication":false}}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
-    def log_message(self, format, *args):
-        pass
-HTTPServer(("127.0.0.1", {github_port}), Handler).serve_forever()
-"#
-                ),
-            )
-            .expect("github server script should be written");
-            let mut github_process = std::process::Command::new("python3")
-                .arg(&github_server)
-                .spawn()
-                .expect("github api server should start");
-            std::thread::sleep(std::time::Duration::from_millis(250));
-
-            let _home_guard = EnvVarGuard::set("HOME", &home);
-            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
-            unsafe {
-                std::env::set_var("MULTICODE_GITHUB_TEST_TOKEN", "secret-token");
-                std::env::set_var("GITHUB_API_URL", format!("http://127.0.0.1:{github_port}"));
-            }
-
-            let config: Config = toml::from_str(
-                &format!(
-                    r#"workspace-directory = "{}"
-
-[github]
-populate-git-credentials = true
-token = {{ env = "MULTICODE_GITHUB_TEST_TOKEN" }}
-
-[isolation]
-"#,
-                    workspace_directory.display()
-                ),
-            )
-            .expect("config should parse");
-
-            let service = CombinedService::from_config(config)
-                .await
-                .expect("combined service should start");
-            let env_vars = service.github_git_credentials_env_vars();
-            assert!(env_vars.contains(&(
-                "MULTICODE_GITHUB_USERNAME".to_string(),
-                "sandbox-user".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "MULTICODE_GITHUB_TOKEN".to_string(),
-                "secret-token".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "GIT_CONFIG_COUNT".to_string(),
-                "1".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "GIT_CONFIG_KEY_0".to_string(),
-                "credential.helper".to_string(),
-            )));
-            assert!(env_vars.contains(&(
+        let env_vars = github_git_credentials_env_vars(Some(&GithubGitCredentialsEnv {
+            username: "sandbox-user".to_string(),
+            token: "secret-token".to_string(),
+        }));
+        assert!(env_vars.contains(&(
+            "MULTICODE_GITHUB_USERNAME".to_string(),
+            "sandbox-user".to_string(),
+        )));
+        assert!(env_vars.contains(&(
+            "MULTICODE_GITHUB_TOKEN".to_string(),
+            "secret-token".to_string(),
+        )));
+        assert!(env_vars.contains(&("GH_TOKEN".to_string(), "secret-token".to_string(),)));
+        assert!(env_vars.contains(&("GITHUB_TOKEN".to_string(), "secret-token".to_string(),)));
+        assert!(env_vars.contains(&("GIT_CONFIG_COUNT".to_string(), "1".to_string(),)));
+        assert!(env_vars.contains(&(
+            "GIT_CONFIG_KEY_0".to_string(),
+            "credential.helper".to_string(),
+        )));
+        assert!(env_vars.contains(&(
                 "GIT_CONFIG_VALUE_0".to_string(),
                 r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#.to_string(),
             )));
-
-            unsafe {
-                std::env::remove_var("MULTICODE_GITHUB_TEST_TOKEN");
-                std::env::remove_var("GITHUB_API_URL");
-            }
-            let _ = github_process.kill();
-            let _ = github_process.wait();
-        });
     }
 
     #[test]
