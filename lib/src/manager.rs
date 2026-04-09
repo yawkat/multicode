@@ -111,7 +111,10 @@ impl WorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PersistentWorkspaceSnapshot, TransientWorkspaceSnapshot};
+    use crate::{
+        PersistentWorkspaceSnapshot, RuntimeBackend, RuntimeHandleSnapshot,
+        TransientWorkspaceSnapshot,
+    };
 
     #[test]
     fn add_notifies_workspace_set_watch() {
@@ -190,7 +193,11 @@ mod tests {
             snapshot.persistent.description = "incrementally updated".to_string();
             snapshot.transient = Some(TransientWorkspaceSnapshot {
                 uri: "http://opencode:secret@127.0.0.1:31337/".to_string(),
-                unit: "run-u42.service".to_string(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::LinuxSystemdBwrap,
+                    id: "run-u42.service".to_string(),
+                    metadata: Default::default(),
+                },
             });
             true
         });
@@ -199,7 +206,7 @@ mod tests {
         let updated = workspace_rx.borrow_and_update().clone();
         assert_eq!(updated.persistent.description, "incrementally updated");
         assert_eq!(
-            updated.transient.as_ref().map(|t| t.unit.as_str()),
+            updated.transient.as_ref().map(|t| t.runtime.id.as_str()),
             Some("run-u42.service")
         );
         assert!(!workspace_set_rx.has_changed().expect("watch still open"));

@@ -1,5 +1,4 @@
 use std::{
-    env,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -8,205 +7,33 @@ use std::{
 };
 
 use tokio::process::Command;
-use uuid::Uuid;
-
-fn shell_escape_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        "''".to_string()
-    } else if arg
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | ':' | '_' | '-' | '.' | '='))
-    {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
-    }
-}
-
-fn format_command_line(program: &str, args: &[String]) -> String {
-    std::iter::once(program)
-        .chain(args.iter().map(String::as_str))
-        .map(shell_escape_arg)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn append_systemd_run_inherit_env(args: &mut Vec<String>, env: &[(String, String)]) {
-    for (name, _) in env {
-        args.push("--setenv".to_string());
-        args.push(name.clone());
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {
+    pub program: String,
     pub args: Vec<String>,
     pub inherited_env: Vec<(String, String)>,
 }
 
 use crate::{
-    TransientWorkspaceSnapshot, WorkspaceArchiveFormat, WorkspaceManager, WorkspaceManagerError,
-    database::Database, logging,
+    WorkspaceArchiveFormat, WorkspaceManager, WorkspaceManagerError, database::Database, logging,
 };
 
 use super::{
     GithubStatusService, GithubStatusServiceError, WorkspaceDirectoryError,
     config::{
-        AddedSkillMount, Config, ExpandedIsolationConfig, expand_shell_path, path_looks_like_file,
+        AddedSkillMount, Config, ExpandedIsolationConfig, expand_shell_path, inherited_env_value,
         read_config, resolve_opencode_command, validate_handler_config, validate_remote_config,
         validate_tool_config_entries, validate_workspace_key,
     },
     multicode_metadata_service, opencode_client_service, persistent_storage,
-    resource_usage_service, root_session_service, transient_storage, usage_aggregation_service,
+    resource_usage_service, root_session_service,
+    runtime::WorkspaceRuntime,
+    runtime_reconciliation_service::runtime_reconciliation_service,
+    transient_storage, usage_aggregation_service,
     workspace_archive::ArchiveWorkspaceEntry,
     workspace_directory,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MountKind {
-    Readable,
-    Writable,
-    Isolated,
-    Tmpfs,
-}
-
-#[derive(Debug, Clone)]
-struct MountSpec {
-    target: PathBuf,
-    source: Option<PathBuf>,
-    kind: MountKind,
-    is_file: bool,
-}
-
-impl MountSpec {
-    fn new(target: PathBuf, source: Option<PathBuf>, kind: MountKind) -> Self {
-        let is_file = match source.as_ref() {
-            Some(source) => std::fs::metadata(source)
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false),
-            None => std::fs::metadata(&target)
-                .map(|metadata| metadata.is_file())
-                .unwrap_or_else(|_| path_looks_like_file(&target)),
-        };
-        Self {
-            target,
-            source,
-            kind,
-            is_file,
-        }
-    }
-
-    fn depth(&self) -> usize {
-        self.target.components().count()
-    }
-
-    fn resolve_backing_path(path: &Path, prior_mounts: &[ResolvedMountSpec]) -> PathBuf {
-        for prior_mount in prior_mounts.iter().rev() {
-            if path == prior_mount.mount.target || path.starts_with(&prior_mount.mount.target) {
-                let relative = path
-                    .strip_prefix(&prior_mount.mount.target)
-                    .expect("path should be under prior mount target");
-                return prior_mount.effective_source.join(relative);
-            }
-        }
-        path.to_path_buf()
-    }
-
-    fn resolve_effective(&self, prior_mounts: &[ResolvedMountSpec]) -> ResolvedMountSpec {
-        let effective_target = Self::resolve_backing_path(&self.target, prior_mounts);
-        let effective_source = match self.kind {
-            MountKind::Isolated => self
-                .source
-                .as_ref()
-                .map(|source| Self::resolve_backing_path(source, prior_mounts))
-                .unwrap_or_else(|| effective_target.clone()),
-            MountKind::Readable | MountKind::Writable => {
-                self.source.clone().unwrap_or_else(|| self.target.clone())
-            }
-            MountKind::Tmpfs => effective_target.clone(),
-        };
-        ResolvedMountSpec {
-            mount: self.clone(),
-            effective_target,
-            effective_source,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedMountSpec {
-    mount: MountSpec,
-    effective_target: PathBuf,
-    effective_source: PathBuf,
-}
-
-impl ResolvedMountSpec {
-    async fn prepare_source_node(&self, owns_node: bool) -> Result<(), CombinedServiceError> {
-        self.prepare_node(
-            &self.effective_source,
-            owns_node,
-            self.mount
-                .source
-                .as_ref()
-                .filter(|original| *original != &self.effective_source),
-        )
-        .await
-    }
-
-    async fn prepare_target_node(&self, owns_node: bool) -> Result<(), CombinedServiceError> {
-        let should_materialize = owns_node
-            && (!self.mount.is_file
-                || matches!(self.mount.kind, MountKind::Writable | MountKind::Isolated));
-        self.prepare_node(&self.effective_target, should_materialize, None)
-            .await
-    }
-
-    async fn prepare_node(
-        &self,
-        path: &Path,
-        materialize_node: bool,
-        seed_file: Option<&PathBuf>,
-    ) -> Result<(), CombinedServiceError> {
-        if self.mount.is_file {
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            if materialize_node && tokio::fs::metadata(path).await.is_err() {
-                if let Some(seed_file) = seed_file {
-                    if tokio::fs::metadata(seed_file).await.is_ok() {
-                        tokio::fs::copy(seed_file, path).await?;
-                        return Ok(());
-                    }
-                }
-                tokio::fs::File::create(path).await?;
-            }
-        } else if materialize_node {
-            tokio::fs::create_dir_all(path).await?;
-        } else if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        Ok(())
-    }
-
-    fn append_args(&self, args: &mut Vec<String>) {
-        match self.mount.kind {
-            MountKind::Readable => {
-                args.push("--ro-bind".to_string());
-                args.push(self.effective_source.to_string_lossy().into_owned());
-                args.push(self.mount.target.to_string_lossy().into_owned());
-            }
-            MountKind::Writable | MountKind::Isolated => {
-                args.push("--bind".to_string());
-                args.push(self.effective_source.to_string_lossy().into_owned());
-                args.push(self.mount.target.to_string_lossy().into_owned());
-            }
-            MountKind::Tmpfs => {
-                args.push("--tmpfs".to_string());
-                args.push(self.mount.target.to_string_lossy().into_owned());
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct CombinedService {
@@ -217,6 +44,7 @@ pub struct CombinedService {
     workspace_directory_path: PathBuf,
     expanded_isolation: ExpandedIsolationConfig,
     opencode_command: String,
+    runtime: WorkspaceRuntime,
     github_git_credentials_env: Option<GithubGitCredentialsEnv>,
 }
 
@@ -247,6 +75,8 @@ impl CombinedService {
         validate_handler_config(&config.handler)?;
         validate_remote_config(config.remote.as_ref())?;
         let opencode_command = resolve_opencode_command(&config.opencode)?;
+        let container_opencode_command =
+            resolve_container_opencode_command(config.runtime.backend, &config.opencode);
         let workspace_directory_path = expand_shell_path(&config.workspace_directory)?;
         if let Err(err) = logging::enable_workspace_file_logging(&workspace_directory_path).await {
             logging::log_file_enable_failed(
@@ -273,6 +103,13 @@ impl CombinedService {
             GithubStatusService::new(database.clone(), config.github.token.clone()).await?;
         let github_git_credentials_env =
             github_git_credentials_env_from_config(&config, &github_status_service).await?;
+        let runtime = WorkspaceRuntime::new(
+            config.runtime.clone(),
+            workspace_directory_path.clone(),
+            expanded_isolation.clone(),
+            opencode_command.clone(),
+            container_opencode_command,
+        );
 
         let persistent_path = workspace_directory_path
             .join(".multicode")
@@ -287,6 +124,7 @@ impl CombinedService {
             workspace_directory_path.clone(),
         );
         spawn_transient_storage(manager.clone(), transient_link);
+        spawn_runtime_reconciliation_service(manager.clone(), runtime.clone());
         spawn_opencode_client_service(manager.clone());
         spawn_root_session_service(manager.clone());
         spawn_multicode_metadata_service(manager.clone());
@@ -301,6 +139,7 @@ impl CombinedService {
             workspace_directory_path,
             expanded_isolation,
             opencode_command,
+            runtime,
             github_git_credentials_env,
         })
     }
@@ -341,44 +180,22 @@ impl CombinedService {
         let workspace = self.manager.get_workspace(&key)?;
         let workspace_path = self.workspace_directory_path.join(&key);
         tokio::fs::create_dir_all(&workspace_path).await?;
+        strip_workspace_git_identity_overrides(&workspace_path).await?;
 
-        let password = generate_random_password();
-        let port = pick_random_free_port().await?;
-        let unit = generate_transient_unit_name();
-        let args = self
-            .build_systemd_bwrap_command(&key, &password, port, &unit)
+        let inherited_env = self
+            .sandbox_env_pairs(Vec::<(String, String)>::new())
             .await?;
+        let start = self.runtime.start_server(&key, &inherited_env).await?;
         tracing::info!(
             workspace_key = %key,
-            command = %format_command_line("systemd-run", &args.args),
-            "starting application via systemd-run opencode serve"
+            backend = ?self.config.runtime.backend,
+            runtime_id = %start.transient.runtime.id,
+            "started workspace runtime"
         );
-        let mut command = Command::new("systemd-run");
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .args(&args.args);
-        for (name, value) in &args.inherited_env {
-            command.env(name, value);
-        }
-        let output = command.output().await?;
-
-        if !output.status.success() {
-            return Err(CombinedServiceError::StartWorkspaceFailed {
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-
-        let uri = format!("http://opencode:{password}@127.0.0.1:{port}/");
-        let transient = TransientWorkspaceSnapshot {
-            uri,
-            unit: unit.clone(),
-        };
         let mut replaced = false;
         workspace.update(|snapshot| {
             if snapshot.transient.is_none() {
-                snapshot.transient = Some(transient.clone());
+                snapshot.transient = Some(start.transient.clone());
                 replaced = true;
                 true
             } else {
@@ -387,7 +204,7 @@ impl CombinedService {
         });
 
         if !replaced {
-            stop_systemd_unit(&unit).await?;
+            self.runtime.stop_server(&start.transient.runtime).await?;
             return Err(CombinedServiceError::TransientSnapshotAlreadyPresent(
                 key.to_string(),
             ));
@@ -400,14 +217,14 @@ impl CombinedService {
         let key = validate_workspace_key(key)?;
         let workspace = self.manager.get_workspace(&key)?;
         let workspace_rx = workspace.subscribe();
-        let unit = workspace_rx
+        let runtime_handle = workspace_rx
             .borrow()
             .transient
             .as_ref()
-            .map(|transient| transient.unit.clone())
+            .map(|transient| transient.runtime.clone())
             .ok_or_else(|| CombinedServiceError::TransientSnapshotMissing(key.clone()))?;
 
-        stop_systemd_unit(&unit).await?;
+        self.runtime.stop_server(&runtime_handle).await?;
         workspace.update(|snapshot| {
             if snapshot.transient.is_some() {
                 snapshot.transient = None;
@@ -453,27 +270,12 @@ impl CombinedService {
         let workspace_path = self.workspace_directory_path.join(&key);
         tokio::fs::create_dir_all(&workspace_path).await?;
 
-        let unit = generate_transient_unit_name();
-        let mut args = vec![
-            "--user".to_string(),
-            "--wait".to_string(),
-            "--collect".to_string(),
-            "--pty".to_string(),
-        ];
         let inherited_env = self
             .sandbox_env_pairs(Vec::<(String, String)>::new())
             .await?;
-        append_systemd_run_inherit_env(&mut args, &inherited_env);
-        args.push("--unit".to_string());
-        args.push(unit);
-        self.append_systemd_limits(&mut args);
-        self.append_bwrap_sandbox_args(&mut args, &key).await?;
-        args.extend(command);
-
-        Ok(SpawnCommand {
-            args,
-            inherited_env,
-        })
+        self.runtime
+            .build_pty_command(&key, &inherited_env, command)
+            .await
     }
 
     pub async fn archive_workspace(
@@ -624,6 +426,7 @@ impl CombinedService {
         &self.opencode_command
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn build_systemd_bwrap_command(
         &self,
         key: &str,
@@ -631,50 +434,12 @@ impl CombinedService {
         port: u16,
         unit: &str,
     ) -> Result<SpawnCommand, CombinedServiceError> {
-        let mut args = vec!["--user".to_string(), "--no-block".to_string()];
         let inherited_env = self
-            .sandbox_env_pairs(vec![
-                (
-                    "OPENCODE_SERVER_USERNAME".to_string(),
-                    "opencode".to_string(),
-                ),
-                ("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()),
-            ])
+            .sandbox_env_pairs(Vec::<(String, String)>::new())
             .await?;
-        append_systemd_run_inherit_env(&mut args, &inherited_env);
-        args.push("--unit".to_string());
-        args.push(unit.to_string());
-        self.append_systemd_limits(&mut args);
-
-        self.append_bwrap_sandbox_args(&mut args, key).await?;
-        args.push(self.opencode_command.clone());
-        args.push("serve".to_string());
-        args.push("--hostname".to_string());
-        args.push("127.0.0.1".to_string());
-        args.push("--port".to_string());
-        args.push(port.to_string());
-
-        Ok(SpawnCommand {
-            args,
-            inherited_env,
-        })
-    }
-
-    fn append_systemd_limits(&self, args: &mut Vec<String>) {
-        if let Some(memory_high_bytes) = self.expanded_isolation.memory_high_bytes {
-            args.push("-p".to_string());
-            args.push(format!("MemoryHigh={memory_high_bytes}"));
-        }
-        if let Some(memory_max_bytes) = self.expanded_isolation.memory_max_bytes {
-            args.push("-p".to_string());
-            args.push(format!("MemoryMax={memory_max_bytes}"));
-            args.push("-p".to_string());
-            args.push("MemorySwapMax=0".to_string());
-        }
-        if let Some(cpu) = &self.expanded_isolation.cpu {
-            args.push("-p".to_string());
-            args.push(format!("CPUQuota={cpu}"));
-        }
+        self.runtime
+            .build_linux_start_command(key, password, port, unit, &inherited_env)
+            .await
     }
 
     async fn sandbox_env_pairs(
@@ -688,116 +453,10 @@ impl CombinedService {
                 .inherit_env
                 .iter()
                 .filter_map(|env_name| {
-                    env::var(env_name)
-                        .ok()
-                        .map(|env_value| (env_name.clone(), env_value))
+                    inherited_env_value(env_name).map(|value| (env_name.clone(), value))
                 }),
         );
         Ok(env)
-    }
-
-    async fn append_bwrap_sandbox_args(
-        &self,
-        args: &mut Vec<String>,
-        key: &str,
-    ) -> Result<(), CombinedServiceError> {
-        let workspace_path = self.workspace_directory_path.join(key);
-        let workspace_path_str = workspace_path.to_string_lossy().into_owned();
-
-        args.push("bwrap".to_string());
-        args.push("--chdir".to_string());
-        args.push(workspace_path_str.clone());
-
-        args.push("--ro-bind".to_string());
-        args.push("/".to_string());
-        args.push("/".to_string());
-
-        let mut mount_specs = Vec::new();
-        mount_specs.extend(
-            self.expanded_isolation
-                .readable
-                .iter()
-                .cloned()
-                .map(|path| MountSpec::new(path, None, MountKind::Readable)),
-        );
-        mount_specs.extend(
-            self.expanded_isolation
-                .writable
-                .iter()
-                .cloned()
-                .map(|path| MountSpec::new(path.clone(), Some(path), MountKind::Writable)),
-        );
-        mount_specs.push(MountSpec::new(
-            workspace_path.clone(),
-            Some(workspace_path.clone()),
-            MountKind::Writable,
-        ));
-        mount_specs.extend(
-            self.expanded_isolation
-                .isolated
-                .iter()
-                .cloned()
-                .map(|path| {
-                    let source = self.isolated_storage_path(key, &path);
-                    MountSpec::new(path.clone(), Some(source), MountKind::Isolated)
-                }),
-        );
-        mount_specs.extend(
-            self.expanded_isolation
-                .tmpfs
-                .iter()
-                .cloned()
-                .map(|path| MountSpec::new(path, None, MountKind::Tmpfs)),
-        );
-        mount_specs.extend(
-            self.expanded_isolation
-                .added_skills
-                .iter()
-                .cloned()
-                .map(|mount| MountSpec::new(mount.target, Some(mount.source), MountKind::Readable)),
-        );
-        mount_specs.sort_by(|a, b| {
-            a.depth()
-                .cmp(&b.depth())
-                .then_with(|| a.target.cmp(&b.target))
-                .then_with(|| a.kind.cmp(&b.kind))
-        });
-
-        let mut resolved_mounts = Vec::with_capacity(mount_specs.len());
-        for (index, mount_spec) in mount_specs.iter().enumerate() {
-            let resolved_mount = mount_spec.resolve_effective(&resolved_mounts);
-            let owns_node = !mount_specs.iter().skip(index + 1).any(|other| {
-                other.target.starts_with(&mount_spec.target) && other.target != mount_spec.target
-            });
-            let owns_source_node = owns_node
-                || (mount_spec.is_file
-                    && mount_spec
-                        .source
-                        .as_ref()
-                        .is_some_and(|source| source != &resolved_mount.effective_source));
-            resolved_mount.prepare_source_node(owns_source_node).await?;
-            resolved_mount.prepare_target_node(owns_node).await?;
-            resolved_mounts.push(resolved_mount);
-        }
-
-        for resolved_mount in resolved_mounts {
-            resolved_mount.append_args(args);
-        }
-
-        args.push("--proc".to_string());
-        args.push("/proc".to_string());
-        args.push("--dev".to_string());
-        args.push("/dev".to_string());
-        args.push("--die-with-parent".to_string());
-
-        Ok(())
-    }
-
-    fn isolated_storage_path(&self, key: &str, target: &Path) -> PathBuf {
-        let relative = target
-            .strip_prefix("/")
-            .expect("isolated path is validated as absolute");
-        self.isolate_path_for_key(key).join(relative)
     }
 
     fn isolate_path_for_key(&self, key: &str) -> PathBuf {
@@ -808,27 +467,7 @@ impl CombinedService {
     }
 
     fn github_git_credentials_env_vars(&self) -> Vec<(String, String)> {
-        let Some(github_git_credentials_env) = &self.github_git_credentials_env else {
-            return Vec::new();
-        };
-
-        let helper = r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#;
-        vec![
-            (
-                "MULTICODE_GITHUB_USERNAME".to_string(),
-                github_git_credentials_env.username.clone(),
-            ),
-            (
-                "MULTICODE_GITHUB_TOKEN".to_string(),
-                github_git_credentials_env.token.clone(),
-            ),
-            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
-            (
-                "GIT_CONFIG_KEY_0".to_string(),
-                "credential.helper".to_string(),
-            ),
-            ("GIT_CONFIG_VALUE_0".to_string(), helper.to_string()),
-        ]
+        github_git_credentials_env_vars(self.github_git_credentials_env.as_ref())
     }
 
     async fn compress_directory_to_archive(
@@ -973,6 +612,152 @@ impl CombinedService {
     }
 }
 
+fn resolve_container_opencode_command(
+    backend: crate::RuntimeBackend,
+    candidates: &[String],
+) -> String {
+    if backend == crate::RuntimeBackend::AppleContainer {
+        return candidates
+            .iter()
+            .filter_map(|candidate| {
+                let candidate = candidate.trim();
+                if candidate.is_empty() {
+                    return None;
+                }
+                let name = Path::new(candidate)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(candidate);
+                if name == "opencode" {
+                    Some("opencode".to_string())
+                } else {
+                    None
+                }
+            })
+            .next()
+            .unwrap_or_else(|| "opencode".to_string());
+    }
+
+    candidates
+        .iter()
+        .find_map(|candidate| {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                return None;
+            }
+            Some(
+                Path::new(candidate)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(candidate)
+                    .to_string(),
+            )
+        })
+        .unwrap_or_else(|| "opencode".to_string())
+}
+
+fn github_git_credentials_env_vars(
+    github_git_credentials_env: Option<&GithubGitCredentialsEnv>,
+) -> Vec<(String, String)> {
+    let Some(github_git_credentials_env) = github_git_credentials_env else {
+        return Vec::new();
+    };
+
+    let helper = r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#;
+    vec![
+        (
+            "MULTICODE_GITHUB_USERNAME".to_string(),
+            github_git_credentials_env.username.clone(),
+        ),
+        (
+            "MULTICODE_GITHUB_TOKEN".to_string(),
+            github_git_credentials_env.token.clone(),
+        ),
+        (
+            "GH_TOKEN".to_string(),
+            github_git_credentials_env.token.clone(),
+        ),
+        (
+            "GITHUB_TOKEN".to_string(),
+            github_git_credentials_env.token.clone(),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "credential.helper".to_string(),
+        ),
+        ("GIT_CONFIG_VALUE_0".to_string(), helper.to_string()),
+    ]
+}
+
+async fn strip_workspace_git_identity_overrides(
+    workspace_path: &Path,
+) -> Result<(), CombinedServiceError> {
+    let workspace_path = workspace_path.to_path_buf();
+    let repo_roots = tokio::task::spawn_blocking(move || find_git_repo_roots(&workspace_path))
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))??;
+
+    for repo_root in repo_roots {
+        unset_repo_local_git_config(&repo_root, "user.name").await?;
+        unset_repo_local_git_config(&repo_root, "user.email").await?;
+    }
+
+    Ok(())
+}
+
+fn find_git_repo_roots(workspace_path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut stack = vec![workspace_path.to_path_buf()];
+    let mut repo_roots = std::collections::BTreeSet::new();
+
+    while let Some(directory) = stack.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if entry.file_name() == ".git" {
+                repo_roots.insert(directory.clone());
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+
+    Ok(repo_roots.into_iter().collect())
+}
+
+async fn unset_repo_local_git_config(
+    repo_root: &Path,
+    key: &str,
+) -> Result<(), CombinedServiceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "--local", "--unset-all", key])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+
+    if output.status.success() || output.status.code() == Some(5) {
+        return Ok(());
+    }
+
+    Err(std::io::Error::other(format!(
+        "failed to remove repo-local git config {key} from {}: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+    .into())
+}
+
 async fn github_git_credentials_env_from_config(
     config: &Config,
     github_status_service: &GithubStatusService,
@@ -1041,7 +826,12 @@ pub enum CombinedServiceError {
         field: String,
         message: String,
     },
+    InvalidRuntimeConfig {
+        field: String,
+        message: String,
+    },
     InvalidToolExecution(String),
+    UnsupportedRuntimeBackend(String),
     WorkspaceArchived(String),
     WorkspaceNotArchived(String),
     ArchiveWorkspaceRunning(String),
@@ -1095,38 +885,7 @@ impl From<GithubStatusServiceError> for CombinedServiceError {
     }
 }
 
-fn generate_random_password() -> String {
-    Uuid::new_v4().as_simple().to_string()
-}
-
-fn generate_transient_unit_name() -> String {
-    format!("multicode-{}.service", Uuid::new_v4().as_simple())
-}
-
-async fn pick_random_free_port() -> Result<u16, CombinedServiceError> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
-
-async fn stop_systemd_unit(unit: &str) -> Result<(), CombinedServiceError> {
-    let args = stop_systemd_args(unit);
-    let output = Command::new("systemctl")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(CombinedServiceError::StopWorkspaceFailed {
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
-}
-
+#[cfg_attr(not(test), allow(dead_code))]
 fn stop_systemd_args(unit: &str) -> Vec<String> {
     vec![
         "--user".to_string(),
@@ -1152,6 +911,14 @@ fn spawn_transient_storage(manager: Arc<WorkspaceManager>, transient_link: PathB
     tokio::spawn(async move {
         if let Err(err) = transient_storage(manager, transient_link).await {
             tracing::error!(error = ?err, "transient storage service exited with error");
+        }
+    });
+}
+
+fn spawn_runtime_reconciliation_service(manager: Arc<WorkspaceManager>, runtime: WorkspaceRuntime) {
+    tokio::spawn(async move {
+        if let Err(err) = runtime_reconciliation_service(manager, runtime).await {
+            tracing::error!(error = ?err, "runtime reconciliation service exited with error");
         }
     });
 }
@@ -1199,7 +966,10 @@ fn spawn_resource_usage_service(manager: Arc<WorkspaceManager>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::{GithubTokenConfig, ToolType};
+    use crate::services::{
+        GithubTokenConfig, ToolType,
+        runtime::{MountKind, MountSpec},
+    };
     use crate::test_support::ENV_VAR_LOCK;
     use diesel::{QueryableByName, RunQueryDsl, sql_query, sqlite::SqliteConnection};
     use std::os::unix::fs::PermissionsExt;
@@ -1314,6 +1084,35 @@ token = { env = "GITHUB_TOKEN" }
                 env: Some("GITHUB_TOKEN".to_string()),
                 command: None,
             })
+        );
+    }
+
+    #[test]
+    fn resolve_container_opencode_command_prefers_opencode_for_apple_backend() {
+        assert_eq!(
+            resolve_container_opencode_command(
+                crate::RuntimeBackend::AppleContainer,
+                &["opencode-cli".to_string(), "opencode".to_string()]
+            ),
+            "opencode"
+        );
+        assert_eq!(
+            resolve_container_opencode_command(
+                crate::RuntimeBackend::AppleContainer,
+                &["/opt/homebrew/bin/opencode-cli".to_string()]
+            ),
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn resolve_container_opencode_command_keeps_first_candidate_for_linux_backend() {
+        assert_eq!(
+            resolve_container_opencode_command(
+                crate::RuntimeBackend::LinuxSystemdBwrap,
+                &["opencode-cli".to_string(), "opencode".to_string()]
+            ),
+            "opencode-cli"
         );
     }
 
@@ -1809,109 +1608,113 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
 
     #[test]
     fn github_git_credentials_env_vars_include_helper_and_secrets() {
+        let env_vars = github_git_credentials_env_vars(Some(&GithubGitCredentialsEnv {
+            username: "sandbox-user".to_string(),
+            token: "secret-token".to_string(),
+        }));
+        assert!(env_vars.contains(&(
+            "MULTICODE_GITHUB_USERNAME".to_string(),
+            "sandbox-user".to_string(),
+        )));
+        assert!(env_vars.contains(&(
+            "MULTICODE_GITHUB_TOKEN".to_string(),
+            "secret-token".to_string(),
+        )));
+        assert!(env_vars.contains(&("GH_TOKEN".to_string(), "secret-token".to_string(),)));
+        assert!(env_vars.contains(&("GITHUB_TOKEN".to_string(), "secret-token".to_string(),)));
+        assert!(env_vars.contains(&("GIT_CONFIG_COUNT".to_string(), "1".to_string(),)));
+        assert!(env_vars.contains(&(
+            "GIT_CONFIG_KEY_0".to_string(),
+            "credential.helper".to_string(),
+        )));
+        assert!(env_vars.contains(&(
+                "GIT_CONFIG_VALUE_0".to_string(),
+                r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#.to_string(),
+            )));
+    }
+
+    #[test]
+    fn strip_workspace_git_identity_overrides_removes_repo_local_user_identity() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
-            let _env_lock = ENV_VAR_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
-            let home = root.path().join("home");
-            let runtime_dir = root.path().join("runtime");
-            let github_api_dir = root.path().join("github-api");
-            let github_server = github_api_dir.join("server.py");
-            let github_port = 38492;
-            fs::create_dir_all(&home).expect("home should exist");
-            fs::create_dir_all(&runtime_dir).expect("runtime should exist");
-            fs::create_dir_all(&github_api_dir).expect("github api dir should exist");
-            let workspace_directory = home.join("workspaces");
-            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            let workspace = root.path().join("workspace");
+            let repo = workspace.join("repo");
+            fs::create_dir_all(&repo).expect("repo dir should exist");
 
-            fs::write(
-                &github_server,
-                format!(
-                    r#"from http.server import BaseHTTPRequestHandler, HTTPServer
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/user":
-            body = b'{{"login":"sandbox-user","id":1,"node_id":"MDQ6VXNlcjE=","avatar_url":"https://example.com/avatar","gravatar_id":"","url":"https://api.github.com/users/sandbox-user","html_url":"https://github.com/sandbox-user","followers_url":"https://api.github.com/users/sandbox-user/followers","following_url":"https://api.github.com/users/sandbox-user/following{{/other_user}}","gists_url":"https://api.github.com/users/sandbox-user/gists{{/gist_id}}","starred_url":"https://api.github.com/users/sandbox-user/starred{{/owner}}{{/repo}}","subscriptions_url":"https://api.github.com/users/sandbox-user/subscriptions","organizations_url":"https://api.github.com/users/sandbox-user/orgs","repos_url":"https://api.github.com/users/sandbox-user/repos","events_url":"https://api.github.com/users/sandbox-user/events{{/privacy}}","received_events_url":"https://api.github.com/users/sandbox-user/received_events","type":"User","site_admin":false,"name":"Sandbox User","company":null,"blog":"","location":null,"email":null,"hireable":null,"bio":null,"twitter_username":null,"public_repos":0,"public_gists":0,"followers":0,"following":0,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","private_gists":0,"total_private_repos":0,"owned_private_repos":0,"disk_usage":0,"collaborators":0,"two_factor_authentication":false}}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
-    def log_message(self, format, *args):
-        pass
-HTTPServer(("127.0.0.1", {github_port}), Handler).serve_forever()
-"#
-                ),
-            )
-            .expect("github server script should be written");
-            let mut github_process = std::process::Command::new("python3")
-                .arg(&github_server)
-                .spawn()
-                .expect("github api server should start");
-            std::thread::sleep(std::time::Duration::from_millis(250));
-
-            let _home_guard = EnvVarGuard::set("HOME", &home);
-            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
-            unsafe {
-                std::env::set_var("MULTICODE_GITHUB_TEST_TOKEN", "secret-token");
-                std::env::set_var("GITHUB_API_URL", format!("http://127.0.0.1:{github_port}"));
-            }
-
-            let config: Config = toml::from_str(
-                &format!(
-                    r#"workspace-directory = "{}"
-
-[github]
-populate-git-credentials = true
-token = {{ env = "MULTICODE_GITHUB_TEST_TOKEN" }}
-
-[isolation]
-"#,
-                    workspace_directory.display()
-                ),
-            )
-            .expect("config should parse");
-
-            let service = CombinedService::from_config(config)
+            let init = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["init"])
+                .stdin(Stdio::null())
+                .output()
                 .await
-                .expect("combined service should start");
-            let env_vars = service.github_git_credentials_env_vars();
-            assert!(env_vars.contains(&(
-                "MULTICODE_GITHUB_USERNAME".to_string(),
-                "sandbox-user".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "MULTICODE_GITHUB_TOKEN".to_string(),
-                "secret-token".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "GIT_CONFIG_COUNT".to_string(),
-                "1".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "GIT_CONFIG_KEY_0".to_string(),
-                "credential.helper".to_string(),
-            )));
-            assert!(env_vars.contains(&(
-                "GIT_CONFIG_VALUE_0".to_string(),
-                r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#.to_string(),
-            )));
+                .expect("git init should run");
+            assert!(init.status.success(), "git init should succeed");
 
-            unsafe {
-                std::env::remove_var("MULTICODE_GITHUB_TEST_TOKEN");
-                std::env::remove_var("GITHUB_API_URL");
-            }
-            let _ = github_process.kill();
-            let _ = github_process.wait();
+            let set_name = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "user.name", "Local Name"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config user.name should run");
+            assert!(
+                set_name.status.success(),
+                "git config user.name should succeed"
+            );
+
+            let set_email = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "user.email", "local@example.com"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config user.email should run");
+            assert!(
+                set_email.status.success(),
+                "git config user.email should succeed"
+            );
+
+            strip_workspace_git_identity_overrides(&workspace)
+                .await
+                .expect("workspace git identity cleanup should succeed");
+
+            let get_name = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "--get", "user.name"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config get user.name should run");
+            assert_eq!(get_name.status.code(), Some(1));
+
+            let get_email = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "--get", "user.email"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config get user.email should run");
+            assert_eq!(get_email.status.code(), Some(1));
+
+            let remote = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "core.repositoryformatversion"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config core.repositoryformatversion should run");
+            assert!(remote.status.success(), "repo config should remain intact");
         });
     }
 

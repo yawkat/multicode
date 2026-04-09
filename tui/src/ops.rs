@@ -1,4 +1,6 @@
 use crate::*;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 pub(crate) fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -208,6 +210,18 @@ pub(crate) async fn run_tmux_new_session_command(
     workspace_key: &str,
     custom_description: &str,
 ) -> io::Result<()> {
+    if !command_exists("tmux") {
+        let debug_command = command
+            .split_first()
+            .map(|(program, args)| format_command_line(program, args))
+            .unwrap_or_else(|| "<empty command>".to_string());
+        tracing::info!(
+            command = %debug_command,
+            "tmux unavailable; running interactive command directly"
+        );
+        return run_interactive_command(terminal, env, &command).await;
+    }
+
     restore_terminal(terminal)?;
 
     let session_name = generate_tmux_session_name(workspace_key);
@@ -319,6 +333,58 @@ pub(crate) async fn run_tmux_new_session_command(
         (_, Err(err)) => Err(err),
         (Some(err), Ok(())) => Err(err),
         (None, Ok(())) => Ok(()),
+    }
+}
+
+pub(crate) fn command_exists(command: &str) -> bool {
+    if command.contains('/') {
+        return is_executable_file(Path::new(command));
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(command))
+        .any(|candidate| is_executable_file(&candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+async fn run_interactive_command(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    env: &[(String, String)],
+    command: &[String],
+) -> io::Result<()> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(io::Error::other("interactive command must not be empty"));
+    };
+
+    restore_terminal(terminal)?;
+    let status = Command::new(program)
+        .args(args)
+        .envs(env.iter().cloned())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await;
+    let setup_result = setup_terminal().map(|new_terminal| {
+        *terminal = new_terminal;
+    });
+
+    match (status, setup_result) {
+        (_, Err(err)) => Err(err),
+        (Ok(status), Ok(())) if status.success() => Ok(()),
+        (Ok(status), Ok(())) => Err(io::Error::other(format!(
+            "interactive command exited with status {status}"
+        ))),
+        (Err(err), Ok(())) => Err(err),
     }
 }
 

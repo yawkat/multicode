@@ -1753,6 +1753,7 @@ dependencies = [
 name = "multicode-lib"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "diesel",
  "diesel_migrations",
  "libsqlite3-sys",

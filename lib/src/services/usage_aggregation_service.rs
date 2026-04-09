@@ -354,8 +354,21 @@ fn sum_usage(usage_by_message: &HashMap<String, MessageUsage>) -> (u64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OpencodeClientSnapshot, TransientWorkspaceSnapshot};
+    use crate::{
+        OpencodeClientSnapshot, RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn transient_snapshot(uri: String, runtime_id: &str) -> TransientWorkspaceSnapshot {
+        TransientWorkspaceSnapshot {
+            uri,
+            runtime: RuntimeHandleSnapshot {
+                backend: RuntimeBackend::LinuxSystemdBwrap,
+                id: runtime_id.to_string(),
+                metadata: Default::default(),
+            },
+        }
+    }
 
     fn assistant_message_json(
         message_id: &str,
@@ -507,10 +520,10 @@ mod tests {
                 events: event_tx,
             };
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-usage.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    format!("{base_uri}/"),
+                    "run-u-usage.service",
+                ));
                 snapshot.root_session_id = Some("ses-root".to_string());
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
@@ -653,10 +666,10 @@ mod tests {
                 events: event_tx.clone(),
             };
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-usage-events.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    format!("{base_uri}/"),
+                    "run-u-usage-events.service",
+                ));
                 snapshot.root_session_id = Some("ses-root".to_string());
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true

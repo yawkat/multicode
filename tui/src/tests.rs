@@ -11,9 +11,9 @@ mod tests {
         pr_review_icon_color,
     };
     use crate::ops::{
-        SessionWaitState, attach_cli_args, build_handler_command, session_wait_state_for_entry,
-        tmux_session_command, tmux_status_left, validate_workspace_link_target,
-        workspace_attach_target, workspace_ordering,
+        SessionWaitState, attach_cli_args, build_handler_command, command_exists,
+        session_wait_state_for_entry, tmux_session_command, tmux_status_left,
+        validate_workspace_link_target, workspace_attach_target, workspace_ordering,
     };
     use crate::render::selected_link_tooltip_area;
     use crate::system::{
@@ -21,9 +21,13 @@ mod tests {
         parse_proc_meminfo_total_ram_bytes, parse_proc_meminfo_used_ram_bytes,
         started_workspace_attach_ready,
     };
-    use multicode_lib::{PersistentWorkspaceSnapshot, TransientWorkspaceSnapshot};
+    use multicode_lib::{
+        PersistentWorkspaceSnapshot, RuntimeBackend, RuntimeHandleSnapshot,
+        TransientWorkspaceSnapshot,
+    };
     use std::{
         fs,
+        os::unix::fs::PermissionsExt,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -64,7 +68,11 @@ mod tests {
             persistent: PersistentWorkspaceSnapshot::default(),
             transient: uri.map(|uri| TransientWorkspaceSnapshot {
                 uri: uri.to_string(),
-                unit: "unit.service".to_string(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::LinuxSystemdBwrap,
+                    id: "unit.service".to_string(),
+                    metadata: Default::default(),
+                },
             }),
             opencode_client: started.then(|| multicode_lib::OpencodeClientSnapshot {
                 client: std::sync::Arc::new(multicode_lib::opencode::client::Client::new(
@@ -88,7 +96,11 @@ mod tests {
             persistent: PersistentWorkspaceSnapshot::default(),
             transient: Some(TransientWorkspaceSnapshot {
                 uri: "http://127.0.0.1".to_string(),
-                unit: "unit.service".to_string(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::LinuxSystemdBwrap,
+                    id: "unit.service".to_string(),
+                    metadata: Default::default(),
+                },
             }),
             opencode_client: None,
             root_session_id: None,
@@ -220,6 +232,38 @@ mod tests {
                 "attach".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn command_exists_detects_executable_files_on_path() {
+        let root = TestDir::new();
+        let bin_dir = root.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        let tool_path = bin_dir.join("multicode-test-tool");
+        fs::write(&tool_path, "#!/bin/sh\nexit 0\n").expect("tool should be written");
+        let mut perms = fs::metadata(&tool_path)
+            .expect("tool metadata should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tool_path, perms).expect("tool should be executable");
+
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", bin_dir.as_os_str());
+        }
+
+        assert!(command_exists("multicode-test-tool"));
+        assert!(!command_exists("missing-tool"));
+
+        if let Some(path) = old_path {
+            unsafe {
+                std::env::set_var("PATH", path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
     }
 
     #[test]

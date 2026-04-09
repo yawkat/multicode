@@ -529,7 +529,9 @@ fn should_sync_bidirectional_mapping_up(
     remote_latest: Option<SystemTime>,
 ) -> bool {
     match (local_latest, remote_latest) {
-        (Some(_), Some(_)) => compare_sync_tree_recency(local_latest, remote_latest) != Ordering::Less,
+        (Some(_), Some(_)) => {
+            compare_sync_tree_recency(local_latest, remote_latest) != Ordering::Less
+        }
         (Some(_), None) => true,
         (None, Some(_)) => false,
         (None, None) => true,
@@ -2179,7 +2181,9 @@ mod tests {
         std::fs::create_dir_all(&local_dir).expect("local dir should be created");
         let mapping = ResolvedSyncPathMapping {
             local: local_dir.clone(),
-            remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha"),
+            remote: PathBuf::from(
+                "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha",
+            ),
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
@@ -2194,7 +2198,10 @@ mod tests {
         )
         .expect("directory sync args should build");
 
-        assert!(args.iter().any(|arg| arg == &format!("{}/", local_dir.to_string_lossy())));
+        assert!(
+            args.iter()
+                .any(|arg| arg == &format!("{}/", local_dir.to_string_lossy()))
+        );
         assert!(!args.iter().any(|arg| arg == "--mkpath"));
         assert!(args.iter().any(|arg| {
             arg == "alice@example.com:/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha/"
