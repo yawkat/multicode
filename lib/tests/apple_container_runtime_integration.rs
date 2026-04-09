@@ -243,7 +243,10 @@ cpu = "300%"
             .clone()
             .expect("transient snapshot should be present");
         assert_eq!(transient.runtime.backend, RuntimeBackend::AppleContainer);
-        assert_eq!(transient.runtime.id, "multicode-alpha");
+        assert!(
+            transient.runtime.id.starts_with("multicode-alpha-"),
+            "apple runtime id should include the workspace key and a unique suffix"
+        );
         assert!(transient.uri.starts_with("http://opencode:"));
 
         let commands = read_commands(&fake_container_root.join("commands.log"));
@@ -251,7 +254,7 @@ cpu = "300%"
             .iter()
             .find(|line| line.starts_with("run "))
             .expect("run command should be logged");
-        assert!(run_command.contains("--name multicode-alpha"));
+        assert!(run_command.contains(&format!("--name {}", transient.runtime.id)));
         assert!(run_command.contains("--cpus 3"));
         assert!(run_command.contains("--memory 17179869184"));
         assert!(run_command.contains("--tmpfs /tmp"));
@@ -294,14 +297,16 @@ cpu = "300%"
 
         let commands = read_commands(&fake_container_root.join("commands.log"));
         assert!(
-            commands.iter().any(|line| line == "rm -f multicode-alpha"),
+            commands
+                .iter()
+                .any(|line| line == &format!("rm -f {}", transient.runtime.id)),
             "stop should remove the container"
         );
     });
 }
 
 #[test]
-fn start_workspace_removes_stale_named_container_before_run() {
+fn start_workspace_uses_unique_runtime_id_even_when_stale_named_container_exists() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -370,20 +375,29 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR", "PATH"]
         service
             .start_workspace("alpha")
             .await
-            .expect("workspace should start after removing stale container");
+            .expect("workspace should start even if a stale fixed-name container exists");
 
+        let transient = service
+            .manager
+            .get_workspace("alpha")
+            .expect("workspace should exist")
+            .subscribe()
+            .borrow()
+            .clone()
+            .transient
+            .expect("transient snapshot should be present");
         let commands = read_commands(&fake_container_root.join("commands.log"));
-        let stale_rm_index = commands
+        let run_command = commands
             .iter()
-            .position(|line| line == "rm -f multicode-alpha")
-            .expect("stale container should be removed before start");
-        let run_index = commands
-            .iter()
-            .position(|line| line.starts_with("run "))
+            .find(|line| line.starts_with("run "))
             .expect("run command should be logged");
         assert!(
-            stale_rm_index < run_index,
-            "stale container removal should happen before run"
+            run_command.contains(&format!("--name {}", transient.runtime.id)),
+            "apple backend should start a uniquely named runtime"
+        );
+        assert!(
+            transient.runtime.id != "multicode-alpha",
+            "apple backend should not reuse the stale fixed container name"
         );
     });
 }

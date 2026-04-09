@@ -26,6 +26,11 @@ pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
     Some(format!("{NERD_FONT_GITHUB_GLYPH} {owner}/{repo}#{number}"))
 }
 
+pub(crate) fn should_request_autonomous_issue_scan(snapshot: &WorkspaceSnapshot) -> bool {
+    snapshot.persistent.assigned_repository.is_some()
+        && snapshot.persistent.automation_issue.is_none()
+}
+
 impl TuiState {
     pub(crate) async fn new(
         config_path: PathBuf,
@@ -63,10 +68,12 @@ impl TuiState {
             mode: UiMode::Normal,
             create_input: String::new(),
             edit_input: String::new(),
+            repository_input: String::new(),
             custom_link_input: String::new(),
             custom_link_kind: None,
             custom_link_action: None,
             custom_link_original_value: None,
+            pending_delete_workspace_key: None,
             starting_workspace_key: None,
             started_wait_since: None,
             previous_machine_cpu_totals: None,
@@ -178,12 +185,20 @@ impl TuiState {
                     self.mode = UiMode::Normal;
                     self.edit_input.clear();
                 }
+                UiMode::EditRepository => {
+                    self.mode = UiMode::Normal;
+                    self.repository_input.clear();
+                }
                 UiMode::EditCustomLink => {
                     self.mode = UiMode::Normal;
                     self.custom_link_input.clear();
                     self.custom_link_kind = None;
                     self.custom_link_action = None;
                     self.custom_link_original_value = None;
+                }
+                UiMode::ConfirmDelete => {
+                    self.mode = UiMode::Normal;
+                    self.pending_delete_workspace_key = None;
                 }
                 _ => {}
             }
@@ -199,8 +214,7 @@ impl TuiState {
                 Some(WorkspaceUiState::Started) => {}
                 Some(WorkspaceUiState::Stopped) => {
                     if let Some(key) = self.starting_workspace_key.as_deref() {
-                        self.status =
-                            format!("Workspace '{key}' failed to start; server is still stopped");
+                        self.status = starting_modal_failure_status(key, self.snapshots.get(key));
                     }
                     self.mode = UiMode::Normal;
                     self.starting_workspace_key = None;
@@ -224,6 +238,16 @@ impl TuiState {
                 self.mode = UiMode::Normal;
                 self.running_operation = None;
             }
+        }
+
+        if self.mode == UiMode::ConfirmDelete
+            && self
+                .pending_delete_workspace_key
+                .as_deref()
+                .is_some_and(|key| !self.snapshots.contains_key(key))
+        {
+            self.mode = UiMode::Normal;
+            self.pending_delete_workspace_key = None;
         }
     }
 
@@ -525,6 +549,12 @@ impl TuiState {
         let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
             return;
         };
+        let autonomous_scan_requested = self
+            .snapshots
+            .get(&workspace_key)
+            .filter(|snapshot| should_request_autonomous_issue_scan(snapshot))
+            .map(|_| self.service.request_workspace_issue_scan(&workspace_key))
+            .transpose();
 
         let requested_refreshes = self
             .selected_workspace_selectable_links()
@@ -534,13 +564,32 @@ impl TuiState {
             .filter(|url| self.service.github_status_service().request_refresh(url))
             .count();
 
-        if requested_refreshes > 0 {
-            self.status =
-                format!("Requested GitHub status recheck for workspace '{workspace_key}'");
-        } else {
-            self.status = format!(
-                "No refreshable GitHub status links available for workspace '{workspace_key}'"
-            );
+        match autonomous_scan_requested {
+            Err(err) => {
+                self.status = format!(
+                    "Failed to request autonomous issue scan for workspace '{workspace_key}': {err:?}"
+                );
+            }
+            Ok(Some(())) => {
+                if requested_refreshes > 0 {
+                    self.status = format!(
+                        "Requested GitHub status recheck and autonomous issue scan for workspace '{workspace_key}'"
+                    );
+                } else {
+                    self.status =
+                        format!("Requested autonomous issue scan for workspace '{workspace_key}'");
+                }
+            }
+            Ok(None) => {
+                if requested_refreshes > 0 {
+                    self.status =
+                        format!("Requested GitHub status recheck for workspace '{workspace_key}'");
+                } else {
+                    self.status = format!(
+                        "No refreshable GitHub status links available for workspace '{workspace_key}'"
+                    );
+                }
+            }
         }
     }
 
@@ -618,7 +667,9 @@ impl TuiState {
             UiMode::Normal => self.handle_normal_key(terminal, key).await,
             UiMode::CreateModal => self.handle_create_modal_key(key).await,
             UiMode::EditDescription => self.handle_edit_key(key),
+            UiMode::EditRepository => self.handle_repository_key(key).await,
             UiMode::EditCustomLink => self.handle_custom_link_key(key),
+            UiMode::ConfirmDelete => self.handle_confirm_delete_key(key).await,
             UiMode::StartingModal => {}
             UiMode::ToolProgressModal => self.handle_tool_progress_key(key),
         }
@@ -1170,7 +1221,8 @@ impl TuiState {
                                 }
                                 Err(err) => {
                                     self.status = format!(
-                                        "Failed to start workspace '{key}' before attaching: {err:?}"
+                                        "Failed to start workspace '{key}' before attaching: {}",
+                                        err.summary()
                                     );
                                 }
                             }
@@ -1242,6 +1294,25 @@ impl TuiState {
                     self.mode = UiMode::EditDescription;
                 }
             }
+            KeyCode::Char('g') => {
+                if link_selected {
+                    return;
+                }
+                if let Some(key) = self.selected_workspace_key() {
+                    let Some(snapshot) = self.snapshots.get(key) else {
+                        return;
+                    };
+                    if !workspace_is_usable(snapshot) {
+                        return;
+                    }
+                    self.repository_input = snapshot
+                        .persistent
+                        .assigned_repository
+                        .clone()
+                        .unwrap_or_default();
+                    self.mode = UiMode::EditRepository;
+                }
+            }
             KeyCode::Char('s') => {
                 if link_selected {
                     return;
@@ -1262,7 +1333,10 @@ impl TuiState {
                             match self.service.start_workspace(&key).await {
                                 Ok(_) => self.status = format!("Starting workspace '{key}'"),
                                 Err(err) => {
-                                    self.status = format!("Failed to start workspace: {err:?}")
+                                    self.status = format!(
+                                        "Failed to start workspace '{key}': {}",
+                                        err.summary()
+                                    )
                                 }
                             }
                         }
@@ -1283,6 +1357,15 @@ impl TuiState {
                     return;
                 }
                 self.request_selected_workspace_github_status_refresh();
+            }
+            KeyCode::Char('x') => {
+                if link_selected {
+                    return;
+                }
+                if let Some(key) = self.selected_workspace_key().map(str::to_string) {
+                    self.pending_delete_workspace_key = Some(key);
+                    self.mode = UiMode::ConfirmDelete;
+                }
             }
             KeyCode::Char(ch) => {
                 if link_selected {
@@ -1368,6 +1451,79 @@ impl TuiState {
                         }
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_repository_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = UiMode::Normal;
+                self.repository_input.clear();
+            }
+            KeyCode::Backspace => {
+                self.repository_input.pop();
+            }
+            KeyCode::Char(ch) => {
+                self.repository_input.push(ch);
+            }
+            KeyCode::Enter => {
+                let Some(key) = self.selected_workspace_key().map(str::to_string) else {
+                    return;
+                };
+                let repository = self.repository_input.trim().to_string();
+                let repository = (!repository.is_empty()).then_some(repository);
+                match self
+                    .service
+                    .assign_workspace_repository(&key, repository.as_deref())
+                    .await
+                {
+                    Ok(Some(normalized)) => {
+                        self.status =
+                            format!("Assigned repository '{normalized}' to workspace '{key}'");
+                        self.mode = UiMode::Normal;
+                        self.repository_input.clear();
+                    }
+                    Ok(None) => {
+                        self.status =
+                            format!("Cleared repository assignment for workspace '{key}'");
+                        self.mode = UiMode::Normal;
+                        self.repository_input.clear();
+                    }
+                    Err(err) => {
+                        self.status = format!("Failed to update repository assignment: {err:?}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_confirm_delete_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = UiMode::Normal;
+                self.pending_delete_workspace_key = None;
+            }
+            KeyCode::Enter => {
+                let Some(workspace_key) = self.pending_delete_workspace_key.clone() else {
+                    self.mode = UiMode::Normal;
+                    return;
+                };
+                match self.service.delete_workspace(&workspace_key).await {
+                    Ok(()) => {
+                        self.status = format!("Deleted workspace '{workspace_key}'");
+                    }
+                    Err(err) => {
+                        self.status = format!(
+                            "Failed to delete workspace '{workspace_key}': {}",
+                            err.summary()
+                        );
+                    }
+                }
+                self.mode = UiMode::Normal;
+                self.pending_delete_workspace_key = None;
             }
             _ => {}
         }
@@ -1482,6 +1638,21 @@ impl TuiState {
             _ => {}
         }
     }
+}
+
+pub(crate) fn starting_modal_failure_status(
+    key: &str,
+    snapshot: Option<&WorkspaceSnapshot>,
+) -> String {
+    if let Some(automation_status) = snapshot
+        .and_then(|snapshot| snapshot.automation_status.as_deref())
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    {
+        return format!("Workspace '{key}' failed to start: {automation_status}");
+    }
+
+    format!("Workspace '{key}' failed to start; server is still stopped")
 }
 
 pub(crate) async fn dispatch_handler_action(

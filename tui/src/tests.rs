@@ -5,7 +5,7 @@ mod tests {
     use multicode_lib::services::HandlerConfig;
 
     use super::*;
-    use crate::app::compact_github_tooltip_target;
+    use crate::app::{compact_github_tooltip_target, starting_modal_failure_status};
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
         pr_review_icon_color,
@@ -83,6 +83,8 @@ mod tests {
             root_session_id: None,
             root_session_title: None,
             root_session_status: None,
+            automation_status: None,
+            automation_scan_request_nonce: 0,
             usage_total_tokens: None,
             usage_total_cost: None,
             usage_cpu_percent: None,
@@ -106,6 +108,8 @@ mod tests {
             root_session_id: None,
             root_session_title: None,
             root_session_status: None,
+            automation_status: None,
+            automation_scan_request_nonce: 0,
             usage_total_tokens: None,
             usage_total_cost: None,
             usage_cpu_percent: None,
@@ -116,6 +120,24 @@ mod tests {
 
     fn no_tool_hotkeys() -> &'static [(String, String)] {
         &[].as_slice()
+    }
+
+    #[test]
+    fn should_request_autonomous_issue_scan_for_assigned_workspace_without_active_issue() {
+        let mut stopped = WorkspaceSnapshot::default();
+        stopped.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-serialization".to_string());
+        assert!(crate::app::should_request_autonomous_issue_scan(&stopped));
+
+        stopped.persistent.automation_issue = Some(
+            "https://github.com/micronaut-projects/micronaut-serialization/issues/989".to_string(),
+        );
+        assert!(!crate::app::should_request_autonomous_issue_scan(&stopped));
+
+        let unassigned = WorkspaceSnapshot::default();
+        assert!(!crate::app::should_request_autonomous_issue_scan(
+            &unassigned
+        ));
     }
 
     #[test]
@@ -903,6 +925,7 @@ mod tests {
             false,
             Some(WorkspaceLinkKind::Issue),
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -937,6 +960,7 @@ mod tests {
             false,
             Some(WorkspaceLinkKind::Issue),
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -964,6 +988,7 @@ mod tests {
             true,
             Some(WorkspaceLinkKind::Issue),
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -993,6 +1018,7 @@ mod tests {
             false,
             None,
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1013,6 +1039,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             no_tool_hotkeys(),
             "",
@@ -1037,6 +1064,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             no_tool_hotkeys(),
             "",
@@ -1066,6 +1094,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1088,6 +1117,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1098,6 +1128,60 @@ mod tests {
             .collect::<String>();
         assert!(!stopped_text.contains("Enter attach"));
         assert!(stopped_text.contains("Enter start+attach"));
+    }
+
+    #[test]
+    fn help_line_shows_repository_hotkey_for_usable_workspace_row_focus() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            true,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("g repository"));
+    }
+
+    #[test]
+    fn help_line_shows_delete_hotkey_for_workspace_row_focus() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            true,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("x delete"));
     }
 
     #[test]
@@ -1113,6 +1197,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1126,11 +1211,41 @@ mod tests {
     }
 
     #[test]
+    fn help_line_shows_confirm_delete_message() {
+        let line = help_line(
+            UiMode::ConfirmDelete,
+            1,
+            1,
+            Some(&snapshot(false, None)),
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Delete workspace:"));
+        assert!(text.contains("Enter"));
+    }
+
+    #[test]
     fn starting_modal_closes_when_workspace_returns_to_stopped() {
         let mut mode = UiMode::StartingModal;
         let mut starting_workspace_key = Some("alpha".to_string());
         let mut started_wait_since = Some(Instant::now());
         let mut status = String::new();
+        let mut failed_snapshot = WorkspaceSnapshot::default();
+        failed_snapshot.automation_status =
+            Some("Start failed alpha: workspace start failed".to_string());
 
         let starting_state = Some(WorkspaceUiState::Stopped);
         match starting_state {
@@ -1138,7 +1253,7 @@ mod tests {
             Some(WorkspaceUiState::Started) => {}
             Some(WorkspaceUiState::Stopped) => {
                 if let Some(key) = starting_workspace_key.as_deref() {
-                    status = format!("Workspace '{key}' failed to start; server is still stopped");
+                    status = starting_modal_failure_status(key, Some(&failed_snapshot));
                 }
                 mode = UiMode::Normal;
                 starting_workspace_key = None;
@@ -1154,7 +1269,19 @@ mod tests {
         assert_eq!(mode, UiMode::Normal);
         assert!(starting_workspace_key.is_none());
         assert!(started_wait_since.is_none());
-        assert!(status.contains("failed to start"));
+        assert!(status.contains("Start failed alpha"));
+    }
+
+    #[test]
+    fn starting_modal_failure_status_prefers_workspace_automation_status() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.automation_status =
+            Some("Start failed serialization: Apple container allocator exhausted".to_string());
+
+        assert_eq!(
+            starting_modal_failure_status("serialization", Some(&snapshot)),
+            "Workspace 'serialization' failed to start: Start failed serialization: Apple container allocator exhausted"
+        );
     }
 
     #[test]
@@ -1171,6 +1298,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             &tool_hotkeys,
             "",
@@ -1332,6 +1460,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1354,6 +1483,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             no_tool_hotkeys(),
             "",
@@ -1405,6 +1535,19 @@ mod tests {
     }
 
     #[test]
+    fn description_cell_text_includes_automation_status_before_root_session_title() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.description = "Custom description".to_string();
+        started.automation_status = Some("Working on example/repo#42".to_string());
+        started.root_session_title = Some("Root session title".to_string());
+
+        assert_eq!(
+            description_cell_text(&started, &started.persistent.description),
+            "Custom description · Working on example/repo#42 · Root session title"
+        );
+    }
+
+    #[test]
     fn description_line_styles_custom_description_cyan() {
         let mut started = snapshot(true, Some("http://example"));
         started.root_session_title = Some("Root session title".to_string());
@@ -1413,6 +1556,19 @@ mod tests {
         assert_eq!(line.spans[0].content, "Custom description");
         assert_eq!(line.spans[0].style.fg, Some(DESCRIPTION_COLOR));
         assert_eq!(line.spans[2].content, "Root session title");
+    }
+
+    #[test]
+    fn description_line_does_not_prefix_spinner_for_failure_status() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.automation_status = Some("Start failed repo: workspace start failed".to_string());
+
+        let line = description_line(&started, "", false);
+
+        assert_eq!(
+            line.spans[0].content,
+            "Start failed repo: workspace start failed"
+        );
     }
 
     #[test]
@@ -1615,6 +1771,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1639,6 +1796,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1661,6 +1819,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             no_tool_hotkeys(),
             "",

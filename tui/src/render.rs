@@ -249,7 +249,13 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         app.selected_workspace_link()
             .is_some_and(|link| link.value.is_empty()),
         app.selected_workspace_link().map(|link| link.kind),
-        app.selected_workspace_has_refreshable_github_link(),
+        app.selected_workspace_has_refreshable_github_link()
+            || app
+                .selected_workspace_snapshot()
+                .is_some_and(|snapshot| snapshot.persistent.assigned_repository.is_some()),
+        app.selected_workspace_snapshot()
+            .is_some_and(workspace_is_usable)
+            && app.selected_link_index.is_none(),
         &app.contextual_tool_hotkeys(),
         &app.status,
     );
@@ -257,6 +263,8 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
 
     if app.mode == UiMode::CreateModal {
         draw_create_modal(frame, &app.create_input);
+    } else if app.mode == UiMode::EditRepository {
+        draw_repository_modal(frame, &app.repository_input);
     } else if app.mode == UiMode::EditCustomLink {
         draw_custom_link_modal(
             frame,
@@ -264,10 +272,18 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             app.custom_link_action,
             &app.custom_link_input,
         );
+    } else if app.mode == UiMode::ConfirmDelete
+        && let Some(workspace_key) = app.pending_delete_workspace_key.as_deref()
+    {
+        draw_confirm_delete_modal(frame, workspace_key);
     } else if app.mode == UiMode::StartingModal
         && let Some(workspace_key) = app.starting_workspace_key.as_deref()
     {
-        draw_starting_modal(frame, workspace_key);
+        let detail = app
+            .snapshots
+            .get(workspace_key)
+            .and_then(|snapshot| snapshot.automation_status.as_deref());
+        draw_starting_modal(frame, workspace_key, detail);
     } else if app.mode == UiMode::ToolProgressModal
         && let Some((tool_name, progress)) = app.running_tool_progress()
     {
@@ -320,6 +336,30 @@ fn draw_modal_text_input(frame: &mut Frame, area: Rect, input: &str) {
         inner.x.saturating_add(cursor_offset.min(max_offset)),
         inner.y,
     ));
+}
+
+fn draw_repository_modal(frame: &mut Frame, input: &str) {
+    let area = centered_rect_fixed(
+        CREATE_MODAL_WIDTH.max(72),
+        CREATE_MODAL_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Assign repository ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new("GitHub repository (owner/repo or URL). Leave empty to clear.")
+            .wrap(Wrap { trim: true }),
+        vertical[0],
+    );
+    draw_modal_text_input(frame, vertical[1], input);
 }
 
 pub(crate) fn selected_link_tooltip_area(
@@ -490,6 +530,47 @@ pub(crate) fn draw_create_modal(frame: &mut Frame, input: &str) {
     );
 }
 
+fn draw_confirm_delete_modal(frame: &mut Frame, workspace_key: &str) {
+    let area = centered_rect_fixed(
+        CONFIRM_DELETE_MODAL_WIDTH,
+        CONFIRM_DELETE_MODAL_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Delete workspace ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Delete workspace '{workspace_key}'? This stops the workspace and removes its files and containers."
+        ))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter to delete · Esc to cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
+}
+
 pub(crate) fn draw_custom_link_modal(
     frame: &mut Frame,
     kind: Option<WorkspaceLinkKind>,
@@ -549,7 +630,7 @@ pub(crate) fn draw_custom_link_modal(
     );
 }
 
-pub(crate) fn draw_starting_modal(frame: &mut Frame, workspace_key: &str) {
+pub(crate) fn draw_starting_modal(frame: &mut Frame, workspace_key: &str, detail: Option<&str>) {
     let area = centered_rect_fixed(STARTING_MODAL_WIDTH, STARTING_MODAL_HEIGHT, frame.area());
     frame.render_widget(Clear, area);
 
@@ -579,9 +660,19 @@ pub(crate) fn draw_starting_modal(frame: &mut Frame, workspace_key: &str) {
     frame.render_widget(
         Paragraph::new("Waiting for server readiness...")
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::DarkGray)),
         rows[2],
     );
+    if let Some(detail) = detail.map(str::trim).filter(|detail| !detail.is_empty()) {
+        frame.render_widget(
+            Paragraph::new(detail.to_string())
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::Gray)),
+            rows[3],
+        );
+    }
 }
 
 pub(crate) fn draw_tool_progress_modal(frame: &mut Frame, tool_name: &str, progress: &str) {

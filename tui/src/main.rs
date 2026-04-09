@@ -73,13 +73,17 @@ const TOOL_PROGRESS_MODAL_WIDTH: u16 = 72;
 const TOOL_PROGRESS_MODAL_HEIGHT: u16 = 14;
 const CUSTOM_LINK_MODAL_WIDTH: u16 = 72;
 const CUSTOM_LINK_MODAL_HEIGHT: u16 = 10;
+const CONFIRM_DELETE_MODAL_WIDTH: u16 = 72;
+const CONFIRM_DELETE_MODAL_HEIGHT: u16 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiMode {
     Normal,
     CreateModal,
     EditDescription,
+    EditRepository,
     EditCustomLink,
+    ConfirmDelete,
     StartingModal,
     ToolProgressModal,
 }
@@ -108,10 +112,12 @@ struct TuiState {
     mode: UiMode,
     create_input: String,
     edit_input: String,
+    repository_input: String,
     custom_link_input: String,
     custom_link_kind: Option<WorkspaceLinkKind>,
     custom_link_action: Option<CustomLinkModalAction>,
     custom_link_original_value: Option<String>,
+    pending_delete_workspace_key: Option<String>,
     starting_workspace_key: Option<String>,
     started_wait_since: Option<Instant>,
     previous_machine_cpu_totals: Option<ProcCpuTotals>,
@@ -155,6 +161,7 @@ struct WorkspaceLink {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WorkspaceLinkSource {
     Custom,
+    Automation,
     AgentProvided,
 }
 
@@ -393,19 +400,36 @@ fn machine_description(
 
 #[cfg(test)]
 fn description_cell_text(snapshot: &WorkspaceSnapshot, user_description: &str) -> String {
+    let automation_status = snapshot.automation_status.as_deref().unwrap_or("").trim();
     let session_title = snapshot.root_session_title.as_deref().unwrap_or("").trim();
-    if session_title.is_empty() {
-        return user_description.to_string();
+    let mut parts = Vec::new();
+    if !user_description.is_empty() {
+        parts.push(user_description.to_string());
     }
-    if user_description.is_empty() {
-        return session_title.to_string();
+    if !automation_status.is_empty() {
+        parts.push(automation_status.to_string());
     }
-    format!("{user_description} · {session_title}")
+    if !session_title.is_empty() {
+        parts.push(session_title.to_string());
+    }
+    parts.join(" · ")
 }
 
 fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
     let mut links = Vec::new();
 
+    links.extend(
+        snapshot
+            .persistent
+            .automation_issue
+            .iter()
+            .cloned()
+            .map(|value| WorkspaceLink {
+                kind: WorkspaceLinkKind::Issue,
+                value,
+                source: WorkspaceLinkSource::Automation,
+            }),
+    );
     links.extend(
         snapshot
             .persistent
@@ -490,7 +514,9 @@ fn description_line_for_snapshot(
     archived: bool,
 ) -> Line<'static> {
     let session_title = snapshot.root_session_title.as_deref().unwrap_or("").trim();
+    let automation_status = snapshot.automation_status.as_deref().unwrap_or("").trim();
     let has_session_title = !session_title.is_empty();
+    let has_automation_status = !automation_status.is_empty();
     let has_description = !user_description.is_empty();
 
     let mut spans = Vec::new();
@@ -515,6 +541,19 @@ fn description_line_for_snapshot(
         }
     }
 
+    if has_automation_status {
+        if has_content {
+            spans.push(Span::raw(" · "));
+        }
+        let automation_text = if archived || !automation_status_shows_activity(automation_status) {
+            automation_status.to_string()
+        } else {
+            format!("{} {}", automation_activity_glyph(), automation_status)
+        };
+        spans.push(Span::raw(automation_text));
+        has_content = true;
+    }
+
     if has_session_title {
         if has_content {
             spans.push(Span::raw(" · "));
@@ -523,6 +562,24 @@ fn description_line_for_snapshot(
     }
 
     Line::from(spans)
+}
+
+fn automation_activity_glyph() -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let frame = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| ((elapsed.as_millis() / 200) as usize) % FRAMES.len())
+        .unwrap_or(0);
+    FRAMES[frame]
+}
+
+fn automation_status_shows_activity(status: &str) -> bool {
+    !matches!(
+        status,
+        status if status.starts_with("Start failed")
+            || status.starts_with("Scan failed")
+            || status.starts_with("No issues")
+    )
 }
 
 fn first_validated_workspace_link_by_kind(
@@ -726,6 +783,7 @@ fn help_line(
     selected_link_is_placeholder: bool,
     selected_link_kind: Option<WorkspaceLinkKind>,
     selected_workspace_has_refreshable_github_link: bool,
+    selected_workspace_can_assign_repository: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
 ) -> Line<'static> {
@@ -780,7 +838,11 @@ fn help_line(
                                 push_hotkey(&mut spans, "r", " recheck GH status  ");
                             }
                         }
+                        if selected_workspace_can_assign_repository {
+                            push_hotkey(&mut spans, "g", " repository  ");
+                        }
                         push_hotkey(&mut spans, "d", " edit description  ");
+                        push_hotkey(&mut spans, "x", " delete  ");
                         let archive_action = if snapshot.persistent.archived {
                             " unarchive  "
                         } else {
@@ -805,10 +867,20 @@ fn help_line(
             push_hotkey(&mut spans, "Enter", " save, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }
+        UiMode::EditRepository => {
+            spans.push(Span::raw("Assign repository: type owner/repo or URL, "));
+            push_hotkey(&mut spans, "Enter", " save, ");
+            push_hotkey(&mut spans, "Esc", " cancel");
+        }
         UiMode::EditCustomLink => {
             spans.push(Span::raw("Edit link: type, "));
             push_hotkey(&mut spans, "Enter", " save, ");
             push_hotkey(&mut spans, "Del", " delete, ");
+            push_hotkey(&mut spans, "Esc", " cancel");
+        }
+        UiMode::ConfirmDelete => {
+            spans.push(Span::raw("Delete workspace: "));
+            push_hotkey(&mut spans, "Enter", " confirm, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }
         UiMode::StartingModal => {

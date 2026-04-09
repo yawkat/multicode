@@ -244,8 +244,16 @@ async fn query_current_root_session_details(
             .collect::<Vec<_>>(),
     };
 
-    let Some(root_session) = select_root_session(root_session_candidate, &sessions) else {
-        return Ok(None);
+    let root_session = match select_root_session(root_session_candidate, &sessions) {
+        Some(root_session) => root_session,
+        None => match bootstrap_root_session(client).await {
+            Ok(Some(root_session)) => root_session,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to bootstrap root session");
+                return Ok(None);
+            }
+        },
     };
 
     let root_session_id: String = root_session.id.clone().into();
@@ -273,6 +281,20 @@ async fn query_current_root_session_details(
         title: root_session_title,
         status: session_status,
     }))
+}
+
+async fn bootstrap_root_session(
+    client: &opencode::client::Client,
+) -> Result<Option<opencode::client::types::Session>, String> {
+    client
+        .session_create(
+            None,
+            None,
+            &opencode::client::types::SessionCreateBody::default(),
+        )
+        .await
+        .map(|response| Some(response.into_inner()))
+        .map_err(|err| err.to_string())
 }
 
 fn select_root_session(
@@ -439,6 +461,22 @@ mod tests {
                 "version": "1"
             }
         ])
+        .to_string()
+    }
+
+    fn single_session_json(session_id: &str, title: &str) -> String {
+        serde_json::json!({
+            "directory": "/workspace",
+            "id": session_id,
+            "projectID": "project-1",
+            "slug": "root",
+            "time": {
+                "created": 1,
+                "updated": 1
+            },
+            "title": title,
+            "version": "1"
+        })
         .to_string()
     }
 
@@ -696,6 +734,98 @@ mod tests {
             assert_eq!(snapshot.root_session_status, Some(RootSessionStatus::Busy));
 
             service_task.abort();
+            server_task.abort();
+        });
+    }
+
+    #[test]
+    fn service_bootstraps_root_session_when_server_starts_empty() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("test listener should bind");
+            let addr = listener
+                .local_addr()
+                .expect("listener should expose local addr");
+            let server_task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0_u8; 4096];
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..read]);
+
+                        if request.contains("GET /question") {
+                            let body = "[]";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        if request.contains("GET /session/status") {
+                            let body = "{}";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        if request.starts_with("POST /session") {
+                            let body =
+                                single_session_json("ses-root-created", "Root session created");
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        if request.contains("GET /session") {
+                            let body = "[]";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        let response =
+                            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let base_uri = format!("http://{addr}");
+            let client = opencode::client::Client::new(&base_uri);
+            let root_session = query_current_root_session_details(&client)
+                .await
+                .expect("query should succeed")
+                .expect("root session should be bootstrapped when session list is empty");
+            assert_eq!(root_session.id, "ses-root-created");
+            assert_eq!(root_session.title, "Root session created");
+            assert_eq!(root_session.status, None);
+
             server_task.abort();
         });
     }

@@ -18,6 +18,8 @@ pub struct Config {
     pub isolation: IsolationConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub autonomous: AutonomousConfig,
     #[serde(default = "default_opencode_commands")]
     pub opencode: Vec<String>,
     #[serde(default)]
@@ -28,6 +30,24 @@ pub struct Config {
     pub remote: Option<RemoteConfig>,
     #[serde(default)]
     pub github: GithubConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AutonomousConfig {
+    #[serde(
+        default = "default_issue_scan_delay_seconds",
+        alias = "issue-scan-delay-seconds"
+    )]
+    pub issue_scan_delay_seconds: u64,
+}
+
+impl Default for AutonomousConfig {
+    fn default() -> Self {
+        Self {
+            issue_scan_delay_seconds: default_issue_scan_delay_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -113,6 +133,10 @@ fn default_opencode_commands() -> Vec<String> {
 
 fn default_remote_sync_interval_seconds() -> u64 {
     2
+}
+
+fn default_issue_scan_delay_seconds() -> u64 {
+    15 * 60
 }
 
 fn default_handler_review() -> String {

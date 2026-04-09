@@ -1,3 +1,4 @@
+pub mod autonomous_workspace_service;
 pub mod combined;
 pub mod config;
 pub mod github_status_service;
@@ -16,10 +17,10 @@ pub(crate) mod workspace_task_watch;
 pub(crate) mod workspace_watch;
 
 pub use crate::database::{Database, DatabaseError};
-pub use combined::{CombinedService, CombinedServiceError};
+pub use combined::{CombinedService, CombinedServiceError, summarize_workspace_start_failure};
 pub use config::{
-    Config, GithubTokenConfig, HandlerConfig, RuntimeConfig, ToolConfig, ToolType,
-    parse_optional_size_bytes,
+    AutonomousConfig, Config, GithubTokenConfig, HandlerConfig, RuntimeConfig, ToolConfig,
+    ToolType, parse_optional_size_bytes,
 };
 pub use github_status_service::{
     GithubIssueState, GithubIssueStatus, GithubPrBuildState, GithubPrReviewState, GithubPrState,

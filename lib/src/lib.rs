@@ -68,6 +68,10 @@ pub struct PersistentWorkspaceSnapshot {
     pub description: String,
     pub created_at: Option<SystemTime>,
     #[serde(default)]
+    pub assigned_repository: Option<String>,
+    #[serde(default)]
+    pub automation_issue: Option<String>,
+    #[serde(default)]
     pub archive_format: Option<WorkspaceArchiveFormat>,
     #[serde(default)]
     pub agent_provided: AgentProvidedPersistentSnapshot,
@@ -81,6 +85,8 @@ impl Default for PersistentWorkspaceSnapshot {
             archived: false,
             description: String::new(),
             created_at: None,
+            assigned_repository: None,
+            automation_issue: None,
             archive_format: None,
             agent_provided: AgentProvidedPersistentSnapshot::default(),
             custom_links: CustomLinksPersistentSnapshot::default(),
@@ -148,6 +154,8 @@ pub struct WorkspaceSnapshot {
     pub root_session_id: Option<String>,
     pub root_session_title: Option<String>,
     pub root_session_status: Option<RootSessionStatus>,
+    pub automation_status: Option<String>,
+    pub automation_scan_request_nonce: u64,
     pub usage_total_tokens: Option<u64>,
     pub usage_total_cost: Option<f64>,
     pub usage_cpu_percent: Option<u16>,
@@ -164,6 +172,8 @@ impl Default for WorkspaceSnapshot {
             root_session_id: None,
             root_session_title: None,
             root_session_status: None,
+            automation_status: None,
+            automation_scan_request_nonce: 0,
             usage_total_tokens: None,
             usage_total_cost: None,
             usage_cpu_percent: None,

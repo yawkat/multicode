@@ -1491,6 +1491,8 @@ mod tests {
         Config {
             workspace_directory: "~/dev/agent-work".to_string(),
             isolation: Default::default(),
+            runtime: Default::default(),
+            autonomous: Default::default(),
             opencode: vec!["opencode-cli".to_string()],
             tool: Vec::new(),
             handler: Default::default(),
@@ -1657,6 +1659,8 @@ mod tests {
             &Config {
                 workspace_directory: "~/dev/agent-work".to_string(),
                 isolation: Default::default(),
+                runtime: Default::default(),
+                autonomous: Default::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
@@ -1709,6 +1713,8 @@ mod tests {
                     add_skills_from: vec!["extra-skills".to_string()],
                     ..Default::default()
                 },
+                runtime: Default::default(),
+                autonomous: Default::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
@@ -1744,6 +1750,8 @@ mod tests {
                     add_skills_from: vec!["workspace-skills".to_string()],
                     ..Default::default()
                 },
+                runtime: Default::default(),
+                autonomous: Default::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
@@ -2307,6 +2315,8 @@ mod tests {
             &Config {
                 workspace_directory: "~/dev/agent-work".to_string(),
                 isolation: Default::default(),
+                runtime: Default::default(),
+                autonomous: Default::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
