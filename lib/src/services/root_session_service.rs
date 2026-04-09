@@ -416,7 +416,9 @@ fn normalize_base_uri(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OpencodeClientSnapshot, TransientWorkspaceSnapshot};
+    use crate::{
+        OpencodeClientSnapshot, RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::Notify,
@@ -438,6 +440,17 @@ mod tests {
             }
         ])
         .to_string()
+    }
+
+    fn transient_snapshot(uri: &str, runtime_id: &str) -> TransientWorkspaceSnapshot {
+        TransientWorkspaceSnapshot {
+            uri: uri.to_string(),
+            runtime: RuntimeHandleSnapshot {
+                backend: RuntimeBackend::LinuxSystemdBwrap,
+                id: runtime_id.to_string(),
+                metadata: Default::default(),
+            },
+        }
     }
 
     fn sessions_json_with_subagent(
@@ -651,10 +664,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -781,10 +794,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -894,10 +907,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -1053,10 +1066,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -1194,10 +1207,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -1310,10 +1323,8 @@ mod tests {
             let base_uri = format!("http://{addr}");
             let client = Arc::new(opencode::client::Client::new(&base_uri));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-race.service".to_string(),
-                });
+                snapshot.transient =
+                    Some(transient_snapshot(&format!("{base_uri}/"), "run-u-root-race.service"));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: client.clone(),
                     events: event_tx.clone(),
@@ -1437,10 +1448,8 @@ mod tests {
             let base_uri = format!("http://{addr}");
             let old_client = Arc::new(opencode::client::Client::new(&base_uri));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-stale.service".to_string(),
-                });
+                snapshot.transient =
+                    Some(transient_snapshot(&format!("{base_uri}/"), "run-u-root-stale.service"));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: old_client.clone(),
                     events: old_event_tx.clone(),
@@ -1558,10 +1567,10 @@ mod tests {
             let old_client = Arc::new(opencode::client::Client::new(&base_uri));
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-same-uri.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-same-uri.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: old_client,
                     events: old_event_tx,
@@ -1688,10 +1697,10 @@ mod tests {
             let base_uri = format!("http://{addr}");
             let client = Arc::new(opencode::client::Client::new(&base_uri));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-ignore-non-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-ignore-non-session.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: client.clone(),
                     events: event_tx.clone(),
@@ -1750,10 +1759,10 @@ mod tests {
             let (old_event_tx, _) = broadcast::channel(64);
             let old_client = Arc::new(opencode::client::Client::new("http://127.0.0.1:9"));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: "http://127.0.0.1:9/".to_string(),
-                    unit: "run-u-root-old-uri.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    "http://127.0.0.1:9/",
+                    "run-u-root-old-uri.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: old_client,
                     events: old_event_tx,
@@ -1774,10 +1783,10 @@ mod tests {
             let (new_event_tx, _) = broadcast::channel(64);
             let new_client = Arc::new(opencode::client::Client::new("http://127.0.0.1:10"));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: "http://127.0.0.1:10/".to_string(),
-                    unit: "run-u-root-new-uri.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    "http://127.0.0.1:10/",
+                    "run-u-root-new-uri.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: new_client,
                     events: new_event_tx,

@@ -6,6 +6,8 @@ pub mod opencode_client_service;
 pub mod persistent_storage;
 pub mod resource_usage_service;
 pub mod root_session_service;
+pub mod runtime;
+pub(crate) mod runtime_reconciliation_service;
 pub mod transient_storage;
 pub mod usage_aggregation_service;
 pub mod workspace_archive;
@@ -16,7 +18,8 @@ pub(crate) mod workspace_watch;
 pub use crate::database::{Database, DatabaseError};
 pub use combined::{CombinedService, CombinedServiceError};
 pub use config::{
-    Config, GithubTokenConfig, HandlerConfig, ToolConfig, ToolType, parse_optional_size_bytes,
+    Config, GithubTokenConfig, HandlerConfig, RuntimeConfig, ToolConfig, ToolType,
+    parse_optional_size_bytes,
 };
 pub use github_status_service::{
     GithubIssueState, GithubIssueStatus, GithubPrBuildState, GithubPrReviewState, GithubPrState,

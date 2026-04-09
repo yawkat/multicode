@@ -9,12 +9,15 @@ use serde::{Deserialize, Serialize};
 use size::Size;
 
 use super::CombinedServiceError;
+use crate::RuntimeBackend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     pub workspace_directory: String,
     pub isolation: IsolationConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     #[serde(default = "default_opencode_commands")]
     pub opencode: Vec<String>,
     #[serde(default)]
@@ -25,6 +28,15 @@ pub struct Config {
     pub remote: Option<RemoteConfig>,
     #[serde(default)]
     pub github: GithubConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub backend: RuntimeBackend,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -315,9 +327,42 @@ pub(super) fn validate_workspace_key(key: &str) -> Result<String, CombinedServic
 }
 
 pub(super) fn expand_shell_path(value: &str) -> Result<PathBuf, CombinedServiceError> {
-    let expanded = shellexpand::full(value)
-        .map_err(|err| CombinedServiceError::ShellExpand(err.to_string()))?;
+    let expanded = shellexpand::full_with_context(
+        value,
+        || env::var("HOME").ok(),
+        |name| match env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(env::VarError::NotPresent) => Ok(synthesized_env_value(name)),
+            Err(err) => Err(err.to_string()),
+        },
+    )
+    .map_err(|err| CombinedServiceError::ShellExpand(err.to_string()))?;
     Ok(PathBuf::from(expanded.into_owned()))
+}
+
+pub(super) fn inherited_env_value(name: &str) -> Option<String> {
+    env::var(name).ok().or_else(|| synthesized_env_value(name))
+}
+
+pub(super) fn synthesized_env_value(name: &str) -> Option<String> {
+    match name {
+        "XDG_RUNTIME_DIR" => {
+            synthesized_xdg_runtime_dir().map(|path| path.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn synthesized_xdg_runtime_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(env::temp_dir().join("multicode-runtime"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn expand_isolation_paths(
@@ -556,4 +601,94 @@ fn validate_handler_template(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        ffi::OsString,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old_value = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old_value = env::var_os(key);
+            unsafe {
+                env::remove_var(key);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe {
+                    env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expand_shell_path_expands_existing_environment_variables() {
+        let _env_lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let runtime_dir = env::temp_dir().join(format!("multicode-config-test-{unique}"));
+        let _guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+        let path =
+            expand_shell_path("$XDG_RUNTIME_DIR/opencode").expect("runtime dir should expand");
+
+        assert_eq!(path, runtime_dir.join("opencode"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn expand_shell_path_synthesizes_xdg_runtime_dir_on_macos() {
+        let _env_lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvVarGuard::remove("XDG_RUNTIME_DIR");
+
+        let path =
+            expand_shell_path("$XDG_RUNTIME_DIR/opencode").expect("runtime dir should expand");
+
+        assert_eq!(
+            path,
+            synthesized_xdg_runtime_dir()
+                .expect("macOS should synthesize XDG runtime dir")
+                .join("opencode")
+        );
+        assert_eq!(
+            inherited_env_value("XDG_RUNTIME_DIR"),
+            synthesized_xdg_runtime_dir().map(|path| path.to_string_lossy().into_owned())
+        );
+    }
 }

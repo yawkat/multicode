@@ -788,9 +788,10 @@ impl TuiState {
             }
         };
 
-        let mut tmux_command = vec!["systemd-run".to_string()];
         let inherited_env = exec_command.inherited_env;
-        tmux_command.extend(exec_command.args);
+        let tmux_command = std::iter::once(exec_command.program)
+            .chain(exec_command.args)
+            .collect::<Vec<_>>();
         let custom_description = self
             .snapshots
             .get(workspace_key)
@@ -861,9 +862,10 @@ impl TuiState {
                 io::Error::other(format!("failed to prepare PTY review handler: {err:?}"))
             })?;
 
-        let mut tmux_command = vec!["systemd-run".to_string()];
         let inherited_env = command.inherited_env;
-        tmux_command.extend(command.args);
+        let tmux_command = std::iter::once(command.program)
+            .chain(command.args)
+            .collect::<Vec<_>>();
         let custom_description = self
             .snapshots
             .get(workspace_key)

@@ -17,7 +17,7 @@ pub use remote_action::{
 pub use services::root_session_service::RootSessionStatus;
 pub use services::workspace_archive::WorkspaceArchiveFormat;
 
-use std::{fmt, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -90,10 +90,39 @@ impl Default for PersistentWorkspaceSnapshot {
 
 /// Workspace metadata that is saved in transient storage (`/run`) and does not survive a reboot.
 /// This is useful for process metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeBackend {
+    #[default]
+    LinuxSystemdBwrap,
+    AppleContainer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHandleSnapshot {
+    #[serde(default)]
+    pub backend: RuntimeBackend,
+    #[serde(default, alias = "unit")]
+    pub id: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl Default for RuntimeHandleSnapshot {
+    fn default() -> Self {
+        Self {
+            backend: RuntimeBackend::default(),
+            id: String::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransientWorkspaceSnapshot {
     pub uri: String,
-    pub unit: String,
+    #[serde(flatten)]
+    pub runtime: RuntimeHandleSnapshot,
 }
 
 /// Holder for the HTTP connection to the opencode server.

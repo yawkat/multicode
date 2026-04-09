@@ -37,6 +37,30 @@ Isolation is implemented using `systemd-run` (for resource constraints) and
 [`bwrap`](https://github.com/containers/bubblewrap) (for read/write isolation). These tools are **Linux only**, so 
 *multicode* will not work on other operating systems.
 
+On newer Apple Silicon Macs, there is also an experimental Apple `container` runtime backend. It
+reuses the existing `[isolation]` configuration for readable, writable, isolated, and `tmpfs`
+paths, and maps CPU / memory limits onto container allocation settings:
+
+```toml
+[runtime]
+backend = "apple-container"
+image = "ghcr.io/example/multicode-java25:latest"
+
+[isolation]
+writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
+readable = ["~/.config/opencode", "~/.local/share/opencode/auth.json"]
+isolated = ["~/.local/share/opencode", "~/.local/state/opencode"]
+tmpfs = ["/tmp"]
+inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR", "GITHUB_MCP_TOKEN"]
+memory-max = "16 GiB"
+cpu = "300%"
+```
+
+Mounting `~/.config/opencode` read-only lets the container see the same profiles, models,
+skills, and other OpenCode configuration as the host. This is useful if you manage local
+profiles with tools like `ocp`. Keep `~/.local/share/opencode` and `~/.local/state/opencode`
+isolated so session state remains per-workspace.
+
 ## Git / GitHub integration
 
 With the GitHub integration you can see progress at a glance in the overview screen, and navigate to the issue or PR
