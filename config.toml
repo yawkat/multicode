@@ -35,7 +35,6 @@ isolated = [
     "~/.local/state/opencode",
 ]
 readable = [
-    "~/.gitconfig",
     "~/.config/opencode",
     "~/.local/share/opencode/auth.json",
 ]

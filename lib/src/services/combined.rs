@@ -180,6 +180,7 @@ impl CombinedService {
         let workspace = self.manager.get_workspace(&key)?;
         let workspace_path = self.workspace_directory_path.join(&key);
         tokio::fs::create_dir_all(&workspace_path).await?;
+        strip_workspace_git_identity_overrides(&workspace_path).await?;
 
         let inherited_env = self
             .sandbox_env_pairs(Vec::<(String, String)>::new())
@@ -687,6 +688,74 @@ fn github_git_credentials_env_vars(
         ),
         ("GIT_CONFIG_VALUE_0".to_string(), helper.to_string()),
     ]
+}
+
+async fn strip_workspace_git_identity_overrides(
+    workspace_path: &Path,
+) -> Result<(), CombinedServiceError> {
+    let workspace_path = workspace_path.to_path_buf();
+    let repo_roots = tokio::task::spawn_blocking(move || find_git_repo_roots(&workspace_path))
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))??;
+
+    for repo_root in repo_roots {
+        unset_repo_local_git_config(&repo_root, "user.name").await?;
+        unset_repo_local_git_config(&repo_root, "user.email").await?;
+    }
+
+    Ok(())
+}
+
+fn find_git_repo_roots(workspace_path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut stack = vec![workspace_path.to_path_buf()];
+    let mut repo_roots = std::collections::BTreeSet::new();
+
+    while let Some(directory) = stack.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if entry.file_name() == ".git" {
+                repo_roots.insert(directory.clone());
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+
+    Ok(repo_roots.into_iter().collect())
+}
+
+async fn unset_repo_local_git_config(
+    repo_root: &Path,
+    key: &str,
+) -> Result<(), CombinedServiceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "--local", "--unset-all", key])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+
+    if output.status.success() || output.status.code() == Some(5) {
+        return Ok(());
+    }
+
+    Err(std::io::Error::other(format!(
+        "failed to remove repo-local git config {key} from {}: {}",
+        repo_root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+    .into())
 }
 
 async fn github_git_credentials_env_from_config(
@@ -1562,6 +1631,91 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 "GIT_CONFIG_VALUE_0".to_string(),
                 r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#.to_string(),
             )));
+    }
+
+    #[test]
+    fn strip_workspace_git_identity_overrides_removes_repo_local_user_identity() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace = root.path().join("workspace");
+            let repo = workspace.join("repo");
+            fs::create_dir_all(&repo).expect("repo dir should exist");
+
+            let init = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["init"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git init should run");
+            assert!(init.status.success(), "git init should succeed");
+
+            let set_name = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "user.name", "Local Name"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config user.name should run");
+            assert!(
+                set_name.status.success(),
+                "git config user.name should succeed"
+            );
+
+            let set_email = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "user.email", "local@example.com"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config user.email should run");
+            assert!(
+                set_email.status.success(),
+                "git config user.email should succeed"
+            );
+
+            strip_workspace_git_identity_overrides(&workspace)
+                .await
+                .expect("workspace git identity cleanup should succeed");
+
+            let get_name = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "--get", "user.name"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config get user.name should run");
+            assert_eq!(get_name.status.code(), Some(1));
+
+            let get_email = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "--get", "user.email"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config get user.email should run");
+            assert_eq!(get_email.status.code(), Some(1));
+
+            let remote = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "--local", "core.repositoryformatversion"])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("git config core.repositoryformatversion should run");
+            assert!(remote.status.success(), "repo config should remain intact");
+        });
     }
 
     #[test]

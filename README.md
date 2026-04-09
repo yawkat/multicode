@@ -48,7 +48,7 @@ image = "ghcr.io/example/multicode-java25:latest"
 
 [isolation]
 writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
-readable = ["~/.gitconfig", "~/.config/opencode", "~/.local/share/opencode/auth.json"]
+readable = ["~/.config/opencode", "~/.local/share/opencode/auth.json"]
 isolated = ["~/.local/share/opencode", "~/.local/state/opencode"]
 tmpfs = ["/tmp"]
 inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR", "GITHUB_MCP_TOKEN"]
@@ -61,8 +61,9 @@ skills, and other OpenCode configuration as the host. This is useful if you mana
 profiles with tools like `ocp`. Keep `~/.local/share/opencode` and `~/.local/state/opencode`
 isolated so session state remains per-workspace.
 
-Mounting `~/.gitconfig` read-only lets the container see your global git identity and defaults.
-Repo-local `.git/config` settings still override the global file.
+Apple workspaces also expose the host `~/.gitconfig` automatically. The runtime mounts it through
+an internal read-only path and sets `GIT_CONFIG_GLOBAL` so git can use your host global identity
+and defaults without requiring a direct file bind.
 
 ## Git / GitHub integration
 

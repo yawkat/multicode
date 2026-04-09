@@ -9,11 +9,13 @@ use uuid::Uuid;
 
 use super::{
     combined::{CombinedServiceError, SpawnCommand},
-    config::{ExpandedIsolationConfig, RuntimeConfig, expand_shell_path, path_looks_like_file},
+    config::{ExpandedIsolationConfig, RuntimeConfig, path_looks_like_file},
 };
 use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
 
 pub(super) const RUNTIME_SPEC_METADATA_KEY: &str = "runtime-spec";
+const APPLE_GITCONFIG_DIR: &str = "/multicode-host/git";
+const APPLE_GITCONFIG_FILE_NAME: &str = ".gitconfig";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuntimeActivity {
@@ -685,7 +687,11 @@ impl AppleContainerRuntime {
                 message: "apple-container backend requires a runtime image".to_string(),
             }
         })?;
-        let env_file = self.write_env_file(key, "exec.env", inherited_env).await?;
+        let mut env = inherited_env.to_vec();
+        let host_gitconfig = self.host_gitconfig_path_for_env(&env);
+        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
+            .await?;
+        let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let mut args = vec![
             "run".to_string(),
@@ -698,7 +704,8 @@ impl AppleContainerRuntime {
             workspace_path.to_string_lossy().into_owned(),
         ];
         self.append_container_limits(&mut args);
-        self.append_container_mounts(args.as_mut(), key).await?;
+        self.append_container_mounts(args.as_mut(), key, host_gitconfig.as_deref())
+            .await?;
         args.push(image.to_string());
         args.extend(command);
 
@@ -778,6 +785,9 @@ impl AppleContainerRuntime {
             "opencode".to_string(),
         ));
         env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
+        let host_gitconfig = self.host_gitconfig_path_for_env(&env);
+        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
+            .await?;
 
         let workspace_path = self.context.workspace_directory_path.join(key);
         tokio::fs::create_dir_all(&workspace_path).await?;
@@ -797,7 +807,8 @@ impl AppleContainerRuntime {
             format!("127.0.0.1:{port}:{port}/tcp"),
         ];
         self.append_container_limits(&mut args);
-        self.append_container_mounts(&mut args, key).await?;
+        self.append_container_mounts(&mut args, key, host_gitconfig.as_deref())
+            .await?;
         args.push(image.to_string());
         args.push(self.context.container_opencode_command.clone());
         args.push("serve".to_string());
@@ -840,8 +851,12 @@ impl AppleContainerRuntime {
         &self,
         args: &mut Vec<String>,
         key: &str,
+        host_gitconfig: Option<&Path>,
     ) -> Result<(), CombinedServiceError> {
         let workspace_path = self.context.workspace_directory_path.join(key);
+        let implicit_gitconfig_mount = self
+            .build_implicit_gitconfig_mount(key, host_gitconfig)
+            .await?;
         let mut mount_specs = Vec::new();
         mount_specs.extend(
             self.context
@@ -849,6 +864,7 @@ impl AppleContainerRuntime {
                 .readable
                 .iter()
                 .cloned()
+                .filter(|path| !self.is_implicitly_handled_gitconfig(path, host_gitconfig))
                 .map(|path| MountSpec::new(path, None, MountKind::Readable)),
         );
         mount_specs.extend(
@@ -897,7 +913,9 @@ impl AppleContainerRuntime {
                     }),
             );
         }
-        mount_specs.extend(self.implicit_readable_mounts(&mount_specs));
+        if let Some(implicit_gitconfig_mount) = implicit_gitconfig_mount {
+            mount_specs.push(implicit_gitconfig_mount);
+        }
         mount_specs.sort_by(|a, b| {
             a.depth()
                 .cmp(&b.depth())
@@ -918,8 +936,10 @@ impl AppleContainerRuntime {
                         .as_ref()
                         .is_some_and(|source| source != &resolved_mount.effective_source));
             resolved_mount.prepare_source_node(owns_source_node).await?;
-            resolved_mount.prepare_target_node(owns_node).await?;
-            resolved_mount.prepare_container_materialized_file().await?;
+            if resolved_mount.needs_container_target_materialization() {
+                resolved_mount.prepare_target_node(owns_node).await?;
+                resolved_mount.prepare_container_materialized_file().await?;
+            }
             resolved_mounts.push(resolved_mount);
         }
 
@@ -930,22 +950,61 @@ impl AppleContainerRuntime {
         Ok(())
     }
 
-    fn implicit_readable_mounts(&self, existing_mounts: &[MountSpec]) -> Vec<MountSpec> {
-        let Some(gitconfig) = expand_shell_path("~/.gitconfig")
-            .ok()
-            .filter(|path| path.is_absolute() && path.is_file())
-        else {
-            return Vec::new();
+    async fn append_implicit_env(
+        &self,
+        env: &mut Vec<(String, String)>,
+        host_gitconfig: Option<&Path>,
+    ) -> Result<(), CombinedServiceError> {
+        if host_gitconfig.is_some() {
+            env.push((
+                "GIT_CONFIG_GLOBAL".to_string(),
+                format!("{APPLE_GITCONFIG_DIR}/{APPLE_GITCONFIG_FILE_NAME}"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn build_implicit_gitconfig_mount(
+        &self,
+        key: &str,
+        host_gitconfig: Option<&Path>,
+    ) -> Result<Option<MountSpec>, CombinedServiceError> {
+        let Some(host_gitconfig) = host_gitconfig else {
+            return Ok(None);
         };
 
-        if existing_mounts
-            .iter()
-            .any(|mount| mount.target == gitconfig)
-        {
-            return Vec::new();
+        let source_root = self.apple_runtime_root(key).join("gitconfig");
+        match tokio::fs::remove_dir_all(&source_root).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
+        tokio::fs::create_dir_all(&source_root).await?;
+        let gitconfig_contents = std::fs::read(host_gitconfig)?;
+        tokio::fs::write(
+            source_root.join(APPLE_GITCONFIG_FILE_NAME),
+            gitconfig_contents,
+        )
+        .await?;
 
-        vec![MountSpec::new(gitconfig, None, MountKind::Readable)]
+        Ok(Some(MountSpec::new(
+            PathBuf::from(APPLE_GITCONFIG_DIR),
+            Some(source_root),
+            MountKind::Readable,
+        )))
+    }
+
+    fn host_gitconfig_path_for_env(&self, env: &[(String, String)]) -> Option<PathBuf> {
+        let home = env
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| value)?;
+        let path = PathBuf::from(home).join(".gitconfig");
+        (path.is_absolute() && path.is_file() && std::fs::read(&path).is_ok()).then_some(path)
+    }
+
+    fn is_implicitly_handled_gitconfig(&self, path: &Path, host_gitconfig: Option<&Path>) -> bool {
+        host_gitconfig.is_some_and(|gitconfig| gitconfig == path)
     }
 
     async fn build_aggregated_skill_mount(
@@ -1303,6 +1362,10 @@ pub(crate) struct ResolvedMountSpec {
 }
 
 impl ResolvedMountSpec {
+    fn needs_container_target_materialization(&self) -> bool {
+        self.backing_mount_kind.is_some() && self.effective_target != self.mount.target
+    }
+
     pub(crate) async fn prepare_source_node(
         &self,
         owns_node: bool,
@@ -1621,9 +1684,20 @@ mod tests {
 
             let runtime = apple_runtime(&root, IsolationConfig::default());
             let command = runtime
-                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[])
+                .build_run_command(
+                    "alpha",
+                    "multicode-alpha",
+                    "secret",
+                    31337,
+                    &[("HOME".to_string(), home.to_string_lossy().into_owned())],
+                )
                 .await
                 .expect("command should build");
+            let server_env = workspace_root
+                .join(".multicode")
+                .join("apple-container")
+                .join("alpha")
+                .join("server.env");
 
             if let Some(previous_home) = previous_home {
                 unsafe {
@@ -1637,12 +1711,25 @@ mod tests {
 
             let gitconfig_mount = format!(
                 "type=bind,source={},target={},readonly",
-                gitconfig.to_string_lossy(),
-                gitconfig.to_string_lossy()
+                workspace_root
+                    .join(".multicode")
+                    .join("apple-container")
+                    .join("alpha")
+                    .join("gitconfig")
+                    .to_string_lossy(),
+                APPLE_GITCONFIG_DIR
             );
             assert!(
                 command.args.iter().any(|arg| arg == &gitconfig_mount),
-                "apple backend should implicitly mount ~/.gitconfig read-only"
+                "apple backend should implicitly mount host gitconfig through a synthetic directory"
+            );
+            let env_contents =
+                fs::read_to_string(&server_env).expect("server env file should be written");
+            assert!(
+                env_contents.contains(&format!(
+                    "GIT_CONFIG_GLOBAL={APPLE_GITCONFIG_DIR}/{APPLE_GITCONFIG_FILE_NAME}"
+                )),
+                "apple backend should point git at the synthetic mounted gitconfig"
             );
         });
     }
