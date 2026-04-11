@@ -5,6 +5,7 @@ use std::{
     sync::OnceLock,
 };
 
+use serde::Deserialize;
 use tokio::{process::Command, sync::Mutex};
 use uuid::Uuid;
 
@@ -1088,10 +1089,35 @@ impl AppleContainerRuntime {
     }
 
     async fn read_usage(_runtime_handle: &RuntimeHandleSnapshot) -> RuntimeUsageSample {
-        RuntimeUsageSample {
-            state: Some(RuntimeUsageState::Unknown),
-            ..Default::default()
+        let output = match run_blocking_process(
+            container_program(),
+            vec![
+                "stats".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--no-stream".to_string(),
+                _runtime_handle.id.clone(),
+            ],
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(_) => {
+                return RuntimeUsageSample {
+                    state: Some(RuntimeUsageState::Unknown),
+                    ..Default::default()
+                };
+            }
+        };
+
+        if !output.status.success() {
+            return RuntimeUsageSample {
+                state: Some(RuntimeUsageState::Stopped),
+                ..Default::default()
+            };
         }
+
+        parse_apple_container_usage(&String::from_utf8_lossy(&output.stdout))
     }
 
     async fn build_run_command(
@@ -1478,6 +1504,41 @@ fn format_path_list(paths: &[PathBuf]) -> String {
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppleContainerStatsEntry {
+    #[serde(rename = "memoryUsageBytes")]
+    memory_usage_bytes: Option<u64>,
+    #[serde(rename = "cpuUsageUsec")]
+    cpu_usage_usec: Option<u64>,
+}
+
+fn parse_apple_container_usage(output: &str) -> RuntimeUsageSample {
+    let entries = match serde_json::from_str::<Vec<AppleContainerStatsEntry>>(output) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return RuntimeUsageSample {
+                state: Some(RuntimeUsageState::Unknown),
+                ..Default::default()
+            };
+        }
+    };
+
+    let Some(entry) = entries.into_iter().next() else {
+        return RuntimeUsageSample {
+            state: Some(RuntimeUsageState::Stopped),
+            ..Default::default()
+        };
+    };
+
+    RuntimeUsageSample {
+        memory_current: entry.memory_usage_bytes,
+        cpu_usage_nsec: entry
+            .cpu_usage_usec
+            .map(|value| value.saturating_mul(1_000)),
+        state: Some(RuntimeUsageState::Active),
+    }
 }
 
 fn format_skill_mounts(skills: &[super::config::AddedSkillMount]) -> String {
@@ -2791,5 +2852,43 @@ mod tests {
                 "# pr"
             );
         });
+    }
+
+    #[test]
+    fn parse_apple_container_usage_reads_memory_and_cpu() {
+        let output = r#"[{"memoryUsageBytes":4075261952,"cpuUsageUsec":437059128}]"#;
+
+        assert_eq!(
+            parse_apple_container_usage(output),
+            RuntimeUsageSample {
+                memory_current: Some(4_075_261_952),
+                cpu_usage_nsec: Some(437_059_128_000),
+                state: Some(RuntimeUsageState::Active),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_apple_container_usage_reports_stopped_for_empty_results() {
+        assert_eq!(
+            parse_apple_container_usage("[]"),
+            RuntimeUsageSample {
+                memory_current: None,
+                cpu_usage_nsec: None,
+                state: Some(RuntimeUsageState::Stopped),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_apple_container_usage_reports_unknown_for_invalid_json() {
+        assert_eq!(
+            parse_apple_container_usage("not-json"),
+            RuntimeUsageSample {
+                memory_current: None,
+                cpu_usage_nsec: None,
+                state: Some(RuntimeUsageState::Unknown),
+            }
+        );
     }
 }
