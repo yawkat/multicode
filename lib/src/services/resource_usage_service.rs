@@ -227,6 +227,23 @@ fn clear_stale_runtime_for_unit(workspace: &Workspace, unit: &str) {
             snapshot.automation_agent_state = None;
             changed = true;
         }
+        if let Some(active_task_id) = snapshot.active_task_id.clone()
+            && let Some(task_state) = snapshot.task_states.get_mut(&active_task_id)
+        {
+            if task_state.session_id.take().is_some() {
+                changed = true;
+            }
+            if task_state.session_status.take().is_some() {
+                changed = true;
+            }
+            if task_state.agent_state.take().is_some() {
+                changed = true;
+            }
+            if task_state.waiting_on_vm {
+                task_state.waiting_on_vm = false;
+                changed = true;
+            }
+        }
         if snapshot.usage_cpu_percent.is_some() {
             snapshot.usage_cpu_percent = None;
             changed = true;
@@ -445,6 +462,16 @@ mod tests {
             snapshot.root_session_id = Some("thread-1".to_string());
             snapshot.root_session_title = Some("Codex".to_string());
             snapshot.root_session_status = Some(crate::RootSessionStatus::Busy);
+            snapshot.active_task_id = Some("task-42".to_string());
+            snapshot.task_states.insert(
+                "task-42".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-task-42".to_string()),
+                    session_status: Some(crate::RootSessionStatus::Busy),
+                    agent_state: Some(crate::AutomationAgentState::Working),
+                    ..Default::default()
+                },
+            );
             snapshot.usage_cpu_percent = Some(25);
             snapshot.usage_ram_bytes = Some(1024);
             true
@@ -457,6 +484,13 @@ mod tests {
         assert!(snapshot.root_session_id.is_none());
         assert!(snapshot.root_session_title.is_none());
         assert!(snapshot.root_session_status.is_none());
+        let task_state = snapshot
+            .task_states
+            .get("task-42")
+            .expect("task state should remain");
+        assert!(task_state.session_id.is_none());
+        assert!(task_state.session_status.is_none());
+        assert!(task_state.agent_state.is_none());
         assert!(snapshot.usage_cpu_percent.is_none());
         assert!(snapshot.usage_ram_bytes.is_none());
     }

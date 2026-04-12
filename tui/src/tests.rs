@@ -6,8 +6,8 @@ mod tests {
 
     use super::*;
     use crate::app::{
-        compact_github_tooltip_target, should_auto_resume_autonomous_codex_after_attach,
-        starting_modal_failure_status,
+        compact_github_tooltip_target, restored_selected_row,
+        should_auto_resume_autonomous_codex_after_attach, starting_modal_failure_status,
     };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
@@ -15,7 +15,7 @@ mod tests {
     };
     use crate::ops::{
         SessionWaitState, attach_cli_args, build_handler_command, command_exists,
-        session_wait_state_for_entry, tmux_session_command, tmux_status_left,
+        session_wait_state_for_entry, task_attach_target, tmux_session_command, tmux_status_left,
         validate_workspace_link_target, workspace_attach_target, workspace_ordering,
     };
     use crate::render::selected_link_tooltip_area;
@@ -91,6 +91,8 @@ mod tests {
             automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
+            active_task_id: None,
+            task_states: Default::default(),
             usage_total_tokens: None,
             usage_total_cost: None,
             usage_cpu_percent: None,
@@ -119,6 +121,8 @@ mod tests {
             automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
+            active_task_id: None,
+            task_states: Default::default(),
             usage_total_tokens: None,
             usage_total_cost: None,
             usage_cpu_percent: None,
@@ -131,30 +135,172 @@ mod tests {
         &[].as_slice()
     }
 
+    fn assign_active_task(snapshot: &mut WorkspaceSnapshot, issue_url: &str) {
+        let task_id = "task-42".to_string();
+        snapshot
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                task_id.clone(),
+                issue_url.to_string(),
+                multicode_lib::WorkspaceTaskSource::Manual,
+            ));
+        snapshot.active_task_id = Some(task_id);
+    }
+
+    #[test]
+    fn restored_selected_row_preserves_selected_task_row() {
+        let entries = vec![
+            TableEntry::Create,
+            TableEntry::Workspace {
+                workspace_key: "test123".to_string(),
+            },
+            TableEntry::Task {
+                workspace_key: "test123".to_string(),
+                task_id: "task-16".to_string(),
+            },
+            TableEntry::Task {
+                workspace_key: "test123".to_string(),
+                task_id: "task-14".to_string(),
+            },
+        ];
+
+        let selected = restored_selected_row(
+            &entries,
+            Some(&TableEntry::Task {
+                workspace_key: "test123".to_string(),
+                task_id: "task-14".to_string(),
+            }),
+            3,
+        );
+
+        assert_eq!(selected, 3);
+    }
+
+    #[test]
+    fn restored_selected_row_falls_back_to_workspace_when_task_disappears() {
+        let entries = vec![
+            TableEntry::Create,
+            TableEntry::Workspace {
+                workspace_key: "test123".to_string(),
+            },
+            TableEntry::Task {
+                workspace_key: "test123".to_string(),
+                task_id: "task-16".to_string(),
+            },
+        ];
+
+        let selected = restored_selected_row(
+            &entries,
+            Some(&TableEntry::Task {
+                workspace_key: "test123".to_string(),
+                task_id: "task-14".to_string(),
+            }),
+            3,
+        );
+
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn task_issue_reference_uses_repo_and_issue_number_only() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-8".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/8".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+
+        assert_eq!(crate::task_row_label(&task), "➡️ multicode-test#8");
+    }
+
+    #[test]
+    fn task_issue_link_defaults_to_persistent_issue_url() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-1".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/1".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+
+        assert_eq!(
+            crate::task_issue_link(&task, None),
+            "https://github.com/graemerocher/multicode-test/issues/1"
+        );
+    }
+
+    #[test]
+    fn github_link_badge_uses_terminal_issue_or_pr_number() {
+        assert_eq!(
+            crate::github_link_badge("https://github.com/graemerocher/multicode-test/issues/7"),
+            "#7"
+        );
+        assert_eq!(
+            crate::github_link_badge("https://github.com/graemerocher/multicode-test/pull/12"),
+            "#12"
+        );
+    }
+
+    #[test]
+    fn task_links_expose_issue_and_pr_for_task_rows() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-1".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/1".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            pr: vec!["https://github.com/graemerocher/multicode-test/pull/8".to_string()],
+            ..Default::default()
+        };
+
+        let links = crate::task_links(&task, Some(&task_state));
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].kind, WorkspaceLinkKind::Issue);
+        assert_eq!(links[1].kind, WorkspaceLinkKind::Pr);
+    }
+
+    #[test]
+    fn workspace_links_hide_issue_and_pr_when_tasks_exist() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.agent_provided.repo = vec!["/tmp/repo-a".to_string()];
+        started.persistent.agent_provided.issue = vec!["https://example.com/issue/3".to_string()];
+        started.persistent.agent_provided.pr = vec!["https://example.com/pull/4".to_string()];
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+
+        let links = workspace_links(&started);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].kind, WorkspaceLinkKind::Review);
+    }
+
     #[test]
     fn should_request_autonomous_issue_scan_for_assigned_workspace_without_active_issue() {
         let mut stopped = WorkspaceSnapshot::default();
         stopped.persistent.assigned_repository =
             Some("micronaut-projects/micronaut-serialization".to_string());
-        assert!(crate::app::should_request_autonomous_issue_scan(&stopped));
+        assert!(crate::app::should_request_autonomous_issue_scan(&stopped, 5));
 
-        stopped.persistent.automation_issue = Some(
-            "https://github.com/micronaut-projects/micronaut-serialization/issues/989".to_string(),
-        );
-        assert!(!crate::app::should_request_autonomous_issue_scan(&stopped));
+        stopped
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-989".to_string(),
+                "https://github.com/micronaut-projects/micronaut-serialization/issues/989"
+                    .to_string(),
+                multicode_lib::WorkspaceTaskSource::Manual,
+            ));
+        assert!(crate::app::should_request_autonomous_issue_scan(&stopped, 5));
+        assert!(!crate::app::should_request_autonomous_issue_scan(&stopped, 1));
+
+        stopped.persistent.archived = true;
+        assert!(!crate::app::should_request_autonomous_issue_scan(&stopped, 5));
 
         let unassigned = WorkspaceSnapshot::default();
-        assert!(!crate::app::should_request_autonomous_issue_scan(
-            &unassigned
-        ));
+        assert!(!crate::app::should_request_autonomous_issue_scan(&unassigned, 5));
     }
 
     #[test]
     fn auto_resume_after_attach_only_resumes_active_autonomous_work() {
         let mut snapshot = WorkspaceSnapshot::default();
         snapshot.persistent.assigned_repository = Some("example/repo".to_string());
-        snapshot.persistent.automation_issue =
-            Some("https://github.com/example/repo/issues/42".to_string());
+        assign_active_task(&mut snapshot, "https://github.com/example/repo/issues/42");
         snapshot.automation_agent_state = Some(AutomationAgentState::Working);
 
         assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
@@ -172,7 +318,8 @@ mod tests {
         snapshot.root_session_status = Some(RootSessionStatus::Idle);
         assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
 
-        snapshot.persistent.automation_issue = None;
+        snapshot.active_task_id = None;
+        snapshot.persistent.tasks.clear();
         snapshot.root_session_status = Some(RootSessionStatus::Busy);
         assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
     }
@@ -290,10 +437,72 @@ mod tests {
     }
 
     #[test]
+    fn task_attach_target_uses_task_session_for_opencode() {
+        let started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("ses-task-1".to_string()),
+            ..Default::default()
+        };
+
+        let target = task_attach_target(&started, &task_state)
+            .expect("task attach target should use task session id");
+
+        assert_eq!(
+            target,
+            AttachTarget::Opencode {
+                uri: "http://127.0.0.1:3000/".to_string(),
+                username: "opencode".to_string(),
+                password: "secret".to_string(),
+                session_id: Some("ses-task-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn task_attach_target_uses_task_thread_for_codex() {
+        let mut started = snapshot(false, Some("ws://127.0.0.1:3456"));
+        started.root_session_id = Some("thread-root".to_string());
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-task-1".to_string()),
+            ..Default::default()
+        };
+
+        let target = task_attach_target(&started, &task_state)
+            .expect("task attach target should use task thread id");
+
+        assert_eq!(
+            target,
+            AttachTarget::Codex {
+                uri: "ws://127.0.0.1:3456/".to_string(),
+                thread_id: Some("thread-task-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn attach_cli_args_use_codex_resume_for_codex_target() {
         let target = AttachTarget::Codex {
             uri: "ws://127.0.0.1:3456".to_string(),
             thread_id: Some("thread-123".to_string()),
+        };
+
+        assert_eq!(
+            attach_cli_args("codex", &target),
+            vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "--remote".to_string(),
+                "ws://127.0.0.1:3456".to_string(),
+                "thread-123".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_cli_args_use_last_for_codex_when_thread_is_unavailable() {
+        let target = AttachTarget::Codex {
+            uri: "ws://127.0.0.1:3456".to_string(),
+            thread_id: None,
         };
 
         assert_eq!(
@@ -464,7 +673,8 @@ mod tests {
         runtime.block_on(async {
             let root = TestDir::new();
             let workspace_dir = root.path().join("agent-work");
-            let repo_dir = workspace_dir.join("core12299").join("micronaut-core");
+            fs::create_dir_all(&workspace_dir).expect("workspace dir should be created");
+            let repo_dir = workspace_dir.join("micronaut-core");
             fs::create_dir_all(&repo_dir).expect("repo dir should be created");
             fs::create_dir(repo_dir.join(".git")).expect(".git folder should be created");
 
@@ -507,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_workspace_link_target_rejects_repo_without_git_folder() {
+    fn validate_workspace_link_target_rejects_repo_without_git_entry() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -526,8 +736,8 @@ mod tests {
             };
             let err = validate_workspace_link_target(&link, &workspace_dir)
                 .await
-                .expect_err("repo without .git folder should be rejected");
-            assert!(err.to_string().contains("must contain a '.git' folder"));
+                .expect_err("repo without .git entry should be rejected");
+            assert!(err.to_string().contains("must contain a '.git' entry"));
         });
     }
 
@@ -555,6 +765,7 @@ mod tests {
     #[test]
     fn workspace_links_collect_review_issue_and_pr_entries() {
         let mut started = snapshot(true, Some("http://example"));
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
         started.persistent.agent_provided.repo = vec!["/tmp/repo-a".to_string()];
         started.persistent.agent_provided.issue = vec!["https://example.com/issue/1".to_string()];
         started.persistent.agent_provided.pr = vec!["https://example.com/pull/2".to_string()];
@@ -563,6 +774,11 @@ mod tests {
         assert_eq!(
             links,
             vec![
+                WorkspaceLink {
+                    kind: WorkspaceLinkKind::Issue,
+                    value: "https://github.com/example/repo/issues/42".to_string(),
+                    source: WorkspaceLinkSource::Automation,
+                },
                 WorkspaceLink {
                     kind: WorkspaceLinkKind::Review,
                     value: "/tmp/repo-a".to_string(),
@@ -706,10 +922,10 @@ mod tests {
             "https://github.com/micronaut-projects/micronaut-serialization/issues/921".to_string(),
         );
         let workspace = TestDir::new();
-        let repo_path = workspace
-            .path()
-            .join("work/micronaut-serialization-921/.git");
+        let repo_path = workspace.path().join("work/micronaut-serialization-921");
         fs::create_dir_all(&repo_path).expect("issue worktree repo should be created");
+        fs::write(repo_path.join(".git"), "gitdir: /tmp/mock-worktree\n")
+            .expect("issue worktree git file should be created");
 
         assert_eq!(
             compare_target_path(&started, &HashMap::new(), workspace.path()),
@@ -1065,6 +1281,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             1,
             Some(0),
             false,
@@ -1101,6 +1318,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             1,
             Some(0),
             true,
@@ -1130,6 +1348,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             1,
             Some(0),
             true,
@@ -1161,6 +1380,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             1,
             Some(0),
             false,
@@ -1184,6 +1404,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             1,
             Some(0),
             false,
@@ -1210,6 +1431,7 @@ mod tests {
             0,
             0,
             None,
+            false,
             0,
             None,
             false,
@@ -1240,6 +1462,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1264,6 +1487,7 @@ mod tests {
             1,
             1,
             Some(&stopped),
+            false,
             0,
             None,
             false,
@@ -1293,6 +1517,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1321,6 +1546,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1349,6 +1575,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1370,6 +1597,41 @@ mod tests {
     }
 
     #[test]
+    fn help_line_limits_actions_for_task_row_focus() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Enter attach"));
+        assert!(text.contains("c compare"));
+        assert!(text.contains("x delete"));
+        assert!(!text.contains("i issue"));
+        assert!(!text.contains("d edit description"));
+        assert!(!text.contains("a archive"));
+        assert!(!text.contains("r recheck GH status"));
+    }
+
+    #[test]
     fn help_line_shows_compare_hotkey_only_when_enabled() {
         let started = snapshot(true, Some("http://example"));
         let enabled_line = help_line(
@@ -1377,6 +1639,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1400,6 +1663,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1426,6 +1690,7 @@ mod tests {
             1,
             1,
             Some(&snapshot(false, None)),
+            false,
             0,
             None,
             false,
@@ -1453,6 +1718,7 @@ mod tests {
             1,
             1,
             Some(&snapshot(false, None)),
+            false,
             0,
             None,
             false,
@@ -1470,7 +1736,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("Delete workspace:"));
+        assert!(text.contains("Delete item:"));
         assert!(text.contains("Enter"));
     }
 
@@ -1530,6 +1796,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             0,
             None,
             false,
@@ -1692,6 +1959,7 @@ mod tests {
             1,
             1,
             Some(&active),
+            false,
             0,
             None,
             false,
@@ -1717,6 +1985,7 @@ mod tests {
             1,
             1,
             Some(&archived),
+            false,
             0,
             None,
             false,
@@ -1765,8 +2034,7 @@ mod tests {
     #[test]
     fn server_cell_label_uses_automation_question_state() {
         let mut started = snapshot(true, Some("http://example"));
-        started.persistent.automation_issue =
-            Some("https://github.com/example/repo/issues/42".to_string());
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
         started.automation_agent_state = Some(AutomationAgentState::Question);
 
         assert_eq!(server_cell_label(&started), "Question");
@@ -1775,8 +2043,7 @@ mod tests {
     #[test]
     fn server_cell_label_uses_automation_review_state_as_idle() {
         let mut started = snapshot(true, Some("http://example"));
-        started.persistent.automation_issue =
-            Some("https://github.com/example/repo/issues/42".to_string());
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
         started.automation_agent_state = Some(AutomationAgentState::Review);
 
         assert_eq!(server_cell_label(&started), "Idle");
@@ -2025,6 +2292,7 @@ mod tests {
             1,
             1,
             Some(&snapshot(true, Some("http://example"))),
+            false,
             0,
             None,
             false,
@@ -2051,6 +2319,7 @@ mod tests {
             0,
             2,
             None,
+            false,
             0,
             None,
             false,
@@ -2076,6 +2345,7 @@ mod tests {
             2,
             2,
             Some(&last_workspace),
+            false,
             0,
             None,
             false,

@@ -1,20 +1,28 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
+use diesel::{Connection, QueryableByName, RunQueryDsl, sql_query, sqlite::SqliteConnection};
 use serde::Deserialize;
 use tokio::{
     process::Command,
     sync::watch,
-    time::{Instant, sleep_until},
+    task::spawn_blocking,
+    time::{Instant, sleep, sleep_until},
 };
 
 use super::{
     CombinedService, GithubStatus,
-    runtime::{AUTOMATION_STATE_ENV, automation_state_file_source},
+    codex_app_server::CodexAppServerClient,
+    runtime::{AUTOMATION_STATE_ENV, automation_state_file_source, synthetic_codex_home_source},
     workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{
     AutomationAgentState, RootSessionStatus, WorkspaceManagerError, WorkspaceSnapshot,
-    manager::Workspace,
+    WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, manager::Workspace, opencode,
+    services::config::AgentProvider,
 };
 
 const ISSUE_PRIORITY_LABELS: [&str; 4] = [
@@ -46,8 +54,19 @@ pub async fn autonomous_workspace_service(
         move |key, workspace, workspace_rx| {
             let service = service.clone();
             async move {
+                tracing::info!(workspace_key = %key, "starting autonomous workspace watcher");
                 tokio::spawn(async move {
-                    watch_workspace(service, key, workspace, workspace_rx).await;
+                    let workspace_key = key.clone();
+                    let handle = tokio::spawn(async move {
+                        watch_workspace(service, key, workspace, workspace_rx).await;
+                    });
+                    if let Err(error) = handle.await {
+                        tracing::error!(
+                            workspace_key,
+                            error = ?error,
+                            "autonomous workspace watcher terminated unexpectedly"
+                        );
+                    }
                 });
                 Ok(())
             }
@@ -62,26 +81,49 @@ async fn watch_workspace(
     workspace: Workspace,
     mut workspace_rx: watch::Receiver<WorkspaceSnapshot>,
 ) {
+    tracing::info!(workspace_key, "autonomous workspace watcher active");
     let issue_scan_delay = Duration::from_secs(service.config.autonomous.issue_scan_delay_seconds);
     let issue_scan_delay = issue_scan_delay.max(Duration::from_secs(1));
     let mut next_scan_at: Option<Instant> = None;
     let mut watched_issue_url: Option<String> = None;
     let mut issue_status_rx: Option<watch::Receiver<Option<GithubStatus>>> = None;
+    let mut task_issue_status_rxs: HashMap<String, watch::Receiver<Option<GithubStatus>>> =
+        HashMap::new();
     let mut previous_root_status: Option<RootSessionStatus> = None;
     let mut previous_scan_request_nonce: u64 = 0;
     let mut blocked_start_scan_request_nonce: Option<u64> = None;
+    let mut previous_active_issue_url: Option<String> = None;
 
     loop {
-        let snapshot = workspace_rx.borrow().clone();
+        let mut snapshot = workspace_rx.borrow().clone();
         let assigned_repository = snapshot.persistent.assigned_repository.clone();
         let scan_requested = snapshot.automation_scan_request_nonce != previous_scan_request_nonce;
         previous_scan_request_nonce = snapshot.automation_scan_request_nonce;
 
+        if assigned_repository.is_some() || !snapshot.persistent.tasks.is_empty() {
+            tracing::warn!(
+                workspace_key,
+                assigned_repository = assigned_repository.as_deref(),
+                transient_uri = snapshot.transient.as_ref().map(|transient| transient.uri.as_str()),
+                active_task_id = snapshot.active_task_id.as_deref(),
+                resolved_active_task_id = snapshot.resolved_active_task_id().as_deref(),
+                automation_issue = snapshot.persistent.automation_issue.as_deref(),
+                task_count = snapshot.persistent.tasks.len(),
+                root_session_id = snapshot.root_session_id.as_deref(),
+                root_status = ?snapshot.root_session_status,
+                scan_requested,
+                paused = snapshot.persistent.automation_paused,
+                "autonomous workspace iteration"
+            );
+        }
+
         if snapshot.persistent.archived || assigned_repository.is_none() {
             watched_issue_url = None;
             issue_status_rx = None;
+            task_issue_status_rxs.clear();
             next_scan_at = None;
             blocked_start_scan_request_nonce = None;
+            previous_active_issue_url = None;
             previous_root_status = snapshot.root_session_status;
             clear_automation_runtime_state(&workspace);
             set_automation_status(&workspace, None);
@@ -93,11 +135,85 @@ async fn watch_workspace(
 
         let assigned_repository = assigned_repository.expect("checked above");
         let repository_label = compact_repository_label(&assigned_repository);
+        sync_task_runtime_state(&workspace, &snapshot);
+        snapshot = workspace.subscribe().borrow().clone();
+        recover_codex_task_sessions(
+            &service,
+            &workspace,
+            &snapshot,
+            &workspace_key,
+            &assigned_repository,
+        )
+        .await;
+        snapshot = workspace.subscribe().borrow().clone();
+        reconcile_codex_task_runtime_states(
+            &service,
+            &workspace,
+            &snapshot,
+            &workspace_key,
+            &assigned_repository,
+        )
+        .await;
+        snapshot = workspace.subscribe().borrow().clone();
+        sync_task_issue_status_receivers(&service, &snapshot, &mut task_issue_status_rxs);
+        let current_issue_url = active_issue_url_for_snapshot(&snapshot);
+        if previous_active_issue_url != current_issue_url {
+            request_refresh_for_task_issues(
+                &service,
+                task_issue_status_rxs.keys().map(String::as_str),
+                current_issue_url.as_deref(),
+            );
+            previous_active_issue_url = current_issue_url.clone();
+        }
+        let closed_background_issue_urls = closed_background_task_issue_urls(
+            &snapshot,
+            current_issue_url.as_deref(),
+            &task_issue_status_rxs,
+        );
+        if !closed_background_issue_urls.is_empty() {
+            for closed_issue_url in &closed_background_issue_urls {
+                if let Err(err) = service
+                    .remove_workspace_task_checkout(
+                        &workspace_key,
+                        &assigned_repository,
+                        closed_issue_url,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_key,
+                        issue_url = %closed_issue_url,
+                        error = ?err,
+                        "failed to remove closed background task worktree"
+                    );
+                }
+                clear_automation_issue_claim(&workspace, closed_issue_url);
+                task_issue_status_rxs.remove(closed_issue_url);
+            }
+            next_scan_at = Some(Instant::now());
+            set_automation_status(&workspace, Some(format!("Next issue {repository_label}")));
+            previous_root_status = snapshot.root_session_status;
+            continue;
+        }
+        if !snapshot.persistent.tasks.is_empty() {
+            tracing::warn!(
+                workspace_key,
+                task_count = snapshot.persistent.tasks.len(),
+                active_task_id = snapshot.active_task_id.as_deref(),
+                automation_issue = snapshot.persistent.automation_issue.as_deref(),
+                root_session_id = snapshot.root_session_id.as_deref(),
+                root_status = ?snapshot.root_session_status,
+                scan_requested,
+                "autonomous workspace loop snapshot"
+            );
+        }
         if snapshot.persistent.automation_paused {
             watched_issue_url = None;
             issue_status_rx = None;
+            task_issue_status_rxs.clear();
             next_scan_at = None;
             blocked_start_scan_request_nonce = None;
+            previous_active_issue_url = None;
             previous_root_status = snapshot.root_session_status;
             clear_automation_runtime_state(&workspace);
             set_automation_status(&workspace, Some(format!("Stopped {repository_label}")));
@@ -110,7 +226,7 @@ async fn watch_workspace(
             blocked_start_scan_request_nonce = None;
         }
         if scan_requested
-            && snapshot.persistent.automation_issue.is_none()
+            && active_task_id_for_snapshot(&snapshot).is_none()
             && matches!(
                 snapshot
                     .root_session_status
@@ -120,6 +236,45 @@ async fn watch_workspace(
         {
             next_scan_at = Some(Instant::now());
             set_automation_status(&workspace, Some(format!("Scan now {repository_label}")));
+        }
+
+        if active_task_id_for_snapshot(&snapshot).is_none()
+        {
+            if let Some(next_issue_url) = next_schedulable_task_issue_url(&snapshot, None) {
+                tracing::info!(
+                    workspace_key,
+                    issue_url = %next_issue_url,
+                    task_count = snapshot.persistent.tasks.len(),
+                    root_session_id = snapshot.root_session_id.as_deref(),
+                    root_status = ?snapshot.root_session_status,
+                    "leasing autonomous task onto workspace VM"
+                );
+                lease_task_issue(&workspace, &snapshot, &next_issue_url);
+                clear_automation_state_file(&service, &workspace_key).await;
+                set_automation_status(
+                    &workspace,
+                    Some(format!(
+                        "Scheduling {}",
+                        issue_reference(&next_issue_url).unwrap_or(next_issue_url.clone())
+                    )),
+                );
+                previous_root_status = snapshot.root_session_status;
+                if workspace_rx.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            if !snapshot.persistent.tasks.is_empty() {
+                tracing::warn!(
+                    workspace_key,
+                    task_count = snapshot.persistent.tasks.len(),
+                    root_session_id = snapshot.root_session_id.as_deref(),
+                    root_status = ?snapshot.root_session_status,
+                    active_task_id = snapshot.active_task_id.as_deref(),
+                    automation_issue = snapshot.persistent.automation_issue.as_deref(),
+                    "autonomous workspace has queued tasks but no schedulable active lease"
+                );
+            }
         }
 
         if snapshot.transient.is_none() {
@@ -174,22 +329,100 @@ async fn watch_workspace(
             continue;
         }
 
-        let current_issue_url = snapshot.persistent.automation_issue.clone();
         if let Some(current_issue_url) = current_issue_url {
+            tracing::warn!(
+                workspace_key,
+                issue_url = %current_issue_url,
+                root_session_id = snapshot.root_session_id.as_deref(),
+                root_status = ?snapshot.root_session_status,
+                task_session_id = snapshot
+                    .resolved_active_task_id()
+                    .as_deref()
+                    .and_then(|task_id| snapshot.task_states.get(task_id))
+                    .and_then(|state| state.session_id.as_deref()),
+                "autonomous workspace has active issue candidate"
+            );
+            if scan_requested {
+                let available_slots = service
+                    .config
+                    .autonomous
+                    .max_parallel_issues
+                    .saturating_sub(snapshot.persistent.tasks.len());
+                if available_slots > 0 {
+                    match enqueue_next_issues(
+                        &service,
+                        &workspace,
+                        &workspace_key,
+                        &snapshot,
+                        &assigned_repository,
+                        available_slots,
+                    )
+                    .await
+                    {
+                        Ok(queued) if queued > 0 => {
+                            set_automation_status(
+                                &workspace,
+                                Some(format!(
+                                    "Queued {queued} issue(s) for {repository_label}"
+                                )),
+                            );
+                            previous_root_status = snapshot.root_session_status;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            set_automation_status(
+                                &workspace,
+                                Some(format!("Scan failed {repository_label}: {err}")),
+                            );
+                            previous_root_status = snapshot.root_session_status;
+                            if !wait_for_workspace_change_until(
+                                &mut workspace_rx,
+                                &mut issue_status_rx,
+                                Some(Instant::now() + ISSUE_SCAN_RETRY_DELAY),
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            if active_task_can_yield_vm(&snapshot)
+                && let Some(next_issue_url) =
+                    next_schedulable_task_issue_url(&snapshot, Some(current_issue_url.as_str()))
+            {
+                lease_task_issue(&workspace, &snapshot, &next_issue_url);
+                clear_automation_state_file(&service, &workspace_key).await;
+                watched_issue_url = None;
+                issue_status_rx = None;
+                set_automation_status(
+                    &workspace,
+                    Some(format!(
+                        "Scheduling {}",
+                        issue_reference(&next_issue_url).unwrap_or(next_issue_url.clone())
+                    )),
+                );
+                previous_root_status = snapshot.root_session_status;
+                if workspace_rx.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
             let root_status = snapshot
                 .root_session_status
                 .unwrap_or(RootSessionStatus::Idle);
-            let should_resume_assigned_issue = matches!(root_status, RootSessionStatus::Idle)
-                && (scan_requested
-                    || (previous_root_status.is_none()
-                        && snapshot.automation_agent_state.is_none()
-                        && snapshot.automation_session_status.is_none()));
+            let should_resume_assigned_issue =
+                should_start_assigned_issue_work(&snapshot, root_status);
 
-            if !should_resume_assigned_issue
-                && snapshot.automation_session_id.is_none()
-                && snapshot.root_session_id.is_some()
-                && !matches!(root_status, RootSessionStatus::Idle)
-            {
+            if should_bridge_root_runtime_state(
+                service.agent_provider(),
+                &snapshot,
+                should_resume_assigned_issue,
+                root_status,
+            ) {
                 set_automation_runtime_state(
                     &workspace,
                     snapshot.root_session_id.clone(),
@@ -231,6 +464,8 @@ async fn watch_workspace(
                         clear_automation_issue_claim(&workspace, &current_issue_url);
                         watched_issue_url = None;
                         issue_status_rx = None;
+                        task_issue_status_rxs.remove(&current_issue_url);
+                        previous_active_issue_url = None;
                         next_scan_at = Some(Instant::now() + issue_scan_delay);
                         set_automation_status(
                             &workspace,
@@ -275,27 +510,26 @@ async fn watch_workspace(
             }
 
             if issue_is_closed(issue_status_rx.as_ref()) {
-                workspace.update(|next| {
-                    let mut changed = false;
-                    if next.persistent.automation_issue.as_deref()
-                        == Some(current_issue_url.as_str())
-                    {
-                        next.persistent.automation_issue = None;
-                        changed = true;
-                    }
-                    if next.automation_session_id.take().is_some() {
-                        changed = true;
-                    }
-                    if next.automation_agent_state.take().is_some() {
-                        changed = true;
-                    }
-                    if next.automation_session_status.take().is_some() {
-                        changed = true;
-                    }
-                    changed
-                });
+                if let Err(err) = service
+                    .remove_workspace_task_checkout(
+                        &workspace_key,
+                        &assigned_repository,
+                        &current_issue_url,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_key,
+                        issue_url = %current_issue_url,
+                        error = ?err,
+                        "failed to remove closed task worktree"
+                    );
+                }
+                clear_automation_issue_claim(&workspace, &current_issue_url);
                 watched_issue_url = None;
                 issue_status_rx = None;
+                task_issue_status_rxs.remove(&current_issue_url);
+                previous_active_issue_url = None;
                 next_scan_at = Some(Instant::now());
                 set_automation_status(&workspace, Some(format!("Next issue {repository_label}")));
                 previous_root_status = snapshot.root_session_status;
@@ -358,25 +592,48 @@ async fn watch_workspace(
         }
 
         set_automation_status(&workspace, Some(format!("Scan issues {repository_label}")));
-        match claim_next_issue(
+        let available_slots = service
+            .config
+            .autonomous
+            .max_parallel_issues
+            .saturating_sub(snapshot.persistent.tasks.len());
+        match enqueue_next_issues(
             &service,
             &workspace,
             &workspace_key,
             &snapshot,
             &assigned_repository,
+            available_slots.max(1),
         )
         .await
         {
-            Ok(Some(issue)) => {
-                watched_issue_url = Some(issue.url.clone());
-                issue_status_rx = service.github_status_service().watch_status(&issue.url);
+            Ok(queued) if queued > 0 => {
                 next_scan_at = None;
+                let post_enqueue_snapshot = workspace.subscribe().borrow().clone();
+                let next_issue_url =
+                    next_schedulable_task_issue_url(&post_enqueue_snapshot, None);
+                tracing::warn!(
+                    workspace_key,
+                    queued,
+                    task_count = post_enqueue_snapshot.persistent.tasks.len(),
+                    active_task_id = post_enqueue_snapshot.active_task_id.as_deref(),
+                    automation_issue = post_enqueue_snapshot.persistent.automation_issue.as_deref(),
+                    next_issue_url = next_issue_url.as_deref(),
+                    "autonomous workspace post-enqueue state"
+                );
+                if let Some(next_issue_url) = next_issue_url {
+                    lease_task_issue(
+                        &workspace,
+                        &post_enqueue_snapshot,
+                        &next_issue_url,
+                    );
+                }
                 set_automation_status(
                     &workspace,
-                    Some(format!("Working {}", issue.display_reference())),
+                    Some(format!("Queued {queued} issue(s) for {repository_label}")),
                 );
             }
-            Ok(None) => {
+            Ok(_) => {
                 next_scan_at = Some(Instant::now() + issue_scan_delay);
                 set_automation_status(
                     &workspace,
@@ -408,71 +665,6 @@ fn start_retry_is_blocked(blocked_nonce: Option<u64>, current_nonce: u64) -> boo
     blocked_nonce == Some(current_nonce)
 }
 
-async fn claim_next_issue(
-    service: &CombinedService,
-    workspace: &Workspace,
-    workspace_key: &str,
-    snapshot: &WorkspaceSnapshot,
-    assigned_repository: &str,
-) -> Result<Option<SelectedIssue>, String> {
-    let excluded_issue_urls = active_issue_urls(service, workspace_key);
-    let token = resolved_gh_token(service).await?;
-    let Some(issue) = find_next_issue(assigned_repository, &excluded_issue_urls, &token).await?
-    else {
-        return Ok(None);
-    };
-
-    set_automation_status(
-        workspace,
-        Some(format!("Claiming {}", issue.display_reference())),
-    );
-    persist_automation_issue_claim(workspace, assigned_repository, &issue);
-    clear_automation_state_file(service, workspace_key).await;
-
-    if let Err(err) = prompt_root_session(service, snapshot, assigned_repository, &issue).await {
-        clear_automation_issue_claim(workspace, &issue.url);
-        tracing::warn!(
-            workspace_key,
-            issue_url = %issue.url,
-            error = %err,
-            "failed to start autonomous issue work after reserving issue"
-        );
-        return Err(err);
-    }
-
-    set_automation_runtime_state(
-        workspace,
-        snapshot.root_session_id.clone(),
-        Some(RootSessionStatus::Busy),
-    );
-
-    if let Err(err) =
-        add_work_started_comment(assigned_repository, &issue, workspace_key, &token).await
-    {
-        tracing::warn!(
-            workspace_key,
-            issue_url = %issue.url,
-            error = %err,
-            "autonomous issue prompt started but adding work-started comment failed"
-        );
-        return Err(err);
-    }
-
-    if let Err(err) = add_issue_label(assigned_repository, &issue, IN_PROGRESS_LABEL, &token).await
-    {
-        tracing::warn!(
-            workspace_key,
-            issue_url = %issue.url,
-            label = IN_PROGRESS_LABEL,
-            error = %err,
-            "autonomous issue prompt started but adding in-progress label failed"
-        );
-        return Err(err);
-    }
-
-    Ok(Some(issue))
-}
-
 async fn start_assigned_issue_work(
     service: &CombinedService,
     workspace: &Workspace,
@@ -486,13 +678,44 @@ async fn start_assigned_issue_work(
         return Ok(None);
     };
 
+    ensure_workspace_task_claim(
+        workspace,
+        assigned_repository,
+        &issue,
+        WorkspaceTaskSource::Manual,
+    );
+    let task_session_id = ensure_task_session(
+        service,
+        workspace,
+        snapshot,
+        workspace_key,
+        assigned_repository,
+        &issue,
+    )
+    .await?;
+
+    set_automation_runtime_state(
+        workspace,
+        Some(task_session_id.clone()),
+        Some(RootSessionStatus::Busy),
+    );
+
     set_automation_status(
         workspace,
         Some(format!("Claiming {}", issue.display_reference())),
     );
     clear_automation_state_file(service, workspace_key).await;
 
-    if let Err(err) = prompt_root_session(service, snapshot, assigned_repository, &issue).await {
+    if let Err(err) = prompt_task_session(
+        service,
+        snapshot,
+        assigned_repository,
+        &issue,
+        &task_session_id,
+        task_cwd_path(service, workspace_key, assigned_repository, &issue.url),
+    )
+    .await
+    {
         tracing::warn!(
             workspace_key,
             issue_url = %issue.url,
@@ -501,12 +724,6 @@ async fn start_assigned_issue_work(
         );
         return Err(err);
     }
-
-    set_automation_runtime_state(
-        workspace,
-        snapshot.root_session_id.clone(),
-        Some(RootSessionStatus::Busy),
-    );
 
     if let Err(err) =
         add_work_started_comment(assigned_repository, &issue, workspace_key, &token).await
@@ -535,30 +752,123 @@ async fn start_assigned_issue_work(
     Ok(Some(issue))
 }
 
-fn persist_automation_issue_claim(
+async fn enqueue_next_issues(
+    service: &CombinedService,
+    workspace: &Workspace,
+    workspace_key: &str,
+    snapshot: &WorkspaceSnapshot,
+    assigned_repository: &str,
+    limit: usize,
+) -> Result<usize, String> {
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    let token = resolved_gh_token(service).await?;
+    let mut queued = 0usize;
+    for _ in 0..limit {
+        let current_snapshot = workspace.subscribe().borrow().clone();
+        let excluded_issue_urls =
+            reserved_issue_urls(service, workspace_key, Some(&current_snapshot));
+        let Some(issue) =
+            find_next_issue(assigned_repository, &excluded_issue_urls, &token).await?
+        else {
+            break;
+        };
+        queue_issue_task(workspace, &issue, WorkspaceTaskSource::Scan);
+        queued += 1;
+    }
+
+    let _ = snapshot;
+    Ok(queued)
+}
+
+fn ensure_workspace_task_claim(
     workspace: &Workspace,
     assigned_repository: &str,
     issue: &SelectedIssue,
+    source: WorkspaceTaskSource,
 ) {
-    workspace.update(|next| {
-        let changed_issue = next.persistent.automation_issue.as_deref() != Some(issue.url.as_str());
-        let changed_repo =
-            next.persistent.assigned_repository.as_deref() != Some(assigned_repository);
-        if changed_issue || changed_repo {
-            next.persistent.assigned_repository = Some(assigned_repository.to_string());
-            next.persistent.automation_issue = Some(issue.url.clone());
-            true
-        } else {
-            false
+    workspace.update(|snapshot| {
+        let mut changed = false;
+        if snapshot.persistent.assigned_repository.as_deref() != Some(assigned_repository) {
+            snapshot.persistent.assigned_repository = Some(assigned_repository.to_string());
+            changed = true;
         }
+        let task_id = task_id_for_issue(snapshot, &issue.url).unwrap_or_else(|| {
+            let task = WorkspaceTaskPersistentSnapshot::new(
+                format!("task-{}", issue.number),
+                issue.url.clone(),
+                source,
+            );
+            let task_id = task.id.clone();
+            snapshot.persistent.tasks.push(task);
+            task_id
+        });
+        if snapshot.active_task_id.as_deref() != Some(task_id.as_str()) {
+            snapshot.active_task_id = Some(task_id);
+            changed = true;
+        }
+        changed
+    });
+}
+
+fn queue_issue_task(workspace: &Workspace, issue: &SelectedIssue, source: WorkspaceTaskSource) {
+    workspace.update(|snapshot| {
+        if snapshot
+            .persistent
+            .tasks
+            .iter()
+            .any(|task| task.issue_url == issue.url)
+        {
+            return false;
+        }
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                format!("task-{}", issue.number),
+                issue.url.clone(),
+                source,
+            ));
+        true
     });
 }
 
 fn clear_automation_issue_claim(workspace: &Workspace, issue_url: &str) {
     workspace.update(|next| {
         let mut changed = false;
-        if next.persistent.automation_issue.as_deref() == Some(issue_url) {
-            next.persistent.automation_issue = None;
+        let cleared_task_id = task_id_for_issue(next, issue_url);
+        let before = next.persistent.tasks.len();
+        next.persistent
+            .tasks
+            .retain(|task| task.issue_url != issue_url);
+        if next.persistent.tasks.len() != before {
+            changed = true;
+        }
+        if let Some(task_id) = cleared_task_id.as_deref()
+            && next.task_states.remove(task_id).is_some()
+        {
+            changed = true;
+        }
+        let next_active_task_id = if next.active_task_id.as_deref() == cleared_task_id.as_deref() {
+            next.persistent.tasks.first().map(|task| task.id.clone())
+        } else {
+            next.active_task_id
+                .as_deref()
+                .filter(|task_id| task_persistent_snapshot(next, task_id).is_some())
+                .map(ToOwned::to_owned)
+        };
+        if next.active_task_id != next_active_task_id {
+            next.active_task_id = next_active_task_id.clone();
+            changed = true;
+        }
+        let next_active_issue_url = next_active_task_id
+            .as_deref()
+            .and_then(|task_id| task_issue_url_for_id(next, task_id))
+            .map(ToOwned::to_owned);
+        if next.persistent.automation_issue != next_active_issue_url {
+            next.persistent.automation_issue = next_active_issue_url;
             changed = true;
         }
         if next.automation_session_id.take().is_some() {
@@ -577,6 +887,19 @@ fn clear_automation_issue_claim(workspace: &Workspace, issue_url: &str) {
 fn clear_automation_runtime_state(workspace: &Workspace) {
     workspace.update(|snapshot| {
         let mut changed = false;
+        if let Some(active_task_id) = snapshot.active_task_id.clone()
+            && let Some(task_state) = snapshot.task_states.get_mut(&active_task_id)
+        {
+            let mut next_task_state = task_state.clone();
+            next_task_state.session_id = None;
+            next_task_state.session_status = None;
+            next_task_state.agent_state = None;
+            next_task_state.waiting_on_vm = false;
+            if &next_task_state != task_state {
+                *task_state = next_task_state;
+                changed = true;
+            }
+        }
         if snapshot.automation_session_id.take().is_some() {
             changed = true;
         }
@@ -590,6 +913,133 @@ fn clear_automation_runtime_state(workspace: &Workspace) {
     });
 }
 
+fn lease_task_issue(workspace: &Workspace, snapshot: &WorkspaceSnapshot, issue_url: &str) {
+    let next_task_id = task_id_for_issue(snapshot, issue_url);
+    workspace.update(|next| {
+        let mut changed = false;
+        if next.persistent.automation_issue.as_deref() != Some(issue_url) {
+            next.persistent.automation_issue = Some(issue_url.to_string());
+            changed = true;
+        }
+        if next.active_task_id != next_task_id {
+            next.active_task_id = next_task_id.clone();
+            next.automation_session_id = None;
+            next.automation_agent_state = None;
+            next.automation_session_status = None;
+            changed = true;
+        }
+        changed
+    });
+}
+
+fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) {
+    workspace.update(|next| {
+        let mut changed = false;
+        let task_ids = snapshot
+            .persistent
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<HashSet<_>>();
+        let stale_task_ids = next
+            .task_states
+            .keys()
+            .filter(|task_id| !task_ids.contains(task_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for task_id in stale_task_ids {
+            if next.task_states.remove(&task_id).is_some() {
+                changed = true;
+            }
+        }
+
+        let resolved_active_task_id = next
+            .active_task_id
+            .as_deref()
+            .filter(|task_id| active_task_lease_must_be_preserved(next, task_id))
+            .map(ToOwned::to_owned)
+            .or_else(|| active_task_id_for_snapshot(snapshot));
+        if next.active_task_id != resolved_active_task_id {
+            next.active_task_id = resolved_active_task_id.clone();
+            changed = true;
+        }
+        let resolved_issue_url = resolved_active_task_id
+            .as_deref()
+            .and_then(|task_id| task_issue_url_for_id(snapshot, task_id))
+            .map(ToOwned::to_owned);
+        if next.persistent.automation_issue != resolved_issue_url {
+            next.persistent.automation_issue = resolved_issue_url;
+            changed = true;
+        }
+        if next.active_task_id.is_none() {
+            if next.automation_session_id.take().is_some() {
+                changed = true;
+            }
+            if next.automation_agent_state.take().is_some() {
+                changed = true;
+            }
+            if next.automation_session_status.take().is_some() {
+                changed = true;
+            }
+        }
+        for task in &snapshot.persistent.tasks {
+            let is_active = next.active_task_id.as_deref() == Some(task.id.as_str());
+            let task_state = next.task_states.entry(task.id.clone()).or_default();
+            let should_wait = !is_active
+                && !matches!(
+                    task_state.agent_state,
+                    Some(
+                        AutomationAgentState::Question
+                            | AutomationAgentState::Review
+                            | AutomationAgentState::Idle
+                            | AutomationAgentState::Stale
+                    )
+                );
+            if task_state.waiting_on_vm != should_wait {
+                task_state.waiting_on_vm = should_wait;
+                if should_wait {
+                    task_state.agent_state = Some(AutomationAgentState::WaitingOnVm);
+                } else if !should_wait
+                    && task_state.agent_state == Some(AutomationAgentState::WaitingOnVm)
+                {
+                    task_state.agent_state = None;
+                }
+                changed = true;
+            }
+        }
+        changed
+    });
+}
+
+fn active_task_lease_must_be_preserved(snapshot: &WorkspaceSnapshot, task_id: &str) -> bool {
+    task_persistent_snapshot(snapshot, task_id).is_some()
+        && snapshot
+            .task_states
+            .get(task_id)
+            .is_some_and(|task_state| {
+                task_state.session_id.is_some() && !task_can_yield_vm(task_state.agent_state)
+            })
+}
+
+fn active_task_id_for_snapshot(snapshot: &WorkspaceSnapshot) -> Option<String> {
+    snapshot.resolved_active_task_id()
+}
+
+fn active_issue_url_for_snapshot(snapshot: &WorkspaceSnapshot) -> Option<String> {
+    snapshot.resolved_active_issue_url()
+}
+
+fn task_issue_url_for_id<'a>(snapshot: &'a WorkspaceSnapshot, task_id: &str) -> Option<&'a str> {
+    snapshot.task_issue_url_for_id(task_id)
+}
+
+fn task_persistent_snapshot<'a>(
+    snapshot: &'a WorkspaceSnapshot,
+    task_id: &str,
+) -> Option<&'a WorkspaceTaskPersistentSnapshot> {
+    snapshot.task_persistent_snapshot(task_id)
+}
+
 fn set_automation_runtime_state(
     workspace: &Workspace,
     session_id: Option<String>,
@@ -601,11 +1051,7 @@ fn set_automation_runtime_state(
             snapshot.automation_session_id = session_id.clone();
             changed = true;
         }
-        let next_agent_state = session_status.map(|status| match status {
-            RootSessionStatus::Busy => AutomationAgentState::Working,
-            RootSessionStatus::Question => AutomationAgentState::Question,
-            RootSessionStatus::Idle => AutomationAgentState::Idle,
-        });
+        let next_agent_state = session_status.map(root_status_to_agent_state);
         if snapshot.automation_agent_state != next_agent_state {
             snapshot.automation_agent_state = next_agent_state;
             changed = true;
@@ -614,13 +1060,49 @@ fn set_automation_runtime_state(
             snapshot.automation_session_status = session_status;
             changed = true;
         }
+        if let Some(active_task_id) = snapshot.active_task_id.clone() {
+            let task_state = snapshot.task_states.entry(active_task_id).or_default();
+            let can_update_task_state = task_state.session_id.is_none()
+                || task_state.session_id == session_id;
+            if can_update_task_state {
+                if task_state.session_id != session_id {
+                    task_state.session_id = session_id.clone();
+                    changed = true;
+                }
+                if task_state.session_status != session_status {
+                    task_state.session_status = session_status;
+                    changed = true;
+                }
+                if task_state.agent_state != next_agent_state {
+                    task_state.agent_state = next_agent_state;
+                    changed = true;
+                }
+            }
+            if task_state.waiting_on_vm {
+                task_state.waiting_on_vm = false;
+                changed = true;
+            }
+        }
         changed
     });
 }
 
-fn active_issue_urls(service: &CombinedService, current_workspace_key: &str) -> HashSet<String> {
+fn reserved_issue_urls(
+    service: &CombinedService,
+    current_workspace_key: &str,
+    current_snapshot: Option<&WorkspaceSnapshot>,
+) -> HashSet<String> {
     let workspace_keys = service.manager.subscribe().borrow().clone();
     let mut urls = HashSet::new();
+    if let Some(snapshot) = current_snapshot {
+        urls.extend(
+            snapshot
+                .persistent
+                .tasks
+                .iter()
+                .map(|task| task.issue_url.clone()),
+        );
+    }
     for key in workspace_keys {
         if key == current_workspace_key {
             continue;
@@ -629,13 +1111,111 @@ fn active_issue_urls(service: &CombinedService, current_workspace_key: &str) -> 
             continue;
         };
         let snapshot = workspace.subscribe().borrow().clone();
-        if let Some(url) = snapshot.persistent.automation_issue {
-            urls.insert(url);
-        }
+        urls.extend(
+            snapshot
+                .persistent
+                .tasks
+                .into_iter()
+                .map(|task| task.issue_url),
+        );
         urls.extend(snapshot.persistent.custom_links.issue);
         urls.extend(snapshot.persistent.agent_provided.issue);
     }
     urls
+}
+
+fn next_schedulable_task_issue_url(
+    snapshot: &WorkspaceSnapshot,
+    exclude_issue_url: Option<&str>,
+) -> Option<String> {
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .find(|task| {
+            Some(task.issue_url.as_str()) != exclude_issue_url
+                && !matches!(
+                    snapshot
+                        .task_states
+                        .get(&task.id)
+                        .and_then(|state| state.agent_state),
+                    Some(
+                        AutomationAgentState::Working
+                            | AutomationAgentState::Question
+                            | AutomationAgentState::Review
+                            | AutomationAgentState::Idle
+                    )
+                )
+        })
+        .map(|task| task.issue_url.clone())
+}
+
+fn task_can_yield_vm(agent_state: Option<AutomationAgentState>) -> bool {
+    matches!(
+        agent_state,
+        Some(
+            AutomationAgentState::Question
+                | AutomationAgentState::Review
+                | AutomationAgentState::Idle
+                | AutomationAgentState::Stale
+        )
+    )
+}
+
+fn active_task_can_yield_vm(snapshot: &WorkspaceSnapshot) -> bool {
+    let Some(active_task_id) = snapshot.active_task_id.as_deref() else {
+        return false;
+    };
+    let Some(task_state) = snapshot.task_states.get(active_task_id) else {
+        return false;
+    };
+    if task_state.session_id.is_none() {
+        return false;
+    }
+    task_can_yield_vm(task_state.agent_state)
+}
+
+fn task_id_for_issue(snapshot: &WorkspaceSnapshot, issue_url: &str) -> Option<String> {
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .find(|task| task.issue_url == issue_url)
+        .map(|task| task.id.clone())
+}
+
+fn should_start_assigned_issue_work(
+    snapshot: &WorkspaceSnapshot,
+    root_status: RootSessionStatus,
+) -> bool {
+    if !matches!(root_status, RootSessionStatus::Idle) {
+        return false;
+    }
+
+    let Some(active_task_id) = active_task_id_for_snapshot(snapshot) else {
+        return false;
+    };
+
+    snapshot
+        .task_states
+        .get(&active_task_id)
+        .and_then(|state| state.session_id.as_deref())
+        .is_none()
+}
+
+fn should_bridge_root_runtime_state(
+    agent_provider: AgentProvider,
+    snapshot: &WorkspaceSnapshot,
+    should_resume_assigned_issue: bool,
+    root_status: RootSessionStatus,
+) -> bool {
+    if agent_provider == AgentProvider::Codex {
+        return false;
+    }
+    !should_resume_assigned_issue
+        && snapshot.automation_session_id.is_none()
+        && snapshot.root_session_id.is_some()
+        && !matches!(root_status, RootSessionStatus::Idle)
 }
 
 fn set_automation_status(workspace: &Workspace, next_status: Option<String>) {
@@ -650,13 +1230,391 @@ fn set_automation_status(workspace: &Workspace, next_status: Option<String>) {
 }
 
 fn effective_automation_agent_state(snapshot: &WorkspaceSnapshot) -> Option<AutomationAgentState> {
-    snapshot.automation_agent_state.or_else(|| {
-        snapshot.root_session_status.map(|status| match status {
-            RootSessionStatus::Busy => AutomationAgentState::Working,
-            RootSessionStatus::Question => AutomationAgentState::Question,
-            RootSessionStatus::Idle => AutomationAgentState::Idle,
+    snapshot
+        .active_task_id
+        .as_deref()
+        .and_then(|task_id| snapshot.task_states.get(task_id))
+        .and_then(|state| state.agent_state)
+        .or(snapshot.automation_agent_state)
+        .or_else(|| snapshot.root_session_status.map(root_status_to_agent_state))
+}
+
+fn root_status_to_agent_state(status: RootSessionStatus) -> AutomationAgentState {
+    match status {
+        RootSessionStatus::Busy => AutomationAgentState::Working,
+        RootSessionStatus::Question => AutomationAgentState::Question,
+        RootSessionStatus::Idle => AutomationAgentState::Idle,
+    }
+}
+
+#[derive(Debug, QueryableByName)]
+struct CodexStateThreadRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    cwd: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    updated_at: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    has_user_event: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CodexTaskMetadata {
+    repositories: Vec<String>,
+    issues: Vec<String>,
+    prs: Vec<String>,
+}
+
+async fn recover_codex_task_sessions(
+    service: &CombinedService,
+    workspace: &Workspace,
+    snapshot: &WorkspaceSnapshot,
+    workspace_key: &str,
+    assigned_repository: &str,
+) {
+    if service.agent_provider() != AgentProvider::Codex {
+        return;
+    }
+
+    let missing_task_cwds = snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| {
+            snapshot
+                .task_states
+                .get(&task.id)
+                .and_then(|state| state.session_id.as_deref())
+                .is_none()
         })
+        .map(|task| {
+            (
+                task.id.clone(),
+                task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if missing_task_cwds.is_empty() {
+        return;
+    }
+
+    let codex_home = synthetic_codex_home_source(service.workspace_directory_path(), workspace_key);
+    let recovered = spawn_blocking(move || {
+        recover_codex_thread_ids_from_state_db(&codex_home, &missing_task_cwds)
     })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let Some(recovered) = recovered else {
+        return;
+    };
+    if recovered.is_empty() {
+        return;
+    }
+
+    workspace.update(|next| {
+        let mut changed = false;
+        for (task_id, session_id) in &recovered {
+            let task_state = next.task_states.entry(task_id.clone()).or_default();
+            if task_state.session_id.as_deref() != Some(session_id.as_str()) {
+                task_state.session_id = Some(session_id.clone());
+                changed = true;
+            }
+        }
+        changed
+    });
+}
+
+async fn reconcile_codex_task_runtime_states(
+    service: &CombinedService,
+    workspace: &Workspace,
+    snapshot: &WorkspaceSnapshot,
+    workspace_key: &str,
+    assigned_repository: &str,
+) {
+    if service.agent_provider() != AgentProvider::Codex {
+        return;
+    }
+
+    let Some(uri) = snapshot
+        .transient
+        .as_ref()
+        .map(|transient| transient.uri.clone())
+    else {
+        return;
+    };
+
+    let _ = (workspace_key, assigned_repository);
+    let client = CodexAppServerClient::new(uri);
+    let active_task_id = snapshot.active_task_id.as_deref();
+    for task in &snapshot.persistent.tasks {
+        let Some(task_state) = snapshot.task_states.get(&task.id) else {
+            continue;
+        };
+        let Some(task_session_id) = task_state.session_id.clone() else {
+            continue;
+        };
+
+        let response = match client.thread_read_with_turns(&task_session_id, true).await {
+            Ok(response) => response,
+            Err(error) => {
+                if error.contains("thread not loaded") {
+                    let (session_status, agent_state) = unloaded_codex_task_runtime(task_state);
+                    set_task_runtime_state_from_codex(
+                        workspace,
+                        &task.id,
+                        &task_session_id,
+                        session_status,
+                        agent_state,
+                        Some(CodexTaskMetadata {
+                            issues: vec![task.issue_url.clone()],
+                            ..Default::default()
+                        }),
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(status) = response.thread.status.as_ref() else {
+            continue;
+        };
+
+        let next_session_status = codex_thread_status_to_root_session_status(status);
+        let next_agent_state = codex_task_thread_status_to_agent_state(status);
+        let next_agent_state = if active_task_id != Some(task.id.as_str())
+            && next_agent_state == AutomationAgentState::Working
+        {
+            AutomationAgentState::WaitingOnVm
+        } else {
+            next_agent_state
+        };
+        let metadata = codex_task_metadata_from_turns(&response.thread.turns, &task.issue_url);
+        set_task_runtime_state_from_codex(
+            workspace,
+            &task.id,
+            &task_session_id,
+            next_session_status,
+            next_agent_state,
+            Some(metadata),
+        );
+    }
+}
+
+fn latest_codex_state_db_path(codex_home: &Path) -> Option<PathBuf> {
+    let mut candidates = std::fs::read_dir(codex_home)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_file() {
+                return None;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            (file_name.starts_with("state_") && file_name.ends_with(".sqlite")).then(|| {
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+                (modified, entry.path())
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.pop().map(|(_, path)| path)
+}
+
+fn recover_codex_thread_ids_from_state_db(
+    codex_home: &Path,
+    task_cwds: &[(String, String)],
+) -> Result<HashMap<String, String>, String> {
+    let Some(state_db_path) = latest_codex_state_db_path(codex_home) else {
+        return Ok(HashMap::new());
+    };
+    let database_url = state_db_path.to_string_lossy().into_owned();
+    let mut connection =
+        SqliteConnection::establish(&database_url).map_err(|error| error.to_string())?;
+    let rows = sql_query(
+        "SELECT id, cwd, updated_at, has_user_event \
+         FROM threads \
+         WHERE archived = 0 \
+         ORDER BY updated_at DESC, created_at DESC",
+    )
+    .load::<CodexStateThreadRow>(&mut connection)
+    .map_err(|error| error.to_string())?;
+
+    let mut threads_by_cwd = HashMap::<String, CodexStateThreadRow>::new();
+    for row in rows {
+        let prefer_row = match threads_by_cwd.get(&row.cwd) {
+            None => true,
+            Some(existing) => {
+                (row.has_user_event != 0 && existing.has_user_event == 0)
+                    || (row.has_user_event == existing.has_user_event
+                        && row.updated_at > existing.updated_at)
+            }
+        };
+        if prefer_row {
+            threads_by_cwd.insert(row.cwd.clone(), row);
+        }
+    }
+
+    Ok(task_cwds
+        .iter()
+        .filter_map(|(task_id, cwd)| {
+            threads_by_cwd
+                .get(cwd)
+                .map(|row| (task_id.clone(), row.id.clone()))
+        })
+        .collect())
+}
+
+fn unloaded_codex_task_runtime(
+    task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+) -> (RootSessionStatus, AutomationAgentState) {
+    match task_state.agent_state {
+        Some(AutomationAgentState::Question) => {
+            (RootSessionStatus::Question, AutomationAgentState::Question)
+        }
+        Some(AutomationAgentState::Stale) => (RootSessionStatus::Idle, AutomationAgentState::Stale),
+        _ => (RootSessionStatus::Idle, AutomationAgentState::Review),
+    }
+}
+
+fn codex_task_metadata_from_turns(
+    turns: &[super::codex_app_server::CodexThreadTurn],
+    issue_url: &str,
+) -> CodexTaskMetadata {
+    let mut repositories = std::collections::BTreeSet::new();
+    let mut issues = std::collections::BTreeSet::from([issue_url.to_string()]);
+    let mut prs = std::collections::BTreeSet::new();
+
+    for turn in turns {
+        for item in &turn.items {
+            if item.get("type").and_then(serde_json::Value::as_str) != Some("agentMessage") {
+                continue;
+            }
+            let Some(text) = item.get("text").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            repositories.extend(extract_multicode_tag_values(text, "repo"));
+            issues.extend(extract_multicode_tag_values(text, "issue"));
+            prs.extend(extract_multicode_tag_values(text, "pr"));
+        }
+    }
+
+    CodexTaskMetadata {
+        repositories: repositories.into_iter().collect(),
+        issues: issues.into_iter().collect(),
+        prs: prs.into_iter().collect(),
+    }
+}
+
+fn extract_multicode_tag_values(text: &str, tag: &str) -> Vec<String> {
+    let opening = format!("<multicode:{tag}>");
+    let closing = format!("</multicode:{tag}>");
+    let mut values = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(open_index) = text[search_start..].find(&opening) {
+        let content_start = search_start + open_index + opening.len();
+        let Some(close_index) = text[content_start..].find(&closing) else {
+            break;
+        };
+        let content_end = content_start + close_index;
+        let value = text[content_start..content_end].trim();
+        if !value.is_empty() {
+            values.push(value.to_string());
+        }
+        search_start = content_end + closing.len();
+    }
+
+    values
+}
+
+fn codex_thread_status_to_root_session_status(
+    status: &super::codex_app_server::CodexThreadStatus,
+) -> RootSessionStatus {
+    if status.waits_for_human_input() {
+        RootSessionStatus::Question
+    } else if status.is_idle() {
+        RootSessionStatus::Idle
+    } else {
+        RootSessionStatus::Busy
+    }
+}
+
+fn codex_task_thread_status_to_agent_state(
+    status: &super::codex_app_server::CodexThreadStatus,
+) -> AutomationAgentState {
+    match status {
+        super::codex_app_server::CodexThreadStatus::SystemError => AutomationAgentState::Stale,
+        _ if status.waits_for_human_input() => AutomationAgentState::Question,
+        _ if status.is_idle() => AutomationAgentState::Review,
+        _ => AutomationAgentState::Working,
+    }
+}
+
+fn set_task_runtime_state_from_codex(
+    workspace: &Workspace,
+    task_id: &str,
+    session_id: &str,
+    session_status: RootSessionStatus,
+    agent_state: AutomationAgentState,
+    metadata: Option<CodexTaskMetadata>,
+) {
+    workspace.update(|snapshot| {
+        let mut changed = false;
+        let is_active = snapshot.active_task_id.as_deref() == Some(task_id);
+        if is_active {
+            if snapshot.automation_session_id.as_deref() != Some(session_id) {
+                snapshot.automation_session_id = Some(session_id.to_string());
+                changed = true;
+            }
+            if snapshot.automation_agent_state != Some(agent_state) {
+                snapshot.automation_agent_state = Some(agent_state);
+                changed = true;
+            }
+            if snapshot.automation_session_status != Some(session_status) {
+                snapshot.automation_session_status = Some(session_status);
+                changed = true;
+            }
+        }
+        let task_state = snapshot.task_states.entry(task_id.to_string()).or_default();
+        if task_state.session_id.as_deref() != Some(session_id) {
+            task_state.session_id = Some(session_id.to_string());
+            changed = true;
+        }
+        if task_state.agent_state != Some(agent_state) {
+            task_state.agent_state = Some(agent_state);
+            changed = true;
+        }
+        if task_state.session_status != Some(session_status) {
+            task_state.session_status = Some(session_status);
+            changed = true;
+        }
+        if task_state.waiting_on_vm {
+            task_state.waiting_on_vm = false;
+            changed = true;
+        }
+        if let Some(metadata) = metadata {
+            if task_state.repository != metadata.repositories {
+                task_state.repository = metadata.repositories;
+                changed = true;
+            }
+            if task_state.issue != metadata.issues {
+                task_state.issue = metadata.issues;
+                changed = true;
+            }
+            if task_state.pr != metadata.prs {
+                task_state.pr = metadata.prs;
+                changed = true;
+            }
+        }
+        changed
+    });
 }
 
 fn issue_progress_status(
@@ -668,6 +1626,7 @@ fn issue_progress_status(
     let _ = assigned_repository;
     match agent_state.unwrap_or(AutomationAgentState::Idle) {
         AutomationAgentState::Working => format!("Working {issue_ref}"),
+        AutomationAgentState::WaitingOnVm => format!("Waiting on VM {issue_ref}"),
         AutomationAgentState::Question => format!("Question {issue_ref}"),
         AutomationAgentState::Review => format!("Review {issue_ref}"),
         AutomationAgentState::Idle => format!("Wait close {issue_ref}"),
@@ -688,6 +1647,59 @@ fn issue_is_closed(issue_status_rx: Option<&watch::Receiver<Option<GithubStatus>
         Some(GithubStatus::Issue(issue_status))
             if issue_status.state == super::github_status_service::GithubIssueState::Closed
     )
+}
+
+fn sync_task_issue_status_receivers(
+    service: &CombinedService,
+    snapshot: &WorkspaceSnapshot,
+    task_issue_status_rxs: &mut HashMap<String, watch::Receiver<Option<GithubStatus>>>,
+) {
+    let tracked_issue_urls = snapshot
+        .persistent
+        .tasks
+        .iter()
+        .map(|task| task.issue_url.as_str())
+        .collect::<HashSet<_>>();
+    task_issue_status_rxs.retain(|issue_url, _| tracked_issue_urls.contains(issue_url.as_str()));
+    for task in &snapshot.persistent.tasks {
+        task_issue_status_rxs
+            .entry(task.issue_url.clone())
+            .or_insert_with(|| {
+                service
+                    .github_status_service()
+                    .watch_status(&task.issue_url)
+                    .expect("queued workspace tasks must have valid GitHub issue URLs")
+            });
+    }
+}
+
+fn request_refresh_for_task_issues<'a>(
+    service: &CombinedService,
+    issue_urls: impl Iterator<Item = &'a str>,
+    exclude_issue_url: Option<&str>,
+) {
+    for issue_url in issue_urls {
+        if Some(issue_url) == exclude_issue_url {
+            continue;
+        }
+        let _ = service.github_status_service().request_refresh(issue_url);
+    }
+}
+
+fn closed_background_task_issue_urls(
+    snapshot: &WorkspaceSnapshot,
+    active_issue_url: Option<&str>,
+    task_issue_status_rxs: &HashMap<String, watch::Receiver<Option<GithubStatus>>>,
+) -> Vec<String> {
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| Some(task.issue_url.as_str()) != active_issue_url)
+        .filter_map(|task| {
+            issue_is_closed(task_issue_status_rxs.get(&task.issue_url)).then(|| task.issue_url.clone())
+        })
+        .collect()
 }
 
 async fn wait_for_workspace_change_until(
@@ -719,14 +1731,260 @@ async fn wait_for_workspace_change_until(
     }
 }
 
-async fn prompt_root_session(
+async fn ensure_task_session(
+    service: &CombinedService,
+    workspace: &Workspace,
+    snapshot: &WorkspaceSnapshot,
+    workspace_key: &str,
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+) -> Result<String, String> {
+    let task_cwd = service
+        .ensure_workspace_task_checkout(workspace_key, assigned_repository, &issue.url)
+        .await
+        .map_err(|err| err.summary())?;
+    let task_id = task_id_for_issue(snapshot, &issue.url)
+        .ok_or_else(|| format!("task missing for issue {}", issue.url))?;
+    if let Some(existing) = snapshot
+        .task_states
+        .get(&task_id)
+        .and_then(|state| state.session_id.clone())
+    {
+        let mut reuse_existing = true;
+        if service.agent_provider() == AgentProvider::Codex {
+            let Some(uri) = snapshot
+                .transient
+                .as_ref()
+                .map(|transient| transient.uri.clone())
+            else {
+                return Err("workspace has no active runtime uri".to_string());
+            };
+            match CodexAppServerClient::new(uri).thread_read(&existing).await {
+                Ok(response) => {
+                    reuse_existing = response.thread.id.as_deref() == Some(existing.as_str())
+                        && response.thread.status.as_ref().is_some_and(|status| {
+                            !matches!(status, super::codex_app_server::CodexThreadStatus::NotLoaded)
+                                && !status.requires_replacement()
+                        });
+                }
+                Err(error) => {
+                    reuse_existing = !(error.contains("thread not loaded")
+                        || error.contains("thread not found"));
+                    if !reuse_existing {
+                        tracing::info!(
+                            workspace_key,
+                            issue_url = %issue.url,
+                            task_id = %task_id,
+                            session_id = %existing,
+                            error = %error,
+                            "discarding stale autonomous codex task session"
+                        );
+                    }
+                }
+            }
+        }
+        if reuse_existing {
+            tracing::info!(
+                workspace_key,
+                issue_url = %issue.url,
+                task_id = %task_id,
+                session_id = %existing,
+                cwd = %task_cwd.display(),
+                "reusing existing autonomous task session"
+            );
+            return Ok(existing);
+        }
+    }
+
+    let session_id = match service.agent_provider() {
+        AgentProvider::Opencode => {
+            let client = snapshot
+                .opencode_client
+                .as_ref()
+                .ok_or_else(|| "workspace has no healthy opencode client".to_string())?;
+            let root_session_id = snapshot
+                .root_session_id
+                .clone()
+                .ok_or_else(|| "workspace has no root session id".to_string())?;
+            let root_session_id =
+                opencode::client::types::SessionForkSessionId::try_from(root_session_id.as_str())
+                    .map_err(|err| format!("invalid root session id '{root_session_id}': {err}"))?;
+            client
+                .client
+                .session_fork(
+                    &root_session_id,
+                    None,
+                    None,
+                    &opencode::client::types::SessionForkBody::default(),
+                )
+                .await
+                .map_err(|err| format!("failed to fork task session: {err}"))?
+                .into_inner()
+                .id
+                .to_string()
+        }
+        AgentProvider::Codex => {
+            let uri = snapshot
+                .transient
+                .as_ref()
+                .map(|transient| transient.uri.clone())
+                .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
+            let client = CodexAppServerClient::new(uri);
+            let session_id = client
+                .thread_start(task_cwd.to_string_lossy().as_ref(), &service.config.agent.codex)
+                .await?
+                .thread
+                .id;
+            wait_for_codex_task_thread_ready(&client, &session_id).await?;
+            session_id
+        }
+    };
+
+    tracing::info!(
+        workspace_key,
+        issue_url = %issue.url,
+        task_id = %task_id,
+        session_id = %session_id,
+        cwd = %task_cwd.display(),
+        "created autonomous task session"
+    );
+
+    workspace.update(|next| {
+        let task_state = next.task_states.entry(task_id.clone()).or_default();
+        if task_state.session_id.as_deref() == Some(session_id.as_str()) {
+            false
+        } else {
+            task_state.session_id = Some(session_id.clone());
+            true
+        }
+    });
+
+    Ok(session_id)
+}
+
+async fn prompt_task_session(
     service: &CombinedService,
     snapshot: &WorkspaceSnapshot,
     assigned_repository: &str,
     issue: &SelectedIssue,
+    task_session_id: &str,
+    cwd: std::path::PathBuf,
 ) -> Result<(), String> {
-    let prompt = build_issue_prompt(assigned_repository, issue);
-    service.prompt_root_session(snapshot, &prompt).await
+    let prompt = build_issue_prompt(assigned_repository, issue, task_session_id, &cwd);
+    match service.agent_provider() {
+        AgentProvider::Opencode => {
+            let opencode_client = snapshot
+                .opencode_client
+                .as_ref()
+                .ok_or_else(|| "workspace has no healthy opencode client".to_string())?;
+            let session_id = task_session_id
+                .parse::<opencode::client::types::SessionPromptAsyncSessionId>()
+                .map_err(|err| format!("invalid task session id '{task_session_id}': {err}"))?;
+            let prompt_body = opencode::client::types::SessionPromptAsyncBody {
+                agent: None,
+                format: None,
+                message_id: None,
+                model: None,
+                no_reply: None,
+                parts: vec![
+                    opencode::client::types::TextPartInput {
+                        id: None,
+                        ignored: None,
+                        metadata: Default::default(),
+                        synthetic: None,
+                        text: prompt,
+                        time: None,
+                        type_: opencode::client::types::TextPartInputType::Text,
+                    }
+                    .into(),
+                ],
+                system: None,
+                tools: Default::default(),
+                variant: None,
+            };
+            opencode_client
+                .client
+                .session_prompt_async(&session_id, None, None, &prompt_body)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("failed to send prompt: {err}"))
+        }
+        AgentProvider::Codex => {
+            let uri = snapshot
+                .transient
+                .as_ref()
+                .map(|transient| transient.uri.clone())
+                .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
+            let _ = cwd;
+            let client = CodexAppServerClient::new(uri);
+            let mut last_error: Option<String> = None;
+            for attempt in 0..5 {
+                match client
+                    .turn_start(task_session_id, &prompt, &service.config.agent.codex)
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(error)
+                        if (error.contains("thread not found")
+                            || error.contains("thread not loaded"))
+                            && attempt < 4 =>
+                    {
+                        last_error = Some(error);
+                        wait_for_codex_task_thread_ready(&client, task_session_id).await?;
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| {
+                format!("failed to start codex turn for task session {task_session_id}")
+            }))
+        }
+    }
+}
+
+async fn wait_for_codex_task_thread_ready(
+    client: &CodexAppServerClient,
+    task_session_id: &str,
+) -> Result<(), String> {
+    let mut last_error: Option<String> = None;
+    for attempt in 0..25 {
+        match client.thread_read(task_session_id).await {
+            Ok(response) => {
+                let status_ready = response.thread.status.as_ref().is_some_and(|status| {
+                    !matches!(status, super::codex_app_server::CodexThreadStatus::NotLoaded)
+                });
+                if status_ready {
+                    return Ok(());
+                }
+                last_error = Some(format!(
+                    "thread '{task_session_id}' read succeeded but is not materialized yet"
+                ));
+            }
+            Err(error)
+                if error.contains("thread not found") || error.contains("thread not loaded") =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+        if attempt < 24 {
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        format!("timed out waiting for codex task thread '{task_session_id}' to materialize")
+    }))
+}
+
+fn task_cwd_path(
+    service: &CombinedService,
+    workspace_key: &str,
+    assigned_repository: &str,
+    issue_url: &str,
+) -> std::path::PathBuf {
+    service.workspace_task_checkout_path(workspace_key, assigned_repository, issue_url)
 }
 
 async fn clear_automation_state_file(service: &CombinedService, workspace_key: &str) {
@@ -740,15 +1998,22 @@ async fn clear_automation_state_file(service: &CombinedService, workspace_key: &
     }
 }
 
-fn build_issue_prompt(assigned_repository: &str, issue: &SelectedIssue) -> String {
+fn build_issue_prompt(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    task_session_id: &str,
+    cwd: &std::path::Path,
+) -> String {
     format!(
         "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
 Start work on GitHub issue {issue_url}.\n\
 Issue title: {issue_title}\n\
+Primary checkout for this task: {cwd}\n\
 Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
 The environment variable `{automation_state_env}` points to a multicode-owned state file. Maintain it throughout the run using the `autonomous-state` skill so multicode can track whether you are working, waiting for a question, or ready for review.\n\
+For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\
 Your job is to:\n\
-1. Ensure the repository is available in this workspace.\n\
+1. Use the existing checkout at `{cwd}` for this issue. Keep this task isolated to that checkout instead of sharing another task's repository state.\n\
 2. Understand and reproduce the issue, creating a minimal reproducer or failing test when possible.\n\
 3. Implement the fix.\n\
 4. Run focused verification and summarize the evidence.\n\
@@ -759,7 +2024,9 @@ Your job is to:\n\
 Prefer an upstream pull request if you have write access. Keep going until the workspace is ready for review or you need human feedback.",
         automation_state_env = AUTOMATION_STATE_ENV,
         issue_url = issue.url,
-        issue_title = issue.title
+        issue_title = issue.title,
+        task_session_id = task_session_id,
+        cwd = cwd.display()
     )
 }
 
@@ -1128,6 +2395,7 @@ struct SelectedIssueLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::codex_app_server::{CodexThreadActiveFlag, CodexThreadStatus};
     use crate::WorkspaceSnapshot;
 
     #[test]
@@ -1355,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_automation_issue_claim_updates_workspace_state() {
+    fn ensure_workspace_task_claim_updates_workspace_state() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         let issue = SelectedIssue {
             number: 810,
@@ -1367,16 +2635,144 @@ mod tests {
             labels: vec![],
         };
 
-        persist_automation_issue_claim(&workspace, "example/repo", &issue);
+        ensure_workspace_task_claim(
+            &workspace,
+            "example/repo",
+            &issue,
+            WorkspaceTaskSource::Scan,
+        );
 
         let snapshot = workspace.subscribe().borrow().clone();
         assert_eq!(
             snapshot.persistent.assigned_repository.as_deref(),
             Some("example/repo")
         );
+        assert!(snapshot.persistent.automation_issue.is_none());
+        assert_eq!(snapshot.persistent.tasks.len(), 1);
+        assert_eq!(snapshot.persistent.tasks[0].issue_url, issue.url);
         assert_eq!(
-            snapshot.persistent.automation_issue.as_deref(),
-            Some(issue.url.as_str())
+            snapshot.persistent.tasks[0].source,
+            WorkspaceTaskSource::Scan
+        );
+        assert_eq!(snapshot.active_task_id.as_deref(), Some("task-810"));
+    }
+
+    #[test]
+    fn sync_task_runtime_state_prunes_stale_entries_and_derives_active_task() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-810".to_string(),
+                    "https://github.com/example/repo/issues/810".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/810".to_string());
+            snapshot.task_states.insert(
+                "task-stale".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    waiting_on_vm: true,
+                    ..Default::default()
+                },
+            );
+            snapshot.automation_session_id = Some("stale-session".to_string());
+            snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+            snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert_eq!(next.active_task_id.as_deref(), Some("task-810"));
+        assert_eq!(
+            next.persistent.automation_issue.as_deref(),
+            Some("https://github.com/example/repo/issues/810")
+        );
+        assert!(!next.task_states.contains_key("task-stale"));
+        let task_state = next
+            .task_states
+            .get("task-810")
+            .expect("task state should exist");
+        assert_eq!(task_state.agent_state, None);
+        assert!(!task_state.waiting_on_vm);
+    }
+
+    #[test]
+    fn sync_task_runtime_state_clears_bridge_state_without_active_task() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.active_task_id = Some("task-missing".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/999".to_string());
+            snapshot.automation_session_id = Some("stale-session".to_string());
+            snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+            snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert!(next.active_task_id.is_none());
+        assert!(next.persistent.automation_issue.is_none());
+        assert!(next.automation_session_id.is_none());
+        assert!(next.automation_agent_state.is_none());
+        assert!(next.automation_session_status.is_none());
+    }
+
+    #[test]
+    fn sync_task_runtime_state_preserves_live_non_yieldable_active_task_lease() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-48".to_string(),
+                    "https://github.com/example/repo/issues/48".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-48".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/48".to_string());
+            snapshot.task_states.insert(
+                "task-48".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-48".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        let mut stale_snapshot = workspace.subscribe().borrow().clone();
+        stale_snapshot.active_task_id = Some("task-42".to_string());
+        stale_snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/42".to_string());
+
+        sync_task_runtime_state(&workspace, &stale_snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert_eq!(next.active_task_id.as_deref(), Some("task-48"));
+        assert_eq!(
+            next.persistent.automation_issue.as_deref(),
+            Some("https://github.com/example/repo/issues/48")
         );
     }
 
@@ -1393,7 +2789,12 @@ mod tests {
             labels: vec![],
         };
 
-        persist_automation_issue_claim(&workspace, "example/repo", &issue);
+        ensure_workspace_task_claim(
+            &workspace,
+            "example/repo",
+            &issue,
+            WorkspaceTaskSource::Scan,
+        );
         clear_automation_issue_claim(&workspace, "https://github.com/example/repo/issues/999");
         let unchanged = workspace.subscribe().borrow().clone();
         assert_eq!(
@@ -1404,10 +2805,60 @@ mod tests {
         clear_automation_issue_claim(&workspace, &issue.url);
         let cleared = workspace.subscribe().borrow().clone();
         assert!(cleared.persistent.automation_issue.is_none());
+        assert!(cleared.persistent.tasks.is_empty());
         assert_eq!(
             cleared.persistent.assigned_repository.as_deref(),
             Some("example/repo")
         );
+    }
+
+    #[test]
+    fn clear_automation_issue_claim_promotes_next_task_to_active_lease() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-810".to_string(),
+                    "https://github.com/example/repo/issues/810".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-811".to_string(),
+                    "https://github.com/example/repo/issues/811".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-810".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/810".to_string());
+            snapshot.task_states.insert(
+                "task-810".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("ses-810".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        clear_automation_issue_claim(&workspace, "https://github.com/example/repo/issues/810");
+
+        let next = workspace.subscribe().borrow().clone();
+        assert_eq!(next.active_task_id.as_deref(), Some("task-811"));
+        assert_eq!(
+            next.persistent.automation_issue.as_deref(),
+            Some("https://github.com/example/repo/issues/811")
+        );
+        assert!(!next.task_states.contains_key("task-810"));
+        assert!(next.automation_session_id.is_none());
+        assert!(next.automation_agent_state.is_none());
+        assert!(next.automation_session_status.is_none());
     }
 
     #[test]
@@ -1419,6 +2870,14 @@ mod tests {
                 Some(AutomationAgentState::Working),
             ),
             "Working example/repo#42"
+        );
+        assert_eq!(
+            issue_progress_status(
+                "example/repo",
+                "https://github.com/example/repo/issues/42",
+                Some(AutomationAgentState::WaitingOnVm),
+            ),
+            "Waiting on VM example/repo#42"
         );
         assert_eq!(
             issue_progress_status(
@@ -1439,6 +2898,712 @@ mod tests {
     }
 
     #[test]
+    fn sync_task_runtime_state_marks_only_blocked_non_active_tasks_waiting_on_vm() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-2".to_string(),
+                    "https://github.com/example/repo/issues/2".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-3".to_string(),
+                    "https://github.com/example/repo/issues/3".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-4".to_string(),
+                    "https://github.com/example/repo/issues/4".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.task_states.insert(
+                "task-1".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    agent_state: Some(AutomationAgentState::Working),
+                    ..Default::default()
+                },
+            );
+            snapshot.task_states.insert(
+                "task-2".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    agent_state: Some(AutomationAgentState::Question),
+                    ..Default::default()
+                },
+            );
+            snapshot.task_states.insert(
+                "task-3".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    agent_state: Some(AutomationAgentState::Idle),
+                    ..Default::default()
+                },
+            );
+            snapshot.task_states.insert(
+                "task-4".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert!(!next
+            .task_states
+            .get("task-1")
+            .expect("active task should exist")
+            .waiting_on_vm);
+        assert!(!next
+            .task_states
+            .get("task-2")
+            .expect("question task should exist")
+            .waiting_on_vm);
+        assert!(!next
+            .task_states
+            .get("task-3")
+            .expect("idle task should exist")
+            .waiting_on_vm);
+        let waiting_task = next
+            .task_states
+            .get("task-4")
+            .expect("blocked task should exist");
+        assert!(waiting_task.waiting_on_vm);
+        assert_eq!(
+            waiting_task.agent_state,
+            Some(AutomationAgentState::WaitingOnVm)
+        );
+    }
+
+    #[test]
+    fn sync_task_runtime_state_relabels_blocked_working_task_as_waiting_on_vm() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-2".to_string(),
+                    "https://github.com/example/repo/issues/2".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.task_states.insert(
+                "task-2".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-2".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        let task_state = next
+            .task_states
+            .get("task-2")
+            .expect("blocked task should exist");
+        assert!(task_state.waiting_on_vm);
+        assert_eq!(
+            task_state.agent_state,
+            Some(AutomationAgentState::WaitingOnVm)
+        );
+    }
+
+    #[test]
+    fn closed_background_task_issue_urls_only_returns_closed_non_active_tasks() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-26".to_string(),
+                "https://github.com/example/repo/issues/26".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-16".to_string(),
+                "https://github.com/example/repo/issues/16".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-14".to_string(),
+                "https://github.com/example/repo/issues/14".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-16".to_string());
+        snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/16".to_string());
+
+        let (closed_sender, closed_rx) = watch::channel(Some(GithubStatus::Issue(
+            super::super::github_status_service::GithubIssueStatus {
+                state: super::super::github_status_service::GithubIssueState::Closed,
+                fetched_at: std::time::SystemTime::now(),
+            },
+        )));
+        let (_open_sender, open_rx) = watch::channel(Some(GithubStatus::Issue(
+            super::super::github_status_service::GithubIssueStatus {
+                state: super::super::github_status_service::GithubIssueState::Open,
+                fetched_at: std::time::SystemTime::now(),
+            },
+        )));
+        let mut task_issue_status_rxs = HashMap::new();
+        task_issue_status_rxs.insert(
+            "https://github.com/example/repo/issues/26".to_string(),
+            closed_rx,
+        );
+        task_issue_status_rxs.insert(
+            "https://github.com/example/repo/issues/16".to_string(),
+            open_rx,
+        );
+        drop(closed_sender);
+
+        assert_eq!(
+            closed_background_task_issue_urls(
+                &snapshot,
+                Some("https://github.com/example/repo/issues/16"),
+                &task_issue_status_rxs
+            ),
+            vec!["https://github.com/example/repo/issues/26".to_string()]
+        );
+    }
+
+    #[test]
+    fn next_schedulable_task_issue_url_skips_tasks_with_live_or_terminal_agent_states() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-1".to_string(),
+                "https://github.com/example/repo/issues/1".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-2".to_string(),
+                "https://github.com/example/repo/issues/2".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-3".to_string(),
+                "https://github.com/example/repo/issues/3".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-4".to_string(),
+                "https://github.com/example/repo/issues/4".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.task_states.insert(
+            "task-1".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                agent_state: Some(AutomationAgentState::Question),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-3".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            next_schedulable_task_issue_url(&snapshot, None).as_deref(),
+            Some("https://github.com/example/repo/issues/4")
+        );
+        assert_eq!(
+            next_schedulable_task_issue_url(
+                &snapshot,
+                Some("https://github.com/example/repo/issues/4")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn task_can_yield_vm_only_for_non_working_states() {
+        assert!(!task_can_yield_vm(Some(AutomationAgentState::Working)));
+        assert!(task_can_yield_vm(Some(AutomationAgentState::Question)));
+        assert!(task_can_yield_vm(Some(AutomationAgentState::Review)));
+        assert!(task_can_yield_vm(Some(AutomationAgentState::Idle)));
+        assert!(task_can_yield_vm(Some(AutomationAgentState::Stale)));
+        assert!(!task_can_yield_vm(None));
+    }
+
+    #[test]
+    fn active_task_can_yield_vm_requires_existing_session() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-5".to_string(),
+                "https://github.com/example/repo/issues/5".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-5".to_string());
+        snapshot.task_states.insert(
+            "task-5".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: None,
+                agent_state: Some(AutomationAgentState::Idle),
+                ..Default::default()
+            },
+        );
+
+        assert!(!active_task_can_yield_vm(&snapshot));
+
+        snapshot.task_states.insert(
+            "task-5".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-5".to_string()),
+                agent_state: Some(AutomationAgentState::Idle),
+                ..Default::default()
+            },
+        );
+
+        assert!(active_task_can_yield_vm(&snapshot));
+    }
+
+    #[test]
+    fn active_task_can_yield_vm_requires_explicit_task_state() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-5".to_string(),
+                "https://github.com/example/repo/issues/5".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-5".to_string());
+        snapshot.automation_agent_state = Some(AutomationAgentState::Idle);
+        snapshot.task_states.insert(
+            "task-5".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-5".to_string()),
+                agent_state: None,
+                ..Default::default()
+            },
+        );
+
+        assert!(!active_task_can_yield_vm(&snapshot));
+
+        snapshot.task_states.insert(
+            "task-5".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-5".to_string()),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+
+        assert!(active_task_can_yield_vm(&snapshot));
+    }
+
+    #[test]
+    fn set_automation_runtime_state_preserves_existing_task_session() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-5".to_string(),
+                    "https://github.com/example/repo/issues/5".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-5".to_string());
+            snapshot.task_states.insert(
+                "task-5".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("task-session-5".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_automation_runtime_state(
+            &workspace,
+            Some("root-session".to_string()),
+            Some(RootSessionStatus::Idle),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.automation_session_id.as_deref(),
+            Some("root-session")
+        );
+        let task_state = snapshot
+            .task_states
+            .get("task-5")
+            .expect("task state should remain");
+        assert_eq!(task_state.session_id.as_deref(), Some("task-session-5"));
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Busy));
+    }
+
+    #[test]
+    fn set_automation_runtime_state_updates_matching_task_session_to_working() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-7".to_string(),
+                    "https://github.com/example/repo/issues/7".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-7".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/7".to_string());
+            snapshot.task_states.insert(
+                "task-7".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("task-session-7".to_string()),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_automation_runtime_state(
+            &workspace,
+            Some("task-session-7".to_string()),
+            Some(RootSessionStatus::Busy),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.automation_session_id.as_deref(),
+            Some("task-session-7")
+        );
+        assert_eq!(
+            snapshot.automation_agent_state,
+            Some(AutomationAgentState::Working)
+        );
+        assert_eq!(
+            snapshot.automation_session_status,
+            Some(RootSessionStatus::Busy)
+        );
+        let task_state = snapshot
+            .task_states
+            .get("task-7")
+            .expect("task state should remain");
+        assert_eq!(task_state.session_id.as_deref(), Some("task-session-7"));
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Busy));
+    }
+
+    #[test]
+    fn codex_task_thread_status_maps_idle_to_review() {
+        assert_eq!(
+            codex_task_thread_status_to_agent_state(&CodexThreadStatus::Idle),
+            AutomationAgentState::Review
+        );
+        assert_eq!(
+            codex_thread_status_to_root_session_status(&CodexThreadStatus::Idle),
+            RootSessionStatus::Idle
+        );
+    }
+
+    #[test]
+    fn codex_task_thread_status_maps_waiting_flags_to_question() {
+        let status = CodexThreadStatus::Active {
+            active_flags: vec![CodexThreadActiveFlag::WaitingOnApproval],
+        };
+
+        assert_eq!(
+            codex_task_thread_status_to_agent_state(&status),
+            AutomationAgentState::Question
+        );
+        assert_eq!(
+            codex_thread_status_to_root_session_status(&status),
+            RootSessionStatus::Question
+        );
+    }
+
+    #[test]
+    fn set_task_runtime_state_from_codex_marks_reviewing_task_yieldable() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-7".to_string(),
+                    "https://github.com/example/repo/issues/7".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-7".to_string());
+            snapshot.task_states.insert(
+                "task-7".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("task-session-7".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-7",
+            "task-session-7",
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review,
+            Some(CodexTaskMetadata {
+                issues: vec!["https://github.com/example/repo/issues/7".to_string()],
+                prs: vec!["https://github.com/example/repo/pull/11".to_string()],
+                ..Default::default()
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.automation_session_id.as_deref(),
+            Some("task-session-7")
+        );
+        assert_eq!(
+            snapshot.automation_agent_state,
+            Some(AutomationAgentState::Review)
+        );
+        assert_eq!(
+            snapshot.automation_session_status,
+            Some(RootSessionStatus::Idle)
+        );
+        let task_state = snapshot
+            .task_states
+            .get("task-7")
+            .expect("task state should remain");
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Review));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
+        assert_eq!(
+            task_state.issue,
+            vec!["https://github.com/example/repo/issues/7".to_string()]
+        );
+        assert_eq!(
+            task_state.pr,
+            vec!["https://github.com/example/repo/pull/11".to_string()]
+        );
+        assert!(active_task_can_yield_vm(&snapshot));
+    }
+
+    #[test]
+    fn unloaded_codex_task_runtime_preserves_question_state() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Question),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unloaded_codex_task_runtime(&task_state),
+            (RootSessionStatus::Question, AutomationAgentState::Question)
+        );
+    }
+
+    #[test]
+    fn codex_task_metadata_from_turns_extracts_issue_and_pr_tags() {
+        let turns = vec![crate::services::codex_app_server::CodexThreadTurn {
+            items: vec![
+                serde_json::json!({
+                    "type": "agentMessage",
+                    "text": "<multicode:repo>/tmp/multicode-codex-workspaces/e2e-test/work/multicode-test-1</multicode:repo>\n<multicode:issue>https://github.com/graemerocher/multicode-test/issues/1</multicode:issue>\n<multicode:pr>https://github.com/graemerocher/multicode-test/pull/8</multicode:pr>"
+                }),
+            ],
+        }];
+
+        let metadata = codex_task_metadata_from_turns(
+            &turns,
+            "https://github.com/graemerocher/multicode-test/issues/1",
+        );
+
+        assert_eq!(
+            metadata.repositories,
+            vec!["/tmp/multicode-codex-workspaces/e2e-test/work/multicode-test-1".to_string()]
+        );
+        assert_eq!(
+            metadata.issues,
+            vec!["https://github.com/graemerocher/multicode-test/issues/1".to_string()]
+        );
+        assert_eq!(
+            metadata.prs,
+            vec!["https://github.com/graemerocher/multicode-test/pull/8".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_active_codex_working_task_is_rendered_waiting_on_vm() {
+        let status = CodexThreadStatus::Active {
+            active_flags: vec![],
+        };
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-12".to_string());
+
+        let next_agent_state = codex_task_thread_status_to_agent_state(&status);
+        let next_agent_state = if snapshot.active_task_id.as_deref() != Some("task-7")
+            && next_agent_state == AutomationAgentState::Working
+        {
+            AutomationAgentState::WaitingOnVm
+        } else {
+            next_agent_state
+        };
+
+        assert_eq!(next_agent_state, AutomationAgentState::WaitingOnVm);
+    }
+
+    #[test]
+    fn should_start_assigned_issue_work_when_active_task_has_no_session() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-6".to_string(),
+                "https://github.com/example/repo/issues/6".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-6".to_string());
+        snapshot.automation_agent_state = Some(AutomationAgentState::Idle);
+        snapshot.automation_session_status = Some(RootSessionStatus::Idle);
+
+        assert!(should_start_assigned_issue_work(
+            &snapshot,
+            RootSessionStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn should_not_start_assigned_issue_work_when_active_task_already_has_session() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-6".to_string(),
+                "https://github.com/example/repo/issues/6".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-6".to_string());
+        snapshot.task_states.insert(
+            "task-6".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-task-6".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(!should_start_assigned_issue_work(
+            &snapshot,
+            RootSessionStatus::Idle
+        ));
+        assert!(!should_start_assigned_issue_work(
+            &snapshot,
+            RootSessionStatus::Busy
+        ));
+    }
+
+    #[test]
+    fn should_not_bridge_root_runtime_state_for_codex() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.root_session_id = Some("root-thread".to_string());
+
+        assert!(!should_bridge_root_runtime_state(
+            AgentProvider::Codex,
+            &snapshot,
+            false,
+            RootSessionStatus::Busy,
+        ));
+    }
+
+    #[test]
+    fn should_bridge_root_runtime_state_for_non_codex_busy_root() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.root_session_id = Some("root-thread".to_string());
+
+        assert!(should_bridge_root_runtime_state(
+            AgentProvider::Opencode,
+            &snapshot,
+            false,
+            RootSessionStatus::Busy,
+        ));
+        assert!(!should_bridge_root_runtime_state(
+            AgentProvider::Opencode,
+            &snapshot,
+            true,
+            RootSessionStatus::Busy,
+        ));
+        assert!(!should_bridge_root_runtime_state(
+            AgentProvider::Opencode,
+            &snapshot,
+            false,
+            RootSessionStatus::Idle,
+        ));
+    }
+
+    #[test]
     fn build_issue_prompt_requires_skills_and_publish_approval() {
         let issue = SelectedIssue {
             number: 980,
@@ -1450,12 +3615,22 @@ mod tests {
             labels: vec![],
         };
 
-        let prompt = build_issue_prompt("example/repo", &issue);
+        let prompt = build_issue_prompt(
+            "example/repo",
+            &issue,
+            "thread-task-980",
+            std::path::Path::new("/tmp/work/example-repo-980"),
+        );
 
         assert!(prompt.contains("`independent-fix`"));
         assert!(prompt.contains("`machine-readable-pr`"));
         assert!(prompt.contains("`autonomous-state`"));
         assert!(prompt.contains(AUTOMATION_STATE_ENV));
+        assert!(prompt.contains("Primary checkout for this task: /tmp/work/example-repo-980"));
+        assert!(prompt.contains("Use the existing checkout at `/tmp/work/example-repo-980`"));
+        assert!(prompt.contains(
+            "write autonomous state updates in the format `<state>:thread-task-980`"
+        ));
         assert!(prompt.contains(
             "Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission."
         ));

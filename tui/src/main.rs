@@ -9,12 +9,13 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use multicode_lib::{
-    AutomationAgentState, RootSessionStatus, WorkspaceSnapshot, logging, opencode,
+    AutomationAgentState, RootSessionStatus, WorkspaceSnapshot, WorkspaceTaskPersistentSnapshot,
+    WorkspaceTaskRuntimeSnapshot, logging, opencode,
     services::{
         CombinedService, GithubIssueState, GithubIssueStatus, GithubPrBuildState,
         GithubPrReviewState, GithubPrState, GithubPrStatus, GithubStatus, ToolConfig, ToolType,
@@ -100,6 +101,17 @@ enum CustomLinkModalAction {
     Edit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingDeleteTarget {
+    Workspace {
+        workspace_key: String,
+    },
+    Task {
+        workspace_key: String,
+        task_id: String,
+    },
+}
+
 struct TuiState {
     service: CombinedService,
     relay_socket: Option<PathBuf>,
@@ -125,7 +137,7 @@ struct TuiState {
     custom_link_kind: Option<WorkspaceLinkKind>,
     custom_link_action: Option<CustomLinkModalAction>,
     custom_link_original_value: Option<String>,
-    pending_delete_workspace_key: Option<String>,
+    pending_delete_target: Option<PendingDeleteTarget>,
     starting_workspace_key: Option<String>,
     started_wait_since: Option<Instant>,
     previous_machine_cpu_totals: Option<ProcCpuTotals>,
@@ -146,6 +158,18 @@ struct RunningOperation {
     progress_rx: watch::Receiver<String>,
     result_rx: oneshot::Receiver<Result<(), String>>,
     cancel: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TableEntry {
+    Create,
+    Workspace {
+        workspace_key: String,
+    },
+    Task {
+        workspace_key: String,
+        task_id: String,
+    },
 }
 
 fn workspace_is_usable(snapshot: &WorkspaceSnapshot) -> bool {
@@ -171,6 +195,7 @@ enum WorkspaceLinkSource {
     Custom,
     Automation,
     AgentProvided,
+    Task,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +299,120 @@ fn workspace_state(snapshot: &WorkspaceSnapshot) -> WorkspaceUiState {
     }
 }
 
+fn task_persistent_snapshot<'a>(
+    snapshot: &'a WorkspaceSnapshot,
+    task_id: &str,
+) -> Option<&'a WorkspaceTaskPersistentSnapshot> {
+    snapshot.task_persistent_snapshot(task_id)
+}
+
+fn task_runtime_snapshot<'a>(
+    snapshot: &'a WorkspaceSnapshot,
+    task_id: &str,
+) -> Option<&'a WorkspaceTaskRuntimeSnapshot> {
+    snapshot.task_states.get(task_id)
+}
+
+fn task_issue_reference(task: &WorkspaceTaskPersistentSnapshot) -> String {
+    let Some(url) = Url::parse(&task.issue_url).ok() else {
+        return task.issue_url.clone();
+    };
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    if segments.len() >= 4 {
+        let repo = segments[1];
+        let number = segments[3];
+        return format!("{repo}#{number}");
+    }
+    task.issue_url.clone()
+}
+
+fn task_row_label(task: &WorkspaceTaskPersistentSnapshot) -> String {
+    format!("➡️ {}", task_issue_reference(task))
+}
+
+fn task_issue_link<'a>(
+    task: &'a WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&'a WorkspaceTaskRuntimeSnapshot>,
+) -> &'a str {
+    task_state
+        .and_then(|state| state.issue.first().map(String::as_str))
+        .unwrap_or(task.issue_url.as_str())
+}
+
+fn task_pr_link(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> Option<&str> {
+    task_state.and_then(|state| state.pr.first().map(String::as_str))
+}
+
+fn github_link_badge(url: &str) -> String {
+    let Some(parsed) = Url::parse(url).ok() else {
+        return String::new();
+    };
+    let segments = parsed
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(number) = segments.last().filter(|segment| !segment.is_empty()) else {
+        return String::new();
+    };
+    format!("#{number}")
+}
+
+fn task_server_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> &'static str {
+    match task_state.and_then(|state| state.agent_state) {
+        Some(AutomationAgentState::Working) => "Busy",
+        Some(AutomationAgentState::Question) => "Question",
+        Some(AutomationAgentState::Review | AutomationAgentState::Idle) => "Idle",
+        Some(AutomationAgentState::WaitingOnVm) => "Waiting on VM",
+        Some(AutomationAgentState::Stale) => "Stale",
+        None => {
+            if task_state.is_some_and(|state| state.waiting_on_vm) {
+                "Waiting on VM"
+            } else {
+                ""
+            }
+        }
+    }
+}
+
+fn task_server_style(task_state: Option<&WorkspaceTaskRuntimeSnapshot>, archived: bool) -> Style {
+    if archived {
+        return Style::default();
+    }
+    match task_server_label(task_state) {
+        "Idle" => Style::default().fg(IDLE_COLOR),
+        "Busy" => Style::default().fg(BUSY_COLOR),
+        "Question" => Style::default().fg(WAITING_FOR_INPUT_COLOR),
+        "Waiting on VM" => Style::default().fg(Color::Blue),
+        "Stale" => Style::default().fg(OOM_COLOR),
+        _ => Style::default(),
+    }
+}
+
+fn task_description(
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> String {
+    if let Some(status) = task_state.and_then(|state| state.status.as_deref())
+        && !status.trim().is_empty()
+    {
+        return status.trim().to_string();
+    }
+    match task_state.and_then(|state| state.agent_state) {
+        Some(AutomationAgentState::Working) => format!("Working {}", task_issue_reference(task)),
+        Some(AutomationAgentState::Question) => format!("Question {}", task_issue_reference(task)),
+        Some(AutomationAgentState::Review) => format!("Review {}", task_issue_reference(task)),
+        Some(AutomationAgentState::WaitingOnVm) => {
+            format!("Waiting on VM {}", task_issue_reference(task))
+        }
+        Some(AutomationAgentState::Idle) => format!("Wait close {}", task_issue_reference(task)),
+        Some(AutomationAgentState::Stale) => format!("Stalled {}", task_issue_reference(task)),
+        None => task_issue_reference(task),
+    }
+}
+
 fn next_non_stopped_row(
     current_row: usize,
     ordered_keys: &[String],
@@ -312,10 +451,11 @@ fn server_cell_label(snapshot: &WorkspaceSnapshot) -> &'static str {
 }
 
 fn effective_server_status(snapshot: &WorkspaceSnapshot) -> RootSessionStatus {
-    if snapshot.persistent.automation_issue.is_some() {
+    if active_task_issue_url(snapshot).is_some() {
         if let Some(agent_state) = snapshot.automation_agent_state {
             return match agent_state {
                 AutomationAgentState::Working => RootSessionStatus::Busy,
+                AutomationAgentState::WaitingOnVm => RootSessionStatus::Idle,
                 AutomationAgentState::Question => RootSessionStatus::Question,
                 AutomationAgentState::Review
                 | AutomationAgentState::Idle
@@ -458,18 +598,6 @@ fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
     links.extend(
         snapshot
             .persistent
-            .automation_issue
-            .iter()
-            .cloned()
-            .map(|value| WorkspaceLink {
-                kind: WorkspaceLinkKind::Issue,
-                value,
-                source: WorkspaceLinkSource::Automation,
-            }),
-    );
-    links.extend(
-        snapshot
-            .persistent
             .agent_provided
             .repo
             .iter()
@@ -496,19 +624,6 @@ fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
     links.extend(
         snapshot
             .persistent
-            .agent_provided
-            .issue
-            .iter()
-            .cloned()
-            .map(|value| WorkspaceLink {
-                kind: WorkspaceLinkKind::Issue,
-                value,
-                source: WorkspaceLinkSource::AgentProvided,
-            }),
-    );
-    links.extend(
-        snapshot
-            .persistent
             .custom_links
             .pr
             .iter()
@@ -519,20 +634,71 @@ fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
                 source: WorkspaceLinkSource::Custom,
             }),
     );
-    links.extend(
-        snapshot
-            .persistent
-            .agent_provided
-            .pr
-            .iter()
-            .cloned()
-            .map(|value| WorkspaceLink {
-                kind: WorkspaceLinkKind::Pr,
-                value,
-                source: WorkspaceLinkSource::AgentProvided,
-            }),
-    );
 
+    links
+}
+
+fn workspace_issue_pr_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
+    let mut links = Vec::new();
+
+    if snapshot.persistent.tasks.is_empty() {
+        links.extend(
+            active_task_issue_url(snapshot)
+                .iter()
+                .cloned()
+                .map(|value| WorkspaceLink {
+                    kind: WorkspaceLinkKind::Issue,
+                    value,
+                    source: WorkspaceLinkSource::Automation,
+                }),
+        );
+        links.extend(
+            snapshot
+                .persistent
+                .agent_provided
+                .issue
+                .iter()
+                .cloned()
+                .map(|value| WorkspaceLink {
+                    kind: WorkspaceLinkKind::Issue,
+                    value,
+                    source: WorkspaceLinkSource::AgentProvided,
+                }),
+        );
+        links.extend(
+            snapshot
+                .persistent
+                .agent_provided
+                .pr
+                .iter()
+                .cloned()
+                .map(|value| WorkspaceLink {
+                    kind: WorkspaceLinkKind::Pr,
+                    value,
+                    source: WorkspaceLinkSource::AgentProvided,
+                }),
+        );
+    }
+
+    links
+}
+
+fn task_links(
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> Vec<WorkspaceLink> {
+    let mut links = vec![WorkspaceLink {
+        kind: WorkspaceLinkKind::Issue,
+        value: task_issue_link(task, task_state).to_string(),
+        source: WorkspaceLinkSource::Task,
+    }];
+    if let Some(pr) = task_pr_link(task_state) {
+        links.push(WorkspaceLink {
+            kind: WorkspaceLinkKind::Pr,
+            value: pr.to_string(),
+            source: WorkspaceLinkSource::Task,
+        });
+    }
     links
 }
 
@@ -663,6 +829,32 @@ fn compare_target_path(
         .or_else(|| compare_target_path_from_workspace(snapshot, workspace_path))
 }
 
+fn compare_target_path_for_task(
+    snapshot: &WorkspaceSnapshot,
+    task: &WorkspaceTaskPersistentSnapshot,
+    workspace_path: &Path,
+) -> Option<PathBuf> {
+    let repo_name = snapshot
+        .persistent
+        .assigned_repository
+        .as_deref()
+        .and_then(|repository| repository.rsplit('/').next())
+        .filter(|segment| !segment.is_empty())?;
+    let issue_number = task
+        .issue_url
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())?;
+
+    let candidates = [
+        workspace_path
+            .join("work")
+            .join(format!("{repo_name}-{issue_number}")),
+        workspace_path.join(repo_name),
+    ];
+    candidates.into_iter().find(|candidate| is_git_checkout(candidate))
+}
+
 fn compare_target_path_from_workspace(
     snapshot: &WorkspaceSnapshot,
     workspace_path: &Path,
@@ -673,9 +865,8 @@ fn compare_target_path_from_workspace(
         .as_deref()
         .and_then(|repository| repository.rsplit('/').next())
         .filter(|segment| !segment.is_empty());
-    let issue_number = snapshot
-        .persistent
-        .automation_issue
+    let active_issue_url = active_task_issue_url(snapshot);
+    let issue_number = active_issue_url
         .as_deref()
         .and_then(|issue| issue.rsplit('/').next())
         .filter(|segment| !segment.is_empty());
@@ -692,9 +883,15 @@ fn compare_target_path_from_workspace(
         candidates.push(workspace_path.join(repo_name));
     }
 
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.join(".git").is_dir())
+    candidates.into_iter().find(|candidate| is_git_checkout(candidate))
+}
+
+fn is_git_checkout(path: &Path) -> bool {
+    std::fs::symlink_metadata(path.join(".git")).is_ok()
+}
+
+fn active_task_issue_url(snapshot: &WorkspaceSnapshot) -> Option<String> {
+    snapshot.resolved_active_issue_url()
 }
 
 fn visible_workspace_links(
@@ -711,9 +908,18 @@ fn visible_workspace_links(
     }
 
     for kind in [WorkspaceLinkKind::Issue, WorkspaceLinkKind::Pr] {
-        if let Some(link) = first_validated_workspace_link_by_kind(snapshot, validations, kind) {
+        let next_link = workspace_issue_pr_links(snapshot)
+            .into_iter()
+            .find(|link| link.kind == kind)
+            .filter(|link| {
+                matches!(
+                    validations.get(link),
+                    Some(WorkspaceLinkValidationResult::Valid(_))
+                )
+            });
+        if let Some(link) = next_link {
             visible.push(link);
-        } else {
+        } else if snapshot.persistent.tasks.is_empty() {
             visible.push(WorkspaceLink {
                 kind,
                 value: String::new(),
@@ -723,6 +929,22 @@ fn visible_workspace_links(
     }
 
     visible
+}
+
+fn visible_task_links(
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    validations: &HashMap<WorkspaceLink, WorkspaceLinkValidationResult>,
+) -> Vec<WorkspaceLink> {
+    task_links(task, task_state)
+        .into_iter()
+        .filter(|link| {
+            matches!(
+                validations.get(link),
+                Some(WorkspaceLinkValidationResult::Valid(_))
+            )
+        })
+        .collect()
 }
 
 fn selectable_workspace_links(
@@ -861,6 +1083,7 @@ fn help_line(
     selected_row: usize,
     workspace_count: usize,
     selected_workspace: Option<&WorkspaceSnapshot>,
+    selected_task_row: bool,
     selected_workspace_link_count: usize,
     selected_link_index: Option<usize>,
     selected_link_is_custom: bool,
@@ -881,6 +1104,27 @@ fn help_line(
                     push_hotkey(&mut spans, "Enter", " create  ");
                 }
                 Some(snapshot) => {
+                    if selected_task_row {
+                        if workspace_is_usable(snapshot)
+                            && workspace_state(snapshot) == WorkspaceUiState::Started
+                        {
+                            push_hotkey(&mut spans, "Enter", " attach  ");
+                        } else if workspace_is_usable(snapshot)
+                            && workspace_state(snapshot) == WorkspaceUiState::Stopped
+                        {
+                            push_hotkey(&mut spans, "Enter", " start+attach  ");
+                        }
+                        if selected_workspace_can_compare {
+                            push_hotkey(&mut spans, "c", " compare  ");
+                        }
+                        push_hotkey(&mut spans, "x", " delete  ");
+                        push_hotkey(&mut spans, "q", " quit");
+                        if !status.is_empty() {
+                            spans.push(Span::raw(" | "));
+                            spans.push(Span::raw(status.to_string()));
+                        }
+                        return Line::from(spans);
+                    }
                     if selected_workspace_link_count > 0 {
                         push_hotkey(&mut spans, "←/→", " select link  ");
                     }
@@ -957,7 +1201,7 @@ fn help_line(
             push_hotkey(&mut spans, "Esc", " cancel");
         }
         UiMode::EditIssue => {
-            spans.push(Span::raw("Assign issue: type number or GitHub issue URL, "));
+            spans.push(Span::raw("Queue issue: type number or GitHub issue URL, "));
             push_hotkey(&mut spans, "Enter", " save, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }
@@ -968,7 +1212,7 @@ fn help_line(
             push_hotkey(&mut spans, "Esc", " cancel");
         }
         UiMode::ConfirmDelete => {
-            spans.push(Span::raw("Delete workspace: "));
+            spans.push(Span::raw("Delete item: "));
             push_hotkey(&mut spans, "Enter", " confirm, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }

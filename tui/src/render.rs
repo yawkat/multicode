@@ -18,6 +18,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         app.machine_total_ram_bytes,
         app.machine_agent_directory_disk_usage,
     );
+    let entries = app.table_entries();
     let (
         workspace_width,
         server_width,
@@ -36,6 +37,22 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         &create_row_cpu_raw,
         &create_row_ram_raw,
     );
+    let workspace_width = entries.iter().fold(workspace_width, |width, entry| {
+        let label = match entry {
+            TableEntry::Create => CREATE_ROW_LABEL.to_string(),
+            TableEntry::Workspace { workspace_key } => workspace_key.clone(),
+            TableEntry::Task {
+                workspace_key,
+                task_id,
+            } => app
+                .snapshots
+                .get(workspace_key)
+                .and_then(|snapshot| task_persistent_snapshot(snapshot, task_id))
+                .map(task_row_label)
+                .unwrap_or_else(|| "➡️ task".to_string()),
+        };
+        width.max(content_width(&label))
+    });
     let create_row_cpu = right_align_cell_text(&create_row_cpu_raw, cpu_width);
     let create_row_ram = right_align_cell_text(&create_row_ram_raw, ram_width);
     let workspace_memory_high_bytes = multicode_lib::services::parse_optional_size_bytes(
@@ -45,7 +62,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
     .ok()
     .flatten();
 
-    let mut rows = Vec::with_capacity(app.ordered_keys.len() + 1);
+    let mut rows = Vec::with_capacity(entries.len());
     rows.push(
         Row::new(vec![
             Cell::from(CREATE_ROW_LABEL),
@@ -63,133 +80,226 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         .style(Style::default().fg(CREATE_ROW_COLOR)),
     );
 
-    for key in &app.ordered_keys {
-        if let Some(snapshot) = app.snapshots.get(key) {
-            let archived = snapshot.persistent.archived;
-            let user_description = if app.mode == UiMode::EditDescription
-                && app.selected_workspace_key() == Some(key.as_str())
-            {
-                format!("{}▏", app.edit_input)
-            } else {
-                snapshot.persistent.description.clone()
-            };
-            let selected_link_index: Option<usize> = if app.mode == UiMode::Normal
-                && app.selected_workspace_key() == Some(key.as_str())
-            {
-                app.selected_link_index
-            } else {
-                None
-            };
-            let links = selectable_workspace_links(
-                snapshot,
-                &app.workspace_link_validation_results,
-                &app.github_link_statuses,
-            );
-            let selected_link_kind = selected_link_index
-                .and_then(|index| links.get(index))
-                .map(|link| link.kind);
-            let review_link = links
-                .iter()
-                .find(|link| link.kind == WorkspaceLinkKind::Review);
-            let issue_link = links
-                .iter()
-                .find(|link| link.kind == WorkspaceLinkKind::Issue);
-            let pr_link = links.iter().find(|link| link.kind == WorkspaceLinkKind::Pr);
-            let issue_status = issue_link.and_then(|link| app.github_link_statuses.get(link));
-            let pr_status = pr_link.and_then(|link| app.github_link_statuses.get(link));
-            let description = Cell::from(description_line_for_snapshot(
-                snapshot,
-                user_description.as_str(),
-                archived,
-            ));
-            let cpu = cpu_cell_label(snapshot);
-            let cpu = right_align_cell_text(&cpu, cpu_width);
-            let ram = ram_cell_label(snapshot);
-            let ram = right_align_cell_text(&ram, ram_width);
-            let cost = cost_cell_label(snapshot);
-            let cost = right_align_cell_text(&cost, cost_width);
+    for entry in entries.iter().skip(1) {
+        match entry {
+            TableEntry::Workspace { workspace_key: key } => {
+                let Some(snapshot) = app.snapshots.get(key) else {
+                    continue;
+                };
+                let archived = snapshot.persistent.archived;
+                let user_description = if app.mode == UiMode::EditDescription
+                    && app.selected_workspace_key() == Some(key.as_str())
+                    && app.selected_task_id().is_none()
+                {
+                    format!("{}▏", app.edit_input)
+                } else {
+                    snapshot.persistent.description.clone()
+                };
+                let selected_link_index: Option<usize> = if app.mode == UiMode::Normal
+                    && app.selected_workspace_key() == Some(key.as_str())
+                    && app.selected_task_id().is_none()
+                {
+                    app.selected_link_index
+                } else {
+                    None
+                };
+                let links = selectable_workspace_links(
+                    snapshot,
+                    &app.workspace_link_validation_results,
+                    &app.github_link_statuses,
+                );
+                let selected_link_kind = selected_link_index
+                    .and_then(|index| links.get(index))
+                    .map(|link| link.kind);
+                let review_link = links
+                    .iter()
+                    .find(|link| link.kind == WorkspaceLinkKind::Review);
+                let issue_link = links
+                    .iter()
+                    .find(|link| link.kind == WorkspaceLinkKind::Issue);
+                let pr_link = links.iter().find(|link| link.kind == WorkspaceLinkKind::Pr);
+                let issue_status = issue_link.and_then(|link| app.github_link_statuses.get(link));
+                let pr_status = pr_link.and_then(|link| app.github_link_statuses.get(link));
+                let description = Cell::from(description_line_for_snapshot(
+                    snapshot,
+                    user_description.as_str(),
+                    archived,
+                ));
+                let cpu = cpu_cell_label(snapshot);
+                let cpu = right_align_cell_text(&cpu, cpu_width);
+                let ram = ram_cell_label(snapshot);
+                let ram = right_align_cell_text(&ram, ram_width);
+                let cost = cost_cell_label(snapshot);
+                let cost = right_align_cell_text(&cost, cost_width);
 
-            let review_cell = review_link.map_or_else(Cell::default, |_| {
-                status_icon_cell(
-                    StatusIconKind::FileDiff,
-                    if archived {
-                        Color::DarkGray
-                    } else {
-                        AGENT_LINK_COLOR
-                    },
-                    selected_link_kind == Some(WorkspaceLinkKind::Review),
-                )
-            });
-            let issue_cell = if let Some(GithubLinkStatusView::Issue(issue_status)) = issue_status {
-                let (kind, color) = issue_icon_kind_and_color(issue_status.state);
-                status_icon_cell(
-                    kind,
-                    if archived { Color::DarkGray } else { color },
-                    selected_link_kind == Some(WorkspaceLinkKind::Issue),
-                )
-            } else {
-                Cell::default()
-            };
-            let (pr_cell, build_cell, review_status_cell) =
-                if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
-                    let (kind, color) = pr_icon_kind_and_color(*pr_status);
-                    (
+                let review_cell = review_link.map_or_else(Cell::default, |_| {
+                    status_icon_cell(
+                        StatusIconKind::FileDiff,
+                        if archived {
+                            Color::DarkGray
+                        } else {
+                            AGENT_LINK_COLOR
+                        },
+                        selected_link_kind == Some(WorkspaceLinkKind::Review),
+                    )
+                });
+                let issue_cell =
+                    if let Some(GithubLinkStatusView::Issue(issue_status)) = issue_status {
+                        let (kind, color) = issue_icon_kind_and_color(issue_status.state);
                         status_icon_cell(
                             kind,
                             if archived { Color::DarkGray } else { color },
-                            selected_link_kind == Some(WorkspaceLinkKind::Pr),
-                        ),
-                        pr_build_icon_color(*pr_status).map_or_else(Cell::default, |build_color| {
+                            selected_link_kind == Some(WorkspaceLinkKind::Issue),
+                        )
+                    } else {
+                        Cell::default()
+                    };
+                let (pr_cell, build_cell, review_status_cell) =
+                    if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
+                        let (kind, color) = pr_icon_kind_and_color(*pr_status);
+                        (
                             status_icon_cell(
-                                StatusIconKind::Server,
-                                if archived {
-                                    Color::DarkGray
-                                } else {
-                                    build_color
+                                kind,
+                                if archived { Color::DarkGray } else { color },
+                                selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                            ),
+                            pr_build_icon_color(*pr_status).map_or_else(
+                                Cell::default,
+                                |build_color| {
+                                    status_icon_cell(
+                                        StatusIconKind::Server,
+                                        if archived {
+                                            Color::DarkGray
+                                        } else {
+                                            build_color
+                                        },
+                                        false,
+                                    )
                                 },
-                                false,
-                            )
-                        }),
-                        pr_review_icon_color(*pr_status).map_or_else(
-                            Cell::default,
-                            |review_color| {
-                                status_icon_cell(
-                                    StatusIconKind::Eye,
-                                    if archived {
-                                        Color::DarkGray
-                                    } else {
-                                        review_color
-                                    },
-                                    false,
-                                )
-                            },
-                        ),
+                            ),
+                            pr_review_icon_color(*pr_status).map_or_else(
+                                Cell::default,
+                                |review_color| {
+                                    status_icon_cell(
+                                        StatusIconKind::Eye,
+                                        if archived {
+                                            Color::DarkGray
+                                        } else {
+                                            review_color
+                                        },
+                                        false,
+                                    )
+                                },
+                            ),
+                        )
+                    } else {
+                        (Cell::default(), Cell::default(), Cell::default())
+                    };
+
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(key.clone()),
+                        Cell::from(server_cell_label(snapshot))
+                            .style(server_cell_style(snapshot, archived)),
+                        Cell::from(cpu),
+                        Cell::from(ram).style(ram_cell_style(
+                            snapshot,
+                            workspace_memory_high_bytes,
+                            archived,
+                        )),
+                        Cell::from(cost),
+                        review_cell,
+                        issue_cell,
+                        pr_cell,
+                        build_cell,
+                        review_status_cell,
+                        description,
+                    ])
+                    .style(workspace_row_style(snapshot)),
+                );
+            }
+            TableEntry::Task {
+                workspace_key,
+                task_id,
+            } => {
+                let Some(snapshot) = app.snapshots.get(workspace_key) else {
+                    continue;
+                };
+                let Some(task) = task_persistent_snapshot(snapshot, task_id) else {
+                    continue;
+                };
+                let task_state = task_runtime_snapshot(snapshot, task_id);
+                let archived = snapshot.persistent.archived;
+                let selected_link_index: Option<usize> = if app.mode == UiMode::Normal
+                    && app.selected_workspace_key() == Some(workspace_key.as_str())
+                    && app.selected_task_id() == Some(task_id.as_str())
+                {
+                    app.selected_link_index
+                } else {
+                    None
+                };
+                let task_links =
+                    visible_task_links(task, task_state, &app.workspace_link_validation_results);
+                let selected_link_kind = selected_link_index
+                    .and_then(|index| task_links.get(index))
+                    .map(|link| link.kind);
+                let issue_link = task_links
+                    .iter()
+                    .find(|link| link.kind == WorkspaceLinkKind::Issue);
+                let pr_link = task_links.iter().find(|link| link.kind == WorkspaceLinkKind::Pr);
+                let issue_status = issue_link.and_then(|link| app.github_link_statuses.get(link));
+                let pr_status = pr_link.and_then(|link| app.github_link_statuses.get(link));
+                let issue_cell = if let Some(GithubLinkStatusView::Issue(issue_status)) = issue_status
+                {
+                    let (kind, color) = issue_icon_kind_and_color(issue_status.state);
+                    status_icon_cell(
+                        kind,
+                        if archived { Color::DarkGray } else { color },
+                        selected_link_kind == Some(WorkspaceLinkKind::Issue),
                     )
                 } else {
-                    (Cell::default(), Cell::default(), Cell::default())
+                    Cell::from(github_link_badge(task_issue_link(task, task_state))).style(
+                        if selected_link_kind == Some(WorkspaceLinkKind::Issue) {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        },
+                    )
                 };
-
-            rows.push(
-                Row::new(vec![
-                    Cell::from(key.clone()),
-                    Cell::from(server_cell_label(snapshot))
-                        .style(server_cell_style(snapshot, archived)),
-                    Cell::from(cpu),
-                    Cell::from(ram).style(ram_cell_style(
-                        snapshot,
-                        workspace_memory_high_bytes,
-                        archived,
-                    )),
-                    Cell::from(cost),
-                    review_cell,
-                    issue_cell,
-                    pr_cell,
-                    build_cell,
-                    review_status_cell,
-                    description,
-                ])
-                .style(workspace_row_style(snapshot)),
-            );
+                let pr_cell = if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
+                    let (kind, color) = pr_icon_kind_and_color(*pr_status);
+                    status_icon_cell(
+                        kind,
+                        if archived { Color::DarkGray } else { color },
+                        selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                    )
+                } else {
+                    Cell::from(task_pr_link(task_state).map(github_link_badge).unwrap_or_default())
+                        .style(if selected_link_kind == Some(WorkspaceLinkKind::Pr) {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        })
+                };
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(task_row_label(task)),
+                        Cell::from(task_server_label(task_state))
+                            .style(task_server_style(task_state, archived)),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        issue_cell,
+                        pr_cell,
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(task_description(task, task_state)),
+                    ])
+                    .style(workspace_row_style(snapshot)),
+                );
+            }
+            TableEntry::Create => {}
         }
     }
 
@@ -240,8 +350,9 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
     let help = help_line(
         app.mode,
         app.selected_row,
-        app.ordered_keys.len(),
+        entries.len().saturating_sub(1),
         app.selected_workspace_snapshot(),
+        app.selected_task_id().is_some(),
         app.selected_workspace_link_count(),
         app.selected_link_index,
         app.selected_workspace_link()
@@ -279,9 +390,37 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             &app.custom_link_input,
         );
     } else if app.mode == UiMode::ConfirmDelete
-        && let Some(workspace_key) = app.pending_delete_workspace_key.as_deref()
+        && let Some(target) = app.pending_delete_target.as_ref()
     {
-        draw_confirm_delete_modal(frame, workspace_key);
+        match target {
+            PendingDeleteTarget::Workspace { workspace_key } => {
+                draw_confirm_delete_modal(
+                    frame,
+                    " Delete workspace ",
+                    &format!(
+                        "Delete workspace '{workspace_key}'? This stops the workspace and removes its files and containers."
+                    ),
+                );
+            }
+            PendingDeleteTarget::Task {
+                workspace_key,
+                task_id,
+            } => {
+                let task_label = app
+                    .snapshots
+                    .get(workspace_key)
+                    .and_then(|snapshot| task_persistent_snapshot(snapshot, task_id))
+                    .map(task_row_label)
+                    .unwrap_or_else(|| task_id.clone());
+                draw_confirm_delete_modal(
+                    frame,
+                    " Delete task ",
+                    &format!(
+                        "Delete task '{task_label}' from workspace '{workspace_key}'? This removes the task worktree and multicode tracking."
+                    ),
+                );
+            }
+        }
     } else if app.mode == UiMode::StartingModal
         && let Some(workspace_key) = app.starting_workspace_key.as_deref()
     {
@@ -563,7 +702,7 @@ pub(crate) fn draw_create_modal(
     );
 }
 
-fn draw_confirm_delete_modal(frame: &mut Frame, workspace_key: &str) {
+fn draw_confirm_delete_modal(frame: &mut Frame, title: &str, message: &str) {
     let area = centered_rect_fixed(
         CONFIRM_DELETE_MODAL_WIDTH,
         CONFIRM_DELETE_MODAL_HEIGHT,
@@ -572,7 +711,7 @@ fn draw_confirm_delete_modal(frame: &mut Frame, workspace_key: &str) {
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Delete workspace ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red));
     let inner = block.inner(area);
@@ -589,11 +728,9 @@ fn draw_confirm_delete_modal(frame: &mut Frame, workspace_key: &str) {
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(format!(
-            "Delete workspace '{workspace_key}'? This stops the workspace and removes its files and containers."
-        ))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true }),
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         rows[1],
     );
     frame.render_widget(

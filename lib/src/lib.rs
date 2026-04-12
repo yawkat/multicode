@@ -61,6 +61,48 @@ impl Default for CustomLinksPersistentSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceTaskSource {
+    #[default]
+    Manual,
+    Scan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceTaskPersistentSnapshot {
+    pub id: String,
+    pub issue_url: String,
+    #[serde(default)]
+    pub source: WorkspaceTaskSource,
+    #[serde(default)]
+    pub created_at: Option<SystemTime>,
+}
+
+impl WorkspaceTaskPersistentSnapshot {
+    pub fn new(id: String, issue_url: String, source: WorkspaceTaskSource) -> Self {
+        Self {
+            id,
+            issue_url,
+            source,
+            created_at: Some(SystemTime::now()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceTaskRuntimeSnapshot {
+    pub session_id: Option<String>,
+    pub session_status: Option<services::root_session_service::RootSessionStatus>,
+    pub agent_state: Option<AutomationAgentState>,
+    pub status: Option<String>,
+    pub waiting_on_vm: bool,
+    pub repository: Vec<String>,
+    pub issue: Vec<String>,
+    pub pr: Vec<String>,
+    pub last_error: Option<String>,
+}
+
 /// Workspace metadata that is saved in persistent storage, i.e. survives a host reboot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistentWorkspaceSnapshot {
@@ -79,6 +121,8 @@ pub struct PersistentWorkspaceSnapshot {
     pub agent_provided: AgentProvidedPersistentSnapshot,
     #[serde(default)]
     pub custom_links: CustomLinksPersistentSnapshot,
+    #[serde(default)]
+    pub tasks: Vec<WorkspaceTaskPersistentSnapshot>,
 }
 
 impl Default for PersistentWorkspaceSnapshot {
@@ -93,6 +137,7 @@ impl Default for PersistentWorkspaceSnapshot {
             archive_format: None,
             agent_provided: AgentProvidedPersistentSnapshot::default(),
             custom_links: CustomLinksPersistentSnapshot::default(),
+            tasks: Vec::new(),
         }
     }
 }
@@ -134,9 +179,10 @@ pub struct TransientWorkspaceSnapshot {
     pub runtime: RuntimeHandleSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutomationAgentState {
     Working,
+    WaitingOnVm,
     Question,
     Review,
     Idle,
@@ -171,6 +217,8 @@ pub struct WorkspaceSnapshot {
     pub automation_agent_state: Option<AutomationAgentState>,
     pub automation_status: Option<String>,
     pub automation_scan_request_nonce: u64,
+    pub active_task_id: Option<String>,
+    pub task_states: BTreeMap<String, WorkspaceTaskRuntimeSnapshot>,
     pub usage_total_tokens: Option<u64>,
     pub usage_total_cost: Option<f64>,
     pub usage_cpu_percent: Option<u16>,
@@ -192,11 +240,50 @@ impl Default for WorkspaceSnapshot {
             automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
+            active_task_id: None,
+            task_states: BTreeMap::new(),
             usage_total_tokens: None,
             usage_total_cost: None,
             usage_cpu_percent: None,
             usage_ram_bytes: None,
             oom_kill_count: None,
         }
+    }
+}
+
+impl WorkspaceSnapshot {
+    pub fn task_persistent_snapshot(&self, task_id: &str) -> Option<&WorkspaceTaskPersistentSnapshot> {
+        self.persistent.tasks.iter().find(|task| task.id == task_id)
+    }
+
+    pub fn task_issue_url_for_id(&self, task_id: &str) -> Option<&str> {
+        self.task_persistent_snapshot(task_id)
+            .map(|task| task.issue_url.as_str())
+    }
+
+    pub fn resolved_active_task_id(&self) -> Option<String> {
+        if self
+            .active_task_id
+            .as_deref()
+            .is_some_and(|task_id| self.task_persistent_snapshot(task_id).is_some())
+        {
+            return self.active_task_id.clone();
+        }
+
+        self.persistent.automation_issue.as_deref().and_then(|issue_url| {
+            self.persistent
+                .tasks
+                .iter()
+                .find(|task| task.issue_url == issue_url)
+                .map(|task| task.id.clone())
+        })
+    }
+
+    pub fn resolved_active_issue_url(&self) -> Option<String> {
+        self.resolved_active_task_id()
+            .as_deref()
+            .and_then(|task_id| self.task_issue_url_for_id(task_id))
+            .map(ToOwned::to_owned)
+            .or_else(|| self.persistent.automation_issue.clone())
     }
 }

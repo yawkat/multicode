@@ -6,7 +6,16 @@ description: Maintain the multicode autonomous state file while working autonomo
 When operating in a multicode autonomous workspace, the environment variable `MULTICODE_AUTONOMOUS_STATE_PATH`
 points to a writable state file owned by multicode. You must keep this file updated.
 
-Write exactly one line to that file:
+Write exactly one line to that file.
+
+If multicode tells you the current task session or thread id, write the state as:
+
+- `working:<session-id>`
+- `question:<session-id>`
+- `review:<session-id>`
+- `idle:<session-id>`
+
+If no session/thread id was provided, fall back to the plain state word:
 
 - `working`
 - `question`
@@ -28,5 +37,6 @@ Required workflow:
 - When the change is ready for human review or publish approval, write `review` before you stop.
 - Only write `idle` if the issue is fully complete and no further action is pending.
 - After resuming from an interruption, attach, or restart, immediately write the current state again before continuing.
+- When a session/thread id was provided for the task, include it after the colon every time you write the state so multicode can distinguish parallel sessions on the same VM.
 
-Do not write anything except the single state word to this file.
+Do not write anything except the single state word, or the state followed by `:<session-id>`, to this file.

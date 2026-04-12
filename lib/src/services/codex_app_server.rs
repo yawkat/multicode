@@ -1,4 +1,11 @@
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -8,11 +15,25 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::config::{CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess, CodexSandboxMode};
 
 const INITIALIZE_REQUEST_ID: i64 = 1;
-const REQUEST_ID: i64 = 2;
+const INITIAL_REQUEST_ID: i64 = 2;
+
+type CodexSocket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(INITIAL_REQUEST_ID);
+static SHARED_CONNECTIONS: OnceLock<std::sync::Mutex<HashMap<String, Arc<SharedCodexConnection>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct CodexAppServerClient {
     uri: String,
+}
+
+#[derive(Debug)]
+struct SharedCodexConnection {
+    uri: String,
+    socket: tokio::sync::Mutex<Option<CodexSocket>>,
 }
 
 impl CodexAppServerClient {
@@ -53,11 +74,19 @@ impl CodexAppServerClient {
     }
 
     pub async fn thread_read(&self, thread_id: &str) -> Result<ThreadReadResponse, String> {
+        self.thread_read_with_turns(thread_id, false).await
+    }
+
+    pub async fn thread_read_with_turns(
+        &self,
+        thread_id: &str,
+        include_turns: bool,
+    ) -> Result<ThreadReadResponse, String> {
         self.request(
             "thread/read",
             json!({
                 "threadId": thread_id,
-                "includeTurns": true,
+                "includeTurns": include_turns,
             }),
         )
         .await
@@ -108,108 +137,165 @@ impl CodexAppServerClient {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let mut socket = self.connect_initialized().await?;
-        socket
-            .send(Message::Text(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": REQUEST_ID,
-                    "method": method,
-                    "params": params,
-                })
-                .to_string()
-                .into(),
-            ))
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        self.shared_connection()
+            .request(request_id, method, params)
             .await
-            .map_err(|err| err.to_string())?;
-
-        while let Some(message) = socket.next().await {
-            let message = message.map_err(|err| err.to_string())?;
-            let Some(text) = message_to_text(message) else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
-            if value.get("id").and_then(Value::as_i64) != Some(REQUEST_ID) {
-                continue;
-            }
-            if let Some(result) = value.get("result") {
-                return serde_json::from_value(result.clone()).map_err(|err| err.to_string());
-            }
-            if let Some(error) = value.get("error") {
-                return Err(error.to_string());
-            }
-        }
-
-        Err(format!(
-            "codex app-server connection to '{}' closed",
-            self.uri
-        ))
     }
 
     async fn connect_initialized(
         &self,
-    ) -> Result<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        String,
-    > {
-        let (mut socket, _) = connect_async(self.uri.as_str())
-            .await
-            .map_err(|err| err.to_string())?;
+    ) -> Result<CodexSocket, String> {
+        connect_initialized_socket(&self.uri).await
+    }
+
+    fn shared_connection(&self) -> Arc<SharedCodexConnection> {
+        let registry = SHARED_CONNECTIONS.get_or_init(Default::default);
+        let mut registry = registry.lock().expect("codex shared connection registry poisoned");
+        registry
+            .entry(self.uri.clone())
+            .or_insert_with(|| {
+                Arc::new(SharedCodexConnection {
+                    uri: self.uri.clone(),
+                    socket: tokio::sync::Mutex::new(None),
+                })
+            })
+            .clone()
+    }
+}
+
+impl SharedCodexConnection {
+    async fn request<T>(&self, request_id: i64, method: &str, params: Value) -> Result<T, String>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+
+        let mut socket = self.socket.lock().await;
+        for attempt in 0..2 {
+            if socket.is_none() {
+                *socket = Some(connect_initialized_socket(&self.uri).await?);
+            }
+
+            let Some(active_socket) = socket.as_mut() else {
+                continue;
+            };
+
+            if let Err(err) = active_socket.send(Message::Text(request.clone().into())).await {
+                *socket = None;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(err.to_string());
+            }
+
+            loop {
+                match active_socket.next().await {
+                    Some(Ok(message)) => {
+                        let Some(text) = message_to_text(message) else {
+                            continue;
+                        };
+                        let value: Value =
+                            serde_json::from_str(&text).map_err(|err| err.to_string())?;
+                        if value.get("id").and_then(Value::as_i64) != Some(request_id) {
+                            continue;
+                        }
+                        if let Some(result) = value.get("result") {
+                            return serde_json::from_value(result.clone())
+                                .map_err(|err| err.to_string());
+                        }
+                        if let Some(error) = value.get("error") {
+                            return Err(error.to_string());
+                        }
+                    }
+                    Some(Err(err)) => {
+                        *socket = None;
+                        if attempt == 0 {
+                            break;
+                        }
+                        return Err(err.to_string());
+                    }
+                    None => {
+                        *socket = None;
+                        if attempt == 0 {
+                            break;
+                        }
+                        return Err(format!(
+                            "codex app-server connection to '{}' closed",
+                            self.uri
+                        ));
+                    }
+                }
+            }
+        }
+
+        Err(format!(
+            "failed to complete codex app-server request '{}' for '{}'",
+            method, self.uri
+        ))
+    }
+}
+
+async fn connect_initialized_socket(uri: &str) -> Result<CodexSocket, String> {
+    let (mut socket, _) = connect_async(uri).await.map_err(|err| err.to_string())?;
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": INITIALIZE_REQUEST_ID,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "multicode",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {
+                        "experimentalApi": true,
+                    },
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|err| err.to_string())?;
+
+    while let Some(message) = socket.next().await {
+        let message = message.map_err(|err| err.to_string())?;
+        let Some(text) = message_to_text(message) else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
+        if value.get("id").and_then(Value::as_i64) != Some(INITIALIZE_REQUEST_ID) {
+            continue;
+        }
+        if value.get("error").is_some() {
+            return Err(value["error"].to_string());
+        }
         socket
             .send(Message::Text(
                 json!({
                     "jsonrpc": "2.0",
-                    "id": INITIALIZE_REQUEST_ID,
-                    "method": "initialize",
-                    "params": {
-                        "clientInfo": {
-                            "name": "multicode",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        },
-                        "capabilities": {
-                            "experimentalApi": true,
-                        },
-                    }
+                    "method": "initialized",
                 })
                 .to_string()
                 .into(),
             ))
             .await
             .map_err(|err| err.to_string())?;
-
-        while let Some(message) = socket.next().await {
-            let message = message.map_err(|err| err.to_string())?;
-            let Some(text) = message_to_text(message) else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
-            if value.get("id").and_then(Value::as_i64) != Some(INITIALIZE_REQUEST_ID) {
-                continue;
-            }
-            if value.get("error").is_some() {
-                return Err(value["error"].to_string());
-            }
-            socket
-                .send(Message::Text(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "method": "initialized",
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .map_err(|err| err.to_string())?;
-            return Ok(socket);
-        }
-
-        Err(format!(
-            "codex app-server initialize did not complete for '{}'",
-            self.uri
-        ))
+        return Ok(socket);
     }
+
+    Err(format!(
+        "codex app-server initialize did not complete for '{}'",
+        uri
+    ))
 }
 
 fn build_thread_start_params(cwd: &str, config: &CodexAgentConfig) -> Value {
@@ -415,6 +501,10 @@ pub struct CodexTurn {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexThreadRead {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<CodexThreadStatus>,
     #[serde(default)]
     pub turns: Vec<CodexThreadTurn>,
 }

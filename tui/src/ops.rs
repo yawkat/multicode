@@ -197,6 +197,63 @@ pub(crate) fn workspace_attach_target(snapshot: &WorkspaceSnapshot) -> io::Resul
     })
 }
 
+pub(crate) fn task_attach_target(
+    snapshot: &WorkspaceSnapshot,
+    task_state: &multicode_lib::WorkspaceTaskRuntimeSnapshot,
+) -> io::Result<AttachTarget> {
+    if workspace_state(snapshot) != WorkspaceUiState::Started {
+        return Err(io::Error::other(
+            "workspace must be in Started state before attaching",
+        ));
+    }
+
+    let uri = snapshot
+        .transient
+        .as_ref()
+        .map(|transient| transient.uri.as_str())
+        .ok_or_else(|| io::Error::other("workspace is missing transient attach URI"))?;
+
+    let mut parsed = Url::parse(uri)
+        .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
+
+    let session_id = task_state
+        .session_id
+        .clone()
+        .ok_or_else(|| io::Error::other("task does not have a resumable session yet"))?;
+
+    if matches!(parsed.scheme(), "ws" | "wss") {
+        return Ok(AttachTarget::Codex {
+            uri: parsed.to_string(),
+            thread_id: Some(session_id),
+        });
+    }
+
+    let username = parsed.username().to_string();
+    if username.is_empty() {
+        return Err(io::Error::other(
+            "workspace attach URI is missing username credentials",
+        ));
+    }
+    let password = parsed
+        .password()
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::other("workspace attach URI is missing password credentials"))?;
+
+    parsed
+        .set_username("")
+        .map_err(|_| io::Error::other("failed to sanitize workspace attach URI username"))?;
+    parsed
+        .set_password(None)
+        .map_err(|_| io::Error::other("failed to sanitize workspace attach URI password"))?;
+
+    Ok(AttachTarget::Opencode {
+        uri: parsed.to_string(),
+        username,
+        password,
+        session_id: Some(session_id),
+    })
+}
+
 pub(crate) fn build_handler_command(
     template: &str,
     argument_mode: multicode_lib::HandlerArgumentMode,
@@ -252,18 +309,12 @@ pub(crate) async fn validate_workspace_link_target(
             }
 
             let git_dir = repo_path.join(".git");
-            let git_metadata = tokio::fs::metadata(&git_dir).await.map_err(|err| {
+            tokio::fs::symlink_metadata(&git_dir).await.map_err(|err| {
                 io::Error::other(format!(
-                    "review path '{}' must contain a '.git' folder: {err}",
+                    "review path '{}' must contain a '.git' entry: {err}",
                     repo_path.display()
                 ))
             })?;
-            if !git_metadata.is_dir() {
-                return Err(io::Error::other(format!(
-                    "review path '{}' must contain a '.git' folder",
-                    repo_path.display()
-                )));
-            }
 
             Ok(repo_path.to_string_lossy().into_owned())
         }
@@ -308,9 +359,9 @@ pub(crate) fn attach_cli_args(agent_command: &str, target: &AttachTarget) -> Vec
                 "--remote".to_string(),
                 uri.clone(),
             ];
-            // Remote Codex resumes are more reliable when the app-server picks the
-            // latest thread instead of trusting a cached local snapshot id.
-            if thread_id.is_some() {
+            if let Some(thread_id) = thread_id.as_deref() {
+                args.push(thread_id.to_string());
+            } else {
                 args.push("--last".to_string());
             }
             args

@@ -42,6 +42,8 @@ pub struct AutonomousConfig {
         alias = "issue-scan-delay-seconds"
     )]
     pub issue_scan_delay_seconds: u64,
+    #[serde(default = "default_max_parallel_issues", alias = "max-parallel-issues")]
+    pub max_parallel_issues: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -121,6 +123,7 @@ impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
             issue_scan_delay_seconds: default_issue_scan_delay_seconds(),
+            max_parallel_issues: default_max_parallel_issues(),
         }
     }
 }
@@ -229,6 +232,10 @@ fn default_remote_sync_interval_seconds() -> u64 {
 
 fn default_issue_scan_delay_seconds() -> u64 {
     15 * 60
+}
+
+fn default_max_parallel_issues() -> usize {
+    5
 }
 
 fn default_handler_review() -> String {
@@ -429,7 +436,10 @@ fn is_executable_file(path: &Path) -> bool {
 pub(super) fn path_looks_like_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains('.'))
+        .is_some_and(|name| {
+            let trimmed = name.trim_start_matches('.');
+            !trimmed.is_empty() && trimmed.contains('.')
+        })
 }
 
 pub(super) fn validate_workspace_key(key: &str) -> Result<String, CombinedServiceError> {

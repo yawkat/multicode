@@ -26,6 +26,10 @@ pub(crate) const AUTOMATION_STATE_DIR: &str = "/multicode-agent/automation";
 pub(crate) const AUTOMATION_STATE_ENV: &str = "MULTICODE_AUTONOMOUS_STATE_PATH";
 pub(crate) const AUTOMATION_STATE_FILE_NAME: &str = "state";
 
+fn is_synthetic_container_target(path: &Path) -> bool {
+    path.starts_with("/multicode-agent")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuntimeActivity {
     Active,
@@ -121,7 +125,7 @@ fn server_uri(context: &RuntimeContext, password: &str, port: u16) -> String {
     }
 }
 
-fn synthetic_codex_home_source(workspace_directory_path: &Path, key: &str) -> PathBuf {
+pub(crate) fn synthetic_codex_home_source(workspace_directory_path: &Path, key: &str) -> PathBuf {
     workspace_directory_path
         .join(".multicode")
         .join("codex")
@@ -728,6 +732,9 @@ impl LinuxSystemdBwrapRuntime {
                         .as_ref()
                         .is_some_and(|source| source != &resolved_mount.effective_source));
             resolved_mount.prepare_source_node(owns_source_node).await?;
+            if !is_synthetic_container_target(&resolved_mount.mount.target) {
+                resolved_mount.prepare_target_node(owns_node).await?;
+            }
             resolved_mounts.push(resolved_mount);
         }
 

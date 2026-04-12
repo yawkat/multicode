@@ -471,7 +471,7 @@ async fn refresh_snapshot_codex_multicode_metadata(
     thread_id: &str,
     expected_uri: &str,
 ) {
-    let Ok(response) = client.thread_read(thread_id).await else {
+    let Ok(response) = client.thread_read_with_turns(thread_id, true).await else {
         return;
     };
     let metadata = collect_metadata_from_codex_turns(response.thread.turns.iter());

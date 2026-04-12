@@ -8,6 +8,7 @@ use std::{
 };
 
 use tokio::process::Command;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {
@@ -17,8 +18,8 @@ pub struct SpawnCommand {
 }
 
 use crate::{
-    WorkspaceArchiveFormat, WorkspaceManager, WorkspaceManagerError, database::Database, logging,
-    opencode,
+    WorkspaceArchiveFormat, WorkspaceManager, WorkspaceManagerError,
+    WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, database::Database, logging, opencode,
 };
 
 use super::{
@@ -283,17 +284,34 @@ impl CombinedService {
             .transpose()?;
 
         workspace.update(|snapshot| {
-            snapshot.persistent.automation_issue = normalized.clone();
+            let Some(issue_url) = normalized.clone() else {
+                return false;
+            };
+            if snapshot
+                .persistent
+                .tasks
+                .iter()
+                .any(|task| task.issue_url == issue_url)
+            {
+                snapshot.automation_status = Some(format!(
+                    "Issue already queued for workspace '{key}': {}",
+                    format_issue_reference(&issue_url)
+                ));
+                return true;
+            }
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    format!("task-{}", Uuid::new_v4().simple()),
+                    issue_url.clone(),
+                    WorkspaceTaskSource::Manual,
+                ));
             snapshot.persistent.automation_paused = false;
-            snapshot.automation_status = Some(match normalized.as_ref() {
-                Some(issue_url) => format!(
-                    "Issue assigned; start queued for {}",
-                    format_issue_reference(issue_url)
-                ),
-                None => {
-                    format!("Issue cleared; scan queued for {assigned_repository}")
-                }
-            });
+            snapshot.automation_status = Some(format!(
+                "Issue queued; start queued for {}",
+                format_issue_reference(&issue_url)
+            ));
             snapshot.automation_scan_request_nonce =
                 snapshot.automation_scan_request_nonce.saturating_add(1);
             true
@@ -307,7 +325,7 @@ impl CombinedService {
         let workspace = self.manager.get_workspace(&key)?;
         workspace.update(|snapshot| {
             if let Some(repository) = snapshot.persistent.assigned_repository.as_deref() {
-                if snapshot.persistent.automation_issue.is_none() {
+                if snapshot.active_task_id.is_none() {
                     snapshot.automation_status = Some(format!("Scan requested for {repository}"));
                 }
             }
@@ -331,6 +349,9 @@ impl CombinedService {
             }
             snapshot.persistent.assigned_repository = repository.clone();
             snapshot.persistent.automation_issue = None;
+            snapshot.persistent.tasks.clear();
+            snapshot.active_task_id = None;
+            snapshot.task_states.clear();
             snapshot.persistent.automation_paused = false;
             snapshot.automation_status = repository
                 .as_ref()
@@ -341,6 +362,112 @@ impl CombinedService {
             }
             true
         });
+        Ok(())
+    }
+
+    pub fn workspace_path_for_key(&self, key: &str) -> PathBuf {
+        self.workspace_directory_path.join(key)
+    }
+
+    pub fn workspace_repo_root_path(&self, key: &str, repository: &str) -> PathBuf {
+        self.workspace_path_for_key(key)
+            .join(repository_repo_name(repository))
+    }
+
+    pub fn workspace_task_checkout_path(
+        &self,
+        key: &str,
+        repository: &str,
+        issue_url: &str,
+    ) -> PathBuf {
+        self.workspace_path_for_key(key)
+            .join("work")
+            .join(format!(
+                "{}-{}",
+                repository_repo_name(repository),
+                issue_url_number(issue_url).unwrap_or("task")
+            ))
+    }
+
+    pub async fn ensure_workspace_task_checkout(
+        &self,
+        key: &str,
+        repository: &str,
+        issue_url: &str,
+    ) -> Result<PathBuf, CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let repository = normalize_repository_spec(repository)?;
+        let repo_root = self.workspace_repo_root_path(&key, &repository);
+        let task_root = self.workspace_task_checkout_path(&key, &repository, issue_url);
+
+        tokio::fs::create_dir_all(self.workspace_path_for_key(&key)).await?;
+        self.ensure_repository_checkout(&repository, &repo_root).await?;
+        self.ensure_task_worktree(&repo_root, &task_root).await?;
+        unset_repo_local_git_config(&repo_root, "user.name").await?;
+        unset_repo_local_git_config(&repo_root, "user.email").await?;
+        unset_repo_local_git_config(&task_root, "user.name").await?;
+        unset_repo_local_git_config(&task_root, "user.email").await?;
+
+        Ok(task_root)
+    }
+
+    pub async fn remove_workspace_task_checkout(
+        &self,
+        key: &str,
+        repository: &str,
+        issue_url: &str,
+    ) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let repository = normalize_repository_spec(repository)?;
+        let repo_root = self.workspace_repo_root_path(&key, &repository);
+        let task_root = self.workspace_task_checkout_path(&key, &repository, issue_url);
+
+        if !path_has_git_entry(&task_root).await? && tokio::fs::metadata(&task_root).await.is_err() {
+            return Ok(());
+        }
+
+        if path_has_git_entry(&repo_root).await? {
+            let mut command = Command::new(git_program());
+            command
+                .arg("-C")
+                .arg(&repo_root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&task_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            for (name, value) in self.sandbox_env_pairs(Vec::new()).await? {
+                command.env(name, value);
+            }
+
+            let output = command.output().await?;
+            if !output.status.success()
+                && path_has_git_entry(&task_root).await?
+            {
+                return Err(CombinedServiceError::RepositoryPreparation(format!(
+                    "failed to remove task worktree '{}': {}",
+                    task_root.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+
+            let mut prune = Command::new(git_program());
+            prune
+                .arg("-C")
+                .arg(&repo_root)
+                .args(["worktree", "prune"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            for (name, value) in self.sandbox_env_pairs(Vec::new()).await? {
+                prune.env(name, value);
+            }
+            let _ = prune.status().await;
+        }
+
+        if tokio::fs::metadata(&task_root).await.is_ok() {
+            remove_path_if_exists(&task_root).await?;
+        }
         Ok(())
     }
 
@@ -378,12 +505,105 @@ impl CombinedService {
         let workspace = self.manager.get_workspace(&key)?;
         let snapshot = workspace.subscribe().borrow().clone();
 
+        if !snapshot.persistent.tasks.is_empty() {
+            return Err(CombinedServiceError::WorkspaceHasTasks {
+                key: key.clone(),
+                task_count: snapshot.persistent.tasks.len(),
+            });
+        }
+
         if let Some(transient) = snapshot.transient.as_ref() {
             self.runtime.stop_server(&transient.runtime).await?;
         }
 
         self.remove_workspace_disk_state(&key).await?;
         self.manager.remove(&key)?;
+        Ok(())
+    }
+
+    pub async fn delete_workspace_task(
+        &self,
+        key: &str,
+        task_id: &str,
+    ) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        let snapshot = workspace.subscribe().borrow().clone();
+
+        let task = snapshot
+            .persistent
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .cloned()
+            .ok_or_else(|| CombinedServiceError::WorkspaceTaskMissing {
+                key: key.clone(),
+                task_id: task_id.to_string(),
+            })?;
+        let assigned_repository = snapshot.persistent.assigned_repository.clone();
+
+        if self.agent_provider == AgentProvider::Opencode
+            && let Some(task_state) = snapshot.task_states.get(task_id)
+            && let (Some(opencode_client), Some(session_id)) = (
+                snapshot.opencode_client.as_ref(),
+                task_state.session_id.as_deref(),
+            )
+            && let Ok(session_id) =
+                opencode::client::types::SessionDeleteSessionId::try_from(session_id)
+        {
+            let _ = opencode_client
+                .client
+                .session_delete(&session_id, None, None)
+                .await;
+        }
+
+        if let Some(assigned_repository) = assigned_repository.as_deref() {
+            self.remove_workspace_task_checkout(&key, assigned_repository, &task.issue_url)
+                .await?;
+        }
+
+        workspace.update(|next| {
+            let mut changed = false;
+            let before = next.persistent.tasks.len();
+            next.persistent.tasks.retain(|entry| entry.id != task_id);
+            if next.persistent.tasks.len() != before {
+                changed = true;
+            }
+            if next.task_states.remove(task_id).is_some() {
+                changed = true;
+            }
+            if next.active_task_id.as_deref() == Some(task_id) {
+                next.active_task_id = next.persistent.tasks.first().map(|task| task.id.clone());
+                next.automation_session_id = None;
+                next.automation_agent_state = None;
+                next.automation_session_status = None;
+                changed = true;
+            } else if next
+                .active_task_id
+                .as_deref()
+                .is_some_and(|active_task_id| {
+                    !next.persistent.tasks.iter().any(|entry| entry.id == active_task_id)
+                })
+            {
+                next.active_task_id = next.persistent.tasks.first().map(|entry| entry.id.clone());
+                changed = true;
+            }
+            let next_active_issue = next
+                .active_task_id
+                .as_deref()
+                .and_then(|active_task_id| {
+                    next.persistent
+                        .tasks
+                        .iter()
+                        .find(|entry| entry.id == active_task_id)
+                        .map(|entry| entry.issue_url.clone())
+                });
+            if next.persistent.automation_issue != next_active_issue {
+                next.persistent.automation_issue = next_active_issue;
+                changed = true;
+            }
+            changed
+        });
         Ok(())
     }
 
@@ -749,6 +969,98 @@ impl CombinedService {
         github_git_credentials_env_vars(self.github_git_credentials_env.as_ref())
     }
 
+    async fn ensure_repository_checkout(
+        &self,
+        repository: &str,
+        repo_root: &Path,
+    ) -> Result<(), CombinedServiceError> {
+        if path_has_git_entry(repo_root).await? {
+            return Ok(());
+        }
+
+        if tokio::fs::metadata(repo_root).await.is_ok() {
+            remove_path_if_exists(repo_root).await?;
+        }
+        if let Some(parent) = repo_root.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let mut command = Command::new(git_program());
+        command
+            .args(["clone", &repository_clone_url(repository)])
+            .arg(repo_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (name, value) in self.sandbox_env_pairs(Vec::new()).await? {
+            command.env(name, value);
+        }
+        let output = command.output().await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(CombinedServiceError::RepositoryPreparation(format!(
+                "failed to clone {repository} into '{}': {}",
+                repo_root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    async fn ensure_task_worktree(
+        &self,
+        repo_root: &Path,
+        task_root: &Path,
+    ) -> Result<(), CombinedServiceError> {
+        if path_has_git_entry(task_root).await? {
+            return Ok(());
+        }
+
+        if tokio::fs::metadata(task_root).await.is_ok() {
+            remove_path_if_exists(task_root).await?;
+        }
+        if let Some(parent) = task_root.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let mut prune = Command::new(git_program());
+        prune
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "prune"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, value) in self.sandbox_env_pairs(Vec::new()).await? {
+            prune.env(name, value);
+        }
+        let _ = prune.status().await;
+
+        let mut command = Command::new(git_program());
+        command
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(task_root)
+            .arg("HEAD")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (name, value) in self.sandbox_env_pairs(Vec::new()).await? {
+            command.env(name, value);
+        }
+        let output = command.output().await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(CombinedServiceError::RepositoryPreparation(format!(
+                "failed to create task worktree '{}': {}",
+                task_root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
     async fn compress_directory_to_archive(
         &self,
         archive_path: &Path,
@@ -988,6 +1300,58 @@ fn github_git_credentials_env_vars(
     ]
 }
 
+async fn path_has_git_entry(path: &Path) -> Result<bool, CombinedServiceError> {
+    match tokio::fs::symlink_metadata(path.join(".git")).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn repository_repo_name(repository: &str) -> &str {
+    repository.rsplit('/').next().unwrap_or(repository)
+}
+
+fn issue_url_number(issue_url: &str) -> Option<&str> {
+    let issue_number = issue_url.rsplit('/').next()?.trim();
+    (!issue_number.is_empty()).then_some(issue_number)
+}
+
+fn repository_clone_url(repository: &str) -> String {
+    format!("https://github.com/{repository}.git")
+}
+
+fn git_program() -> String {
+    for candidate in [
+        "git",
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
+        let path = Path::new(candidate);
+        let available = if path.components().count() > 1 {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        } else {
+            std::env::var_os("PATH").is_some_and(|path_var| {
+                std::env::split_paths(&path_var)
+                    .map(|directory| directory.join(candidate))
+                    .any(|resolved| {
+                        std::fs::metadata(&resolved)
+                            .map(|metadata| metadata.is_file())
+                            .unwrap_or(false)
+                    })
+            })
+        };
+        if available {
+            return candidate.to_string();
+        }
+    }
+
+    "git".to_string()
+}
+
 async fn remove_path_if_exists(path: &Path) -> Result<(), CombinedServiceError> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) if metadata.is_dir() => {
@@ -1051,7 +1415,7 @@ async fn unset_repo_local_git_config(
     repo_root: &Path,
     key: &str,
 ) -> Result<(), CombinedServiceError> {
-    let output = Command::new("git")
+    let output = Command::new(git_program())
         .arg("-C")
         .arg(repo_root)
         .args(["config", "--local", "--unset-all", key])
@@ -1146,8 +1510,17 @@ pub enum CombinedServiceError {
     InvalidToolExecution(String),
     InvalidRepositorySpec(String),
     InvalidIssueSpec(String),
+    RepositoryPreparation(String),
     UnsupportedRuntimeBackend(String),
     WorkspaceRepositoryRequired(String),
+    WorkspaceTaskMissing {
+        key: String,
+        task_id: String,
+    },
+    WorkspaceHasTasks {
+        key: String,
+        task_count: usize,
+    },
     WorkspaceArchived(String),
     WorkspaceNotArchived(String),
     ArchiveWorkspaceRunning(String),
@@ -1484,6 +1857,14 @@ mod tests {
             }
             Self { key, old_value }
         }
+
+        fn set_value(key: &'static str, value: impl Into<OsString>) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value.into());
+            }
+            Self { key, old_value }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -1738,6 +2119,26 @@ token = { command = "gh auth token" }
             .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).expect("executable permissions should be set");
+    }
+
+    fn run_git(repo_root: &Path, args: &[&str]) {
+        let status = std::process::Command::new(git_program())
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .status()
+            .expect("git command should run");
+        assert!(status.success(), "git command should succeed: git -C {repo_root:?} {}", args.join(" "));
+    }
+
+    fn init_test_git_repository(repo_root: &Path) {
+        fs::create_dir_all(repo_root).expect("repo root should exist");
+        run_git(repo_root, &["init", "--initial-branch=main"]);
+        run_git(repo_root, &["config", "user.email", "test@example.com"]);
+        run_git(repo_root, &["config", "user.name", "Test User"]);
+        fs::write(repo_root.join("README.md"), "hello\n").expect("repo file should be written");
+        run_git(repo_root, &["add", "README.md"]);
+        run_git(repo_root, &["commit", "-m", "initial"]);
     }
 
     #[test]
@@ -2226,7 +2627,10 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .expect("fake opencode should be written");
             make_executable(&fake_opencode);
 
-            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _path_guard = EnvVarGuard::set_value(
+                "PATH",
+                "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            );
             let _home_guard = EnvVarGuard::set("HOME", &home);
             let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
 
@@ -2234,8 +2638,9 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
             fs::write(
                 &config_path,
                 format!(
-                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
-                    workspace_directory.display()
+                    "workspace-directory = \"{}\"\nopencode = [\"{}\"]\n\n[isolation]\n",
+                    workspace_directory.display(),
+                    fake_opencode.display()
                 ),
             )
             .expect("config should be written");
@@ -2276,6 +2681,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 Some("example/repo")
             );
             assert!(snapshot.persistent.automation_issue.is_none());
+            assert!(snapshot.persistent.tasks.is_empty());
             assert_eq!(snapshot.automation_scan_request_nonce, 1);
 
             let cleared = service
@@ -2291,12 +2697,13 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .borrow()
                 .clone();
             assert!(cleared_snapshot.persistent.assigned_repository.is_none());
+            assert!(cleared_snapshot.persistent.tasks.is_empty());
             assert_eq!(cleared_snapshot.automation_scan_request_nonce, 1);
         });
     }
 
     #[test]
-    fn assign_workspace_issue_normalizes_and_requests_autonomous_start() {
+    fn assign_workspace_issue_creates_manual_task_and_requests_autonomous_start() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2358,16 +2765,22 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .subscribe()
                 .borrow()
                 .clone();
+            assert!(snapshot.persistent.automation_issue.is_none());
+            assert_eq!(snapshot.persistent.tasks.len(), 1);
             assert_eq!(
-                snapshot.persistent.automation_issue.as_deref(),
-                Some("https://github.com/example/repo/issues/42")
+                snapshot.persistent.tasks[0].issue_url,
+                "https://github.com/example/repo/issues/42"
+            );
+            assert_eq!(
+                snapshot.persistent.tasks[0].source,
+                WorkspaceTaskSource::Manual
             );
             assert_eq!(snapshot.automation_scan_request_nonce, 2);
 
             let cleared = service
                 .assign_workspace_issue("alpha", None)
                 .await
-                .expect("clearing issue assignment should succeed");
+                .expect("empty issue assignment should be ignored");
             assert!(cleared.is_none());
 
             let cleared_snapshot = service
@@ -2378,7 +2791,75 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .borrow()
                 .clone();
             assert!(cleared_snapshot.persistent.automation_issue.is_none());
-            assert_eq!(cleared_snapshot.automation_scan_request_nonce, 3);
+            assert_eq!(cleared_snapshot.persistent.tasks.len(), 1);
+            assert_eq!(cleared_snapshot.automation_scan_request_nonce, 2);
+        });
+    }
+
+    #[test]
+    fn assign_workspace_issue_does_not_duplicate_existing_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("initial issue assignment should succeed");
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("duplicate issue assignment should succeed");
+
+            let snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+            assert_eq!(snapshot.persistent.tasks.len(), 1);
         });
     }
 
@@ -2603,6 +3084,256 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
     }
 
     #[test]
+    fn delete_workspace_rejects_workspace_with_tasks() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("issue assignment should succeed");
+
+            let err = service
+                .delete_workspace("alpha")
+                .await
+                .expect_err("workspace deletion should be rejected while tasks exist");
+            assert!(matches!(
+                err,
+                CombinedServiceError::WorkspaceHasTasks {
+                    key,
+                    task_count: 1
+                } if key == "alpha"
+            ));
+        });
+    }
+
+    #[test]
+    fn delete_workspace_task_removes_task_and_clears_active_session_fields() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("issue assignment should succeed");
+
+            let workspace = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist");
+            let task_id = workspace
+                .subscribe()
+                .borrow()
+                .persistent
+                .tasks
+                .first()
+                .expect("task should exist")
+                .id
+                .clone();
+            workspace.update(|snapshot| {
+                snapshot.active_task_id = Some(task_id.clone());
+                snapshot.automation_session_id = Some("ses-task".to_string());
+                snapshot.automation_agent_state = Some(crate::AutomationAgentState::Working);
+                snapshot.automation_session_status = Some(crate::RootSessionStatus::Busy);
+                snapshot.task_states.insert(
+                    task_id.clone(),
+                    crate::WorkspaceTaskRuntimeSnapshot {
+                        session_id: Some("ses-task".to_string()),
+                        agent_state: Some(crate::AutomationAgentState::Working),
+                        session_status: Some(crate::RootSessionStatus::Busy),
+                        ..Default::default()
+                    },
+                );
+                true
+            });
+
+            service
+                .delete_workspace_task("alpha", &task_id)
+                .await
+                .expect("task deletion should succeed");
+
+            let snapshot = workspace.subscribe().borrow().clone();
+            assert!(snapshot.persistent.tasks.is_empty());
+            assert!(snapshot.active_task_id.is_none());
+            assert!(snapshot.automation_session_id.is_none());
+            assert!(snapshot.automation_agent_state.is_none());
+            assert!(snapshot.automation_session_status.is_none());
+            assert!(!snapshot.task_states.contains_key(&task_id));
+        });
+    }
+
+    #[test]
+    fn ensure_and_remove_workspace_task_checkout_manage_git_worktree() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            let repo_root = service.workspace_repo_root_path("alpha", "example/repo");
+            init_test_git_repository(&repo_root);
+
+            let issue_url = "https://github.com/example/repo/issues/42";
+            let task_root = service
+                .ensure_workspace_task_checkout("alpha", "example/repo", issue_url)
+                .await
+                .expect("task checkout should be prepared");
+
+            assert_eq!(
+                task_root,
+                service.workspace_task_checkout_path("alpha", "example/repo", issue_url)
+            );
+            assert!(
+                tokio::fs::symlink_metadata(task_root.join(".git"))
+                    .await
+                    .expect("worktree should have git entry")
+                    .file_type()
+                    .is_file(),
+                "git worktree should expose a .git file"
+            );
+            assert!(
+                tokio::fs::metadata(task_root.join("README.md")).await.is_ok(),
+                "worktree should contain repository files"
+            );
+
+            service
+                .remove_workspace_task_checkout("alpha", "example/repo", issue_url)
+                .await
+                .expect("task checkout should be removed");
+
+            assert!(
+                tokio::fs::metadata(&task_root).await.is_err(),
+                "task worktree should be removed"
+            );
+            assert!(
+                tokio::fs::symlink_metadata(repo_root.join(".git")).await.is_ok(),
+                "base checkout should remain"
+            );
+        });
+    }
+
+    #[test]
     fn strip_workspace_git_identity_overrides_removes_repo_local_user_identity() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2615,7 +3346,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
             let repo = workspace.join("repo");
             fs::create_dir_all(&repo).expect("repo dir should exist");
 
-            let init = Command::new("git")
+            let init = Command::new(git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(["init"])
@@ -2625,7 +3356,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .expect("git init should run");
             assert!(init.status.success(), "git init should succeed");
 
-            let set_name = Command::new("git")
+            let set_name = Command::new(git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "user.name", "Local Name"])
@@ -2638,7 +3369,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 "git config user.name should succeed"
             );
 
-            let set_email = Command::new("git")
+            let set_email = Command::new(git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "user.email", "local@example.com"])
@@ -2655,7 +3386,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .await
                 .expect("workspace git identity cleanup should succeed");
 
-            let get_name = Command::new("git")
+            let get_name = Command::new(git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "--get", "user.name"])
@@ -2665,7 +3396,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .expect("git config get user.name should run");
             assert_eq!(get_name.status.code(), Some(1));
 
-            let get_email = Command::new("git")
+            let get_email = Command::new(git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "--get", "user.email"])
@@ -2675,7 +3406,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .expect("git config get user.email should run");
             assert_eq!(get_email.status.code(), Some(1));
 
-            let remote = Command::new("git")
+            let remote = Command::new(git_program())
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "core.repositoryformatversion"])

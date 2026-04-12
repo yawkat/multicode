@@ -139,6 +139,7 @@ async fn sync_root_session(
     key: RootSessionTaskKey,
     config: CodexAgentConfig,
 ) {
+    tracing::info!(uri = %key.uri, cwd = %key.cwd, "starting codex root session sync");
     let client = CodexAppServerClient::new(key.uri.clone());
     let event_tx = broadcast::channel(256).0;
     let forwarder = tokio::spawn(forward_codex_notifications_forever(
@@ -256,18 +257,113 @@ async fn refresh_root_session(
 ) {
     let response = match client.thread_list(&key.cwd).await {
         Ok(response) => response,
-        Err(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                uri = %key.uri,
+                cwd = %key.cwd,
+                error = %error,
+                "failed to list codex root threads"
+            );
+            return;
+        }
     };
+    tracing::info!(
+        uri = %key.uri,
+        cwd = %key.cwd,
+        thread_count = response.data.len(),
+        "listed codex root threads"
+    );
 
     let current_root_session_id = workspace.subscribe().borrow().root_session_id.clone();
-    let thread =
-        match select_thread_for_tracking(current_root_session_id.as_deref(), &response.data) {
-            Some(thread) => thread,
-            None => match client.thread_start(&key.cwd, config).await {
+    let thread = match select_thread_for_tracking(current_root_session_id.as_deref(), &response.data)
+    {
+        Some(thread) => thread,
+        None => {
+            if let Some(current_root_session_id) = current_root_session_id.as_deref() {
+                match client.thread_read(current_root_session_id).await {
+                    Ok(response) => {
+                        if let Some(status) = response.thread.status.as_ref() {
+                            if matches!(
+                                status,
+                                super::codex_app_server::CodexThreadStatus::NotLoaded
+                            ) || status.requires_replacement()
+                            {
+                                tracing::info!(
+                                    uri = %key.uri,
+                                    cwd = %key.cwd,
+                                    current_root_session_id,
+                                    status = ?status,
+                                    "clearing stale codex root thread after thread/read"
+                                );
+                                clear_tracked_root_session(workspace, key, Some(current_root_session_id));
+                            } else {
+                                tracing::debug!(
+                                    uri = %key.uri,
+                                    cwd = %key.cwd,
+                                    current_root_session_id,
+                                    status = ?status,
+                                    "retaining existing codex root thread based on thread/read"
+                                );
+                                update_from_read(
+                                    workspace,
+                                    key,
+                                    current_root_session_id,
+                                    status,
+                                    active_turn_thread_id,
+                                );
+                                return;
+                            }
+                        } else {
+                            tracing::debug!(
+                                uri = %key.uri,
+                                cwd = %key.cwd,
+                                current_root_session_id,
+                                "retaining existing codex root thread without status from thread/read"
+                            );
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        if error.contains("thread not loaded") {
+                            tracing::info!(
+                                uri = %key.uri,
+                                cwd = %key.cwd,
+                                current_root_session_id,
+                                error = %error,
+                                "clearing stale codex root thread after thread/read failure"
+                            );
+                            clear_tracked_root_session(
+                                workspace,
+                                key,
+                                Some(current_root_session_id),
+                            );
+                        } else {
+                            tracing::debug!(
+                                uri = %key.uri,
+                                cwd = %key.cwd,
+                                current_root_session_id,
+                                error = %error,
+                                "retaining existing codex root thread while it is not yet materialized in thread/list"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            match client.thread_start(&key.cwd, config).await {
                 Ok(response) => response.thread,
-                Err(_) => return,
-            },
-        };
+                Err(error) => {
+                    tracing::warn!(
+                        uri = %key.uri,
+                        cwd = %key.cwd,
+                        error = %error,
+                        "failed to start codex root thread"
+                    );
+                    return;
+                }
+            }
+        }
+    };
 
     update_from_thread(workspace, key, &thread, active_turn_thread_id);
 }
@@ -356,6 +452,65 @@ fn update_from_thread(
         snapshot.root_session_title = Some(next_title);
         snapshot.root_session_status = Some(next_status);
         true
+    });
+}
+
+fn update_from_read(
+    workspace: &Workspace,
+    key: &RootSessionTaskKey,
+    thread_id: &str,
+    status: &super::codex_app_server::CodexThreadStatus,
+    active_turn_thread_id: Option<&str>,
+) {
+    workspace.update(|snapshot| {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(key.uri.as_str())
+        {
+            return false;
+        }
+        if snapshot.root_session_id.as_deref() != Some(thread_id) {
+            return false;
+        }
+
+        let next_status = effective_status(thread_id, status, active_turn_thread_id);
+        if snapshot.root_session_status == Some(next_status) {
+            return false;
+        }
+
+        snapshot.root_session_status = Some(next_status);
+        true
+    });
+}
+
+fn clear_tracked_root_session(
+    workspace: &Workspace,
+    key: &RootSessionTaskKey,
+    expected_thread_id: Option<&str>,
+) {
+    workspace.update(|snapshot| {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(key.uri.as_str())
+        {
+            return false;
+        }
+        if expected_thread_id.is_some()
+            && snapshot.root_session_id.as_deref() != expected_thread_id
+        {
+            return false;
+        }
+        let changed = snapshot.root_session_id.is_some()
+            || snapshot.root_session_title.is_some()
+            || snapshot.root_session_status.is_some();
+        snapshot.root_session_id = None;
+        snapshot.root_session_title = None;
+        snapshot.root_session_status = None;
+        changed
     });
 }
 
@@ -472,5 +627,41 @@ mod tests {
         assert_eq!(snapshot.root_session_id.as_deref(), Some("thread-current"));
         assert_eq!(snapshot.root_session_title.as_deref(), Some("Current"));
         assert_eq!(snapshot.root_session_status, Some(RootSessionStatus::Busy));
+    }
+
+    #[test]
+    fn select_thread_for_tracking_returns_none_when_current_thread_is_unmaterialized() {
+        assert!(select_thread_for_tracking(Some("thread-current"), &[]).is_none());
+    }
+
+    #[test]
+    fn clear_tracked_root_session_clears_matching_thread() {
+        let workspace = WorkspaceSnapshot::default();
+        let workspace = crate::manager::Workspace::new(workspace);
+        let key = RootSessionTaskKey {
+            uri: "ws://127.0.0.1:31337".to_string(),
+            cwd: "/tmp/workspace".to_string(),
+        };
+        workspace.update(|snapshot| {
+            snapshot.transient = Some(TransientWorkspaceSnapshot {
+                uri: key.uri.clone(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::AppleContainer,
+                    id: "runtime-1".to_string(),
+                    metadata: Default::default(),
+                },
+            });
+            snapshot.root_session_id = Some("thread-current".to_string());
+            snapshot.root_session_title = Some("Current".to_string());
+            snapshot.root_session_status = Some(RootSessionStatus::Busy);
+            true
+        });
+
+        clear_tracked_root_session(&workspace, &key, Some("thread-current"));
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert_eq!(snapshot.root_session_id, None);
+        assert_eq!(snapshot.root_session_title, None);
+        assert_eq!(snapshot.root_session_status, None);
     }
 }

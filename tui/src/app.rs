@@ -27,16 +27,27 @@ pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
     Some(format!("{NERD_FONT_GITHUB_GLYPH} {owner}/{repo}#{number}"))
 }
 
-pub(crate) fn should_request_autonomous_issue_scan(snapshot: &WorkspaceSnapshot) -> bool {
+pub(crate) fn has_available_task_slot(
+    snapshot: &WorkspaceSnapshot,
+    max_parallel_issues: usize,
+) -> bool {
+    snapshot.persistent.tasks.len() < max_parallel_issues
+}
+
+pub(crate) fn should_request_autonomous_issue_scan(
+    snapshot: &WorkspaceSnapshot,
+    max_parallel_issues: usize,
+) -> bool {
     snapshot.persistent.assigned_repository.is_some()
-        && snapshot.persistent.automation_issue.is_none()
+        && !snapshot.persistent.archived
+        && has_available_task_slot(snapshot, max_parallel_issues)
 }
 
 pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
     snapshot: &WorkspaceSnapshot,
 ) -> bool {
     if snapshot.persistent.assigned_repository.is_none()
-        || snapshot.persistent.automation_issue.is_none()
+        || snapshot.resolved_active_task_id().is_none()
     {
         return false;
     }
@@ -44,7 +55,8 @@ pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
     match snapshot.automation_agent_state {
         Some(AutomationAgentState::Working) => true,
         Some(
-            AutomationAgentState::Question
+            AutomationAgentState::WaitingOnVm
+            | AutomationAgentState::Question
             | AutomationAgentState::Review
             | AutomationAgentState::Idle
             | AutomationAgentState::Stale,
@@ -58,7 +70,86 @@ pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
     }
 }
 
+pub(crate) fn restored_selected_row(
+    entries: &[TableEntry],
+    previous_selected_entry: Option<&TableEntry>,
+    current_selected_row: usize,
+) -> usize {
+    let max_row = entries.len().saturating_sub(1);
+    let Some(previous_selected_entry) = previous_selected_entry else {
+        return current_selected_row.min(max_row);
+    };
+
+    if matches!(previous_selected_entry, TableEntry::Create) {
+        return 0;
+    }
+
+    if let Some(position) = entries.iter().position(|entry| entry == previous_selected_entry) {
+        return position;
+    }
+
+    if let TableEntry::Task { workspace_key, .. } = previous_selected_entry
+        && let Some(position) = entries.iter().position(|entry| {
+            matches!(
+                entry,
+                TableEntry::Workspace {
+                    workspace_key: candidate
+                } if candidate == workspace_key
+            )
+        })
+    {
+        return position;
+    }
+
+    current_selected_row.min(max_row)
+}
+
 impl TuiState {
+    pub(crate) fn table_entries(&self) -> Vec<TableEntry> {
+        let mut entries = Vec::with_capacity(self.ordered_keys.len() + 1);
+        entries.push(TableEntry::Create);
+        for key in &self.ordered_keys {
+            entries.push(TableEntry::Workspace {
+                workspace_key: key.clone(),
+            });
+            if let Some(snapshot) = self.snapshots.get(key) {
+                for task in &snapshot.persistent.tasks {
+                    entries.push(TableEntry::Task {
+                        workspace_key: key.clone(),
+                        task_id: task.id.clone(),
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    fn selected_entry(&self) -> Option<TableEntry> {
+        self.table_entries().get(self.selected_row).cloned()
+    }
+
+    pub(crate) fn selected_task_id(&self) -> Option<&str> {
+        if self.selected_row == 0 {
+            return None;
+        }
+        let mut row = 1usize;
+        for key in &self.ordered_keys {
+            if row == self.selected_row {
+                return None;
+            }
+            row += 1;
+            if let Some(snapshot) = self.snapshots.get(key) {
+                for task in &snapshot.persistent.tasks {
+                    if row == self.selected_row {
+                        return Some(task.id.as_str());
+                    }
+                    row += 1;
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) async fn new(
         config_path: PathBuf,
         relay_socket: Option<PathBuf>,
@@ -102,7 +193,7 @@ impl TuiState {
             custom_link_kind: None,
             custom_link_action: None,
             custom_link_original_value: None,
-            pending_delete_workspace_key: None,
+            pending_delete_target: None,
             starting_workspace_key: None,
             started_wait_since: None,
             previous_machine_cpu_totals: None,
@@ -156,12 +247,7 @@ impl TuiState {
     }
 
     pub(crate) fn sync_from_manager(&mut self) {
-        let previous_selected_key = if self.selected_row > 0 {
-            self.ordered_keys.get(self.selected_row - 1).cloned()
-        } else {
-            None
-        };
-        let selected_create_row = self.selected_row == 0;
+        let previous_selected_entry = self.selected_entry();
 
         let workspace_keys = self.workspace_keys_rx.borrow().clone();
 
@@ -190,21 +276,12 @@ impl TuiState {
         self.refresh_workspace_link_validations();
         self.refresh_github_link_statuses();
 
-        if selected_create_row {
-            self.selected_row = 0;
-        } else if let Some(previous_selected_key) = previous_selected_key {
-            self.selected_row = self
-                .ordered_keys
-                .iter()
-                .position(|key| key == &previous_selected_key)
-                .map(|position| position + 1)
-                .unwrap_or(0);
-        } else {
-            let max_row = self.ordered_keys.len();
-            if self.selected_row > max_row {
-                self.selected_row = max_row;
-            }
-        }
+        let table_entries = self.table_entries();
+        self.selected_row = restored_selected_row(
+            &table_entries,
+            previous_selected_entry.as_ref(),
+            self.selected_row,
+        );
 
         self.normalize_selected_link_index();
 
@@ -227,7 +304,7 @@ impl TuiState {
                 }
                 UiMode::ConfirmDelete => {
                     self.mode = UiMode::Normal;
-                    self.pending_delete_workspace_key = None;
+                    self.pending_delete_target = None;
                 }
                 _ => {}
             }
@@ -271,23 +348,40 @@ impl TuiState {
 
         if self.mode == UiMode::ConfirmDelete
             && self
-                .pending_delete_workspace_key
-                .as_deref()
-                .is_some_and(|key| !self.snapshots.contains_key(key))
+                .pending_delete_target
+                .as_ref()
+                .is_some_and(|target| match target {
+                    PendingDeleteTarget::Workspace { workspace_key }
+                    | PendingDeleteTarget::Task { workspace_key, .. } => {
+                        !self.snapshots.contains_key(workspace_key)
+                    }
+                })
         {
             self.mode = UiMode::Normal;
-            self.pending_delete_workspace_key = None;
+            self.pending_delete_target = None;
         }
     }
 
     pub(crate) fn selected_workspace_key(&self) -> Option<&str> {
         if self.selected_row == 0 {
-            None
-        } else {
-            self.ordered_keys
-                .get(self.selected_row - 1)
-                .map(String::as_str)
+            return None;
         }
+        let mut row = 1usize;
+        for key in &self.ordered_keys {
+            if row == self.selected_row {
+                return Some(key.as_str());
+            }
+            row += 1;
+            if let Some(snapshot) = self.snapshots.get(key) {
+                for _task in &snapshot.persistent.tasks {
+                    if row == self.selected_row {
+                        return Some(key.as_str());
+                    }
+                    row += 1;
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn selected_workspace_snapshot(&self) -> Option<&WorkspaceSnapshot> {
@@ -310,6 +404,11 @@ impl TuiState {
         let key = self.selected_workspace_key()?;
         let snapshot = self.snapshots.get(key)?;
         let workspace_path = self.service.workspace_directory_path().join(key);
+        if let Some(task_id) = self.selected_task_id()
+            && let Some(task) = task_persistent_snapshot(snapshot, task_id)
+        {
+            return compare_target_path_for_task(snapshot, task, &workspace_path);
+        }
         compare_target_path(
             snapshot,
             &self.workspace_link_validation_results,
@@ -328,13 +427,27 @@ impl TuiState {
         let Some(snapshot) = self.selected_workspace_snapshot() else {
             return Vec::new();
         };
+        let candidates = if let Some(task_id) = self.selected_task_id() {
+            task_persistent_snapshot(snapshot, task_id)
+                .map(|task| {
+                    visible_task_links(
+                        task,
+                        task_runtime_snapshot(snapshot, task_id),
+                        &self.workspace_link_validation_results,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            validated_workspace_links_by_kind(
+                snapshot,
+                &self.workspace_link_validation_results,
+                link.kind,
+            )
+        };
 
-        validated_workspace_links_by_kind(
-            snapshot,
-            &self.workspace_link_validation_results,
-            link.kind,
-        )
+        candidates
         .into_iter()
+        .filter(|candidate| candidate.kind == link.kind)
         .filter_map(|candidate| {
             self.workspace_link_validation_results
                 .get(&candidate)
@@ -420,22 +533,39 @@ impl TuiState {
     }
 
     fn can_add_custom_link_for_selected_kind(&self) -> Option<WorkspaceLinkKind> {
+        if self.selected_task_id().is_some() {
+            return None;
+        }
         self.selected_workspace_link()
             .filter(|link| matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr))
             .map(|link| link.kind)
     }
 
     fn selected_workspace_selectable_links(&self) -> Vec<WorkspaceLink> {
-        self.selected_workspace_key()
-            .and_then(|key| self.snapshots.get(key))
-            .map(|snapshot| {
-                selectable_workspace_links(
-                    snapshot,
-                    &self.workspace_link_validation_results,
-                    &self.github_link_statuses,
-                )
-            })
-            .unwrap_or_default()
+        let Some(key) = self.selected_workspace_key() else {
+            return Vec::new();
+        };
+        let Some(snapshot) = self.snapshots.get(key) else {
+            return Vec::new();
+        };
+
+        if let Some(task_id) = self.selected_task_id() {
+            return task_persistent_snapshot(snapshot, task_id)
+                .map(|task| {
+                    visible_task_links(
+                        task,
+                        task_runtime_snapshot(snapshot, task_id),
+                        &self.workspace_link_validation_results,
+                    )
+                })
+                .unwrap_or_default();
+        }
+
+        selectable_workspace_links(
+            snapshot,
+            &self.workspace_link_validation_results,
+            &self.github_link_statuses,
+        )
     }
 
     fn selected_workspace_link_argument(&self, link: &WorkspaceLink) -> Option<&str> {
@@ -446,7 +576,7 @@ impl TuiState {
     }
 
     fn normalize_selected_link_index(&mut self) {
-        if self.selected_row == 0 {
+        if matches!(self.selected_entry(), Some(TableEntry::Create)) {
             self.selected_link_index = None;
             return;
         }
@@ -464,11 +594,17 @@ impl TuiState {
     }
 
     fn refresh_workspace_link_validations(&mut self) {
-        let active_links = self
-            .snapshots
-            .values()
-            .flat_map(workspace_links)
-            .collect::<HashSet<_>>();
+        let mut active_links = HashSet::new();
+        for snapshot in self.snapshots.values() {
+            active_links.extend(workspace_links(snapshot));
+            active_links.extend(workspace_issue_pr_links(snapshot));
+            for task in &snapshot.persistent.tasks {
+                active_links.extend(task_links(
+                    task,
+                    task_runtime_snapshot(snapshot, &task.id),
+                ));
+            }
+        }
 
         self.workspace_link_validation_results
             .retain(|link, _| active_links.contains(link));
@@ -524,12 +660,25 @@ impl TuiState {
     }
 
     fn refresh_github_link_statuses(&mut self) {
-        let active_issue_or_pr_links = self
-            .snapshots
-            .values()
-            .flat_map(workspace_links)
-            .filter(|link| matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr))
-            .collect::<HashSet<_>>();
+        let mut active_issue_or_pr_links = HashSet::new();
+        for snapshot in self.snapshots.values() {
+            active_issue_or_pr_links.extend(
+                workspace_issue_pr_links(snapshot)
+                    .into_iter()
+                    .filter(|link| {
+                        matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr)
+                    }),
+            );
+            for task in &snapshot.persistent.tasks {
+                active_issue_or_pr_links.extend(
+                    task_links(task, task_runtime_snapshot(snapshot, &task.id))
+                        .into_iter()
+                        .filter(|link| {
+                            matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr)
+                        }),
+                );
+            }
+        }
 
         self.github_link_status_rxs
             .retain(|link, _| active_issue_or_pr_links.contains(link));
@@ -584,9 +733,15 @@ impl TuiState {
     }
 
     pub(crate) fn selected_workspace_has_refreshable_github_link(&self) -> bool {
-        self.selected_workspace_selectable_links()
-            .into_iter()
-            .any(|link| matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr))
+        self.selected_workspace_snapshot().is_some_and(|snapshot| {
+            should_request_autonomous_issue_scan(
+                snapshot,
+                self.service.config.autonomous.max_parallel_issues,
+            ) || self
+                .selected_workspace_selectable_links()
+                .into_iter()
+                .any(|link| matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr))
+        })
     }
 
     pub(crate) fn selected_workspace_link(&self) -> Option<WorkspaceLink> {
@@ -603,7 +758,12 @@ impl TuiState {
         let autonomous_scan_requested = self
             .snapshots
             .get(&workspace_key)
-            .filter(|snapshot| should_request_autonomous_issue_scan(snapshot))
+            .filter(|snapshot| {
+                should_request_autonomous_issue_scan(
+                    snapshot,
+                    self.service.config.autonomous.max_parallel_issues,
+                )
+            })
             .map(|_| self.service.request_workspace_issue_scan(&workspace_key))
             .transpose();
 
@@ -683,6 +843,9 @@ impl TuiState {
     }
 
     pub(crate) fn contextual_tool_hotkeys(&self) -> Vec<(String, String)> {
+        if self.selected_task_id().is_some() {
+            return Vec::new();
+        }
         contextual_tool_hotkeys(
             &self.service.config.tool,
             self.selected_workspace_snapshot(),
@@ -699,10 +862,16 @@ impl TuiState {
     }
 
     fn snapshot_attach_target(&self, key: &str) -> io::Result<AttachTarget> {
-        self.snapshots
+        let snapshot = self
+            .snapshots
             .get(key)
-            .ok_or_else(|| io::Error::other(format!("workspace snapshot missing for '{key}'")))
-            .and_then(workspace_attach_target)
+            .ok_or_else(|| io::Error::other(format!("workspace snapshot missing for '{key}'")))?;
+        if let Some(task_id) = self.selected_task_id()
+            && let Some(task_state) = task_runtime_snapshot(snapshot, task_id)
+        {
+            return task_attach_target(snapshot, task_state);
+        }
+        workspace_attach_target(snapshot)
     }
 
     fn attach_env_for_workspace(&self, key: &str) -> Vec<(String, String)> {
@@ -1201,23 +1370,11 @@ impl TuiState {
         key: KeyEvent,
     ) {
         let link_selected = self.selected_link_index.is_some();
-        let control_held = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Up => {
                 if link_selected {
                     self.move_selected_link_target_up();
-                } else if control_held {
-                    if let Some(row) = next_non_stopped_row(
-                        self.selected_row,
-                        &self.ordered_keys,
-                        &self.snapshots,
-                        -1,
-                    ) {
-                        self.selected_row = row;
-                        self.selected_link_index = None;
-                        self.selected_link_target_index = 0;
-                    }
                 } else if self.selected_row > 0 {
                     self.selected_row -= 1;
                     self.selected_link_index = None;
@@ -1227,18 +1384,7 @@ impl TuiState {
             KeyCode::Down => {
                 if link_selected {
                     self.move_selected_link_target_down();
-                } else if control_held {
-                    if let Some(row) = next_non_stopped_row(
-                        self.selected_row,
-                        &self.ordered_keys,
-                        &self.snapshots,
-                        1,
-                    ) {
-                        self.selected_row = row;
-                        self.selected_link_index = None;
-                        self.selected_link_target_index = 0;
-                    }
-                } else if self.selected_row < self.ordered_keys.len() {
+                } else if self.selected_row + 1 < self.table_entries().len() {
                     self.selected_row += 1;
                     self.selected_link_index = None;
                     self.selected_link_target_index = 0;
@@ -1366,6 +1512,9 @@ impl TuiState {
                     }
                     return;
                 }
+                if self.selected_task_id().is_some() {
+                    return;
+                }
                 if let Some(key) = self.selected_workspace_key().map(str::to_string) {
                     let archived = self
                         .snapshots
@@ -1464,6 +1613,9 @@ impl TuiState {
                     }
                     return;
                 }
+                if self.selected_task_id().is_some() {
+                    return;
+                }
                 if let Some(key) = self.selected_workspace_key() {
                     let current = self
                         .snapshots
@@ -1478,6 +1630,9 @@ impl TuiState {
                 if link_selected {
                     return;
                 }
+                if self.selected_task_id().is_some() {
+                    return;
+                }
                 if let Some(key) = self.selected_workspace_key() {
                     let Some(snapshot) = self.snapshots.get(key) else {
                         return;
@@ -1488,17 +1643,15 @@ impl TuiState {
                     if snapshot.persistent.assigned_repository.is_none() {
                         return;
                     }
-                    self.issue_input = snapshot
-                        .persistent
-                        .automation_issue
-                        .clone()
-                        .and_then(|issue| issue.rsplit('/').next().map(ToOwned::to_owned))
-                        .unwrap_or_default();
+                    self.issue_input.clear();
                     self.mode = UiMode::EditIssue;
                 }
             }
             KeyCode::Char('s') => {
                 if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_some() {
                     return;
                 }
                 if let Some(key) = self.selected_workspace_key().map(str::to_string) {
@@ -1540,15 +1693,32 @@ impl TuiState {
                 if link_selected {
                     return;
                 }
+                if self.selected_task_id().is_some() {
+                    return;
+                }
                 self.request_selected_workspace_github_status_refresh();
             }
             KeyCode::Char('x') => {
                 if link_selected {
                     return;
                 }
-                if let Some(key) = self.selected_workspace_key().map(str::to_string) {
-                    self.pending_delete_workspace_key = Some(key);
-                    self.mode = UiMode::ConfirmDelete;
+                match self.selected_entry() {
+                    Some(TableEntry::Workspace { workspace_key }) => {
+                        self.pending_delete_target =
+                            Some(PendingDeleteTarget::Workspace { workspace_key });
+                        self.mode = UiMode::ConfirmDelete;
+                    }
+                    Some(TableEntry::Task {
+                        workspace_key,
+                        task_id,
+                    }) => {
+                        self.pending_delete_target = Some(PendingDeleteTarget::Task {
+                            workspace_key,
+                            task_id,
+                        });
+                        self.mode = UiMode::ConfirmDelete;
+                    }
+                    _ => {}
                 }
             }
             KeyCode::Char(ch) => {
@@ -1694,13 +1864,12 @@ impl TuiState {
                     .await
                 {
                     Ok(Some(normalized)) => {
-                        self.status = format!("Assigned issue '{normalized}' to workspace '{key}'");
+                        self.status = format!("Queued issue '{normalized}' for workspace '{key}'");
                         self.mode = UiMode::Normal;
                         self.issue_input.clear();
                     }
                     Ok(None) => {
-                        self.status =
-                            format!("Cleared direct issue assignment for workspace '{key}'");
+                        self.status = format!("No issue queued for workspace '{key}'");
                         self.mode = UiMode::Normal;
                         self.issue_input.clear();
                     }
@@ -1717,26 +1886,50 @@ impl TuiState {
         match key.code {
             KeyCode::Esc => {
                 self.mode = UiMode::Normal;
-                self.pending_delete_workspace_key = None;
+                self.pending_delete_target = None;
             }
             KeyCode::Enter => {
-                let Some(workspace_key) = self.pending_delete_workspace_key.clone() else {
+                let Some(target) = self.pending_delete_target.clone() else {
                     self.mode = UiMode::Normal;
                     return;
                 };
-                match self.service.delete_workspace(&workspace_key).await {
-                    Ok(()) => {
-                        self.status = format!("Deleted workspace '{workspace_key}'");
+                match target {
+                    PendingDeleteTarget::Workspace { workspace_key } => {
+                        match self.service.delete_workspace(&workspace_key).await {
+                            Ok(()) => {
+                                self.status = format!("Deleted workspace '{workspace_key}'");
+                            }
+                            Err(err) => {
+                                self.status = format!(
+                                    "Failed to delete workspace '{workspace_key}': {}",
+                                    err.summary()
+                                );
+                            }
+                        }
                     }
-                    Err(err) => {
-                        self.status = format!(
-                            "Failed to delete workspace '{workspace_key}': {}",
-                            err.summary()
-                        );
-                    }
+                    PendingDeleteTarget::Task {
+                        workspace_key,
+                        task_id,
+                    } => match self
+                        .service
+                        .delete_workspace_task(&workspace_key, &task_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.status = format!(
+                                "Deleted task '{task_id}' from workspace '{workspace_key}'"
+                            );
+                        }
+                        Err(err) => {
+                            self.status = format!(
+                                "Failed to delete task '{task_id}' from workspace '{workspace_key}': {}",
+                                err.summary()
+                            );
+                        }
+                    },
                 }
                 self.mode = UiMode::Normal;
-                self.pending_delete_workspace_key = None;
+                self.pending_delete_target = None;
             }
             _ => {}
         }

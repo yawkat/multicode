@@ -288,6 +288,7 @@ mod tests {
                 archive_format: None,
                 agent_provided: Default::default(),
                 custom_links: Default::default(),
+                tasks: Vec::new(),
             };
             let snapshot_path = storage_dir.join("alpha.json");
             tokio::fs::write(
@@ -377,6 +378,7 @@ mod tests {
                 archive_format: None,
                 agent_provided: Default::default(),
                 custom_links: Default::default(),
+                tasks: Vec::new(),
             };
             tokio::fs::write(
                 storage_dir.join("beta.json"),
@@ -496,6 +498,7 @@ mod tests {
                 archive_format: None,
                 agent_provided: Default::default(),
                 custom_links: Default::default(),
+                tasks: Vec::new(),
             };
             let snapshot_path = storage_dir.join("gamma.json");
             tokio::fs::write(
