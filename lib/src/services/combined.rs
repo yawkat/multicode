@@ -288,6 +288,10 @@ impl CombinedService {
             let Some(issue_url) = normalized.clone() else {
                 return false;
             };
+            snapshot
+                .persistent
+                .ignored_issue_urls
+                .retain(|ignored| ignored != &issue_url);
             if snapshot
                 .persistent
                 .tasks
@@ -414,6 +418,7 @@ impl CombinedService {
             }
             snapshot.persistent.assigned_repository = repository.clone();
             snapshot.persistent.automation_issue = None;
+            snapshot.persistent.ignored_issue_urls.clear();
             snapshot.persistent.tasks.clear();
             snapshot.active_task_id = None;
             snapshot.task_states.clear();
@@ -589,6 +594,15 @@ impl CombinedService {
         key: &str,
         task_id: &str,
     ) -> Result<(), CombinedServiceError> {
+        self.remove_workspace_task(key, task_id, false).await
+    }
+
+    pub async fn remove_workspace_task(
+        &self,
+        key: &str,
+        task_id: &str,
+        ignore_future_scans: bool,
+    ) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
         let workspace = self.manager.get_workspace(&key)?;
         let snapshot = workspace.subscribe().borrow().clone();
@@ -636,6 +650,18 @@ impl CombinedService {
             let before = next.persistent.tasks.len();
             next.persistent.tasks.retain(|entry| entry.id != task_id);
             if next.persistent.tasks.len() != before {
+                changed = true;
+            }
+            if ignore_future_scans
+                && !next
+                    .persistent
+                    .ignored_issue_urls
+                    .iter()
+                    .any(|ignored| ignored == &task.issue_url)
+            {
+                next.persistent
+                    .ignored_issue_urls
+                    .push(task.issue_url.clone());
                 changed = true;
             }
             if next.task_states.remove(task_id).is_some() {
@@ -3160,6 +3186,76 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
     }
 
     #[test]
+    fn assign_workspace_issue_removes_matching_ignored_issue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            let workspace = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist");
+            workspace.update(|snapshot| {
+                snapshot
+                    .persistent
+                    .ignored_issue_urls
+                    .push("https://github.com/example/repo/issues/42".to_string());
+                true
+            });
+
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("issue assignment should succeed");
+
+            let snapshot = workspace.subscribe().borrow().clone();
+            assert!(snapshot.persistent.ignored_issue_urls.is_empty());
+            assert_eq!(snapshot.persistent.tasks.len(), 1);
+        });
+    }
+
+    #[test]
     fn assign_workspace_issue_does_not_duplicate_existing_task() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3604,6 +3700,85 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
             assert!(snapshot.automation_agent_state.is_none());
             assert!(snapshot.automation_session_status.is_none());
             assert!(!snapshot.task_states.contains_key(&task_id));
+        });
+    }
+
+    #[test]
+    fn remove_workspace_task_can_ignore_issue_for_future_scans() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("issue assignment should succeed");
+
+            let workspace = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist");
+            let task_id = workspace
+                .subscribe()
+                .borrow()
+                .persistent
+                .tasks
+                .first()
+                .expect("task should exist")
+                .id
+                .clone();
+
+            service
+                .remove_workspace_task("alpha", &task_id, true)
+                .await
+                .expect("task removal with ignore should succeed");
+
+            let snapshot = workspace.subscribe().borrow().clone();
+            assert!(snapshot.persistent.tasks.is_empty());
+            assert_eq!(
+                snapshot.persistent.ignored_issue_urls,
+                vec!["https://github.com/example/repo/issues/42".to_string()]
+            );
         });
     }
 

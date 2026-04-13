@@ -490,6 +490,25 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                 );
             }
         }
+    } else if app.mode == UiMode::ConfirmTaskRemoval
+        && let Some(PendingDeleteTarget::Task {
+            workspace_key,
+            task_id,
+        }) = app.pending_delete_target.as_ref()
+    {
+        let task_label = app
+            .snapshots
+            .get(workspace_key)
+            .and_then(|snapshot| task_persistent_snapshot(snapshot, task_id))
+            .map(task_row_label)
+            .unwrap_or_else(|| task_id.clone());
+        draw_confirm_task_removal_modal(
+            frame,
+            &format!(
+                "Remove task '{task_label}' from workspace '{workspace_key}'? This removes the issue from the queue."
+            ),
+            app.pending_task_removal_action,
+        );
     } else if app.mode == UiMode::StartingModal
         && let Some(workspace_key) = app.starting_workspace_key.as_deref()
     {
@@ -807,6 +826,75 @@ fn draw_confirm_delete_modal(frame: &mut Frame, title: &str, message: &str) {
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray)),
         rows[2],
+    );
+}
+
+fn draw_confirm_task_removal_modal(
+    frame: &mut Frame,
+    message: &str,
+    selected_action: TaskRemovalAction,
+) {
+    let area = centered_rect_fixed(
+        CONFIRM_TASK_REMOVAL_MODAL_WIDTH,
+        CONFIRM_TASK_REMOVAL_MODAL_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Remove issue ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        rows[1],
+    );
+
+    let actions = [
+        TaskRemovalAction::Remove,
+        TaskRemovalAction::RemoveAndIgnore,
+        TaskRemovalAction::Cancel,
+    ];
+    let mut spans = Vec::new();
+    for (index, action) in actions.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let style = if action == selected_action {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(format!(" {} ", action.label()), style));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new("Left/Right to choose · Enter to confirm · Esc to cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[3],
     );
 }
 

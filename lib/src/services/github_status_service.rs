@@ -217,6 +217,20 @@ impl CachedLinkStatus {
         }
     }
 
+    fn new_pr_error_placeholder(reference: GithubLinkRef, now_epoch_seconds: i64) -> Self {
+        Self {
+            reference,
+            issue_state: None,
+            pr_state: Some(GithubPrState::Open),
+            build_state: Some(GithubPrBuildState::Building),
+            review_state: Some(GithubPrReviewState::None),
+            pr_is_draft: Some(false),
+            fetched_at_epoch_seconds: Some(now_epoch_seconds),
+            refresh_after_epoch_seconds: Some(now_epoch_seconds),
+            last_error: None,
+        }
+    }
+
     fn issue_status(&self) -> Option<GithubIssueStatus> {
         Some(GithubIssueStatus {
             state: self.issue_state?,
@@ -510,11 +524,24 @@ impl GithubStatusService {
                 Err(error) => {
                     let now = now_epoch_seconds();
                     let mut next_status = current_status.take().unwrap_or_else(|| {
-                        CachedLinkStatus::new_pending(entry.reference.clone(), now)
+                        match entry.reference.kind {
+                            GithubLinkKind::PullRequest => {
+                                CachedLinkStatus::new_pr_error_placeholder(
+                                    entry.reference.clone(),
+                                    now,
+                                )
+                            }
+                            GithubLinkKind::Issue => {
+                                CachedLinkStatus::new_pending(entry.reference.clone(), now)
+                            }
+                        }
                     });
                     next_status.last_error = Some(error.to_string());
                     next_status.refresh_after_epoch_seconds =
                         Some(now + FETCH_ERROR_RETRY_INTERVAL.as_secs() as i64);
+                    if let Some(status) = next_status.github_status() {
+                        entry.sender.send_replace(Some(status));
+                    }
                     if let Some(row) = next_status.to_row()
                         && let Err(persist_error) =
                             upsert_cache_row(self.database.pool().clone(), row).await
@@ -1593,6 +1620,46 @@ mod tests {
         assert_eq!(
             next_refresh_wait_duration(Some(&status), now + 60),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn pr_error_placeholder_produces_renderable_and_persistable_status() {
+        let now = 2_000_i64;
+        let status = CachedLinkStatus::new_pr_error_placeholder(
+            GithubLinkRef {
+                kind: GithubLinkKind::PullRequest,
+                url: "https://github.com/owner/repo/pull/7".to_string(),
+                host: "github.com".to_string(),
+                owner: "owner".to_string(),
+                repo: "repo".to_string(),
+                resource_number: 7,
+            },
+            now,
+        );
+
+        assert_eq!(
+            status.github_status(),
+            Some(GithubStatus::Pr(GithubPrStatus {
+                state: GithubPrState::Open,
+                build: GithubPrBuildState::Building,
+                review: GithubPrReviewState::None,
+                is_draft: false,
+                fetched_at: system_time_from_epoch_seconds(now),
+            }))
+        );
+
+        let row = status.to_row().expect("placeholder should persist");
+        let round_trip = CachedLinkStatus::from_row(row).expect("placeholder should reload");
+        assert_eq!(
+            round_trip.github_status(),
+            Some(GithubStatus::Pr(GithubPrStatus {
+                state: GithubPrState::Open,
+                build: GithubPrBuildState::Building,
+                review: GithubPrReviewState::None,
+                is_draft: false,
+                fetched_at: system_time_from_epoch_seconds(now),
+            }))
         );
     }
 

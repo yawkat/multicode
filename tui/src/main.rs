@@ -76,6 +76,8 @@ const CUSTOM_LINK_MODAL_WIDTH: u16 = 72;
 const CUSTOM_LINK_MODAL_HEIGHT: u16 = 10;
 const CONFIRM_DELETE_MODAL_WIDTH: u16 = 72;
 const CONFIRM_DELETE_MODAL_HEIGHT: u16 = 9;
+const CONFIRM_TASK_REMOVAL_MODAL_WIDTH: u16 = 76;
+const CONFIRM_TASK_REMOVAL_MODAL_HEIGHT: u16 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiMode {
@@ -85,6 +87,7 @@ enum UiMode {
     EditIssue,
     EditCustomLink,
     ConfirmDelete,
+    ConfirmTaskRemoval,
     StartingModal,
     ToolProgressModal,
 }
@@ -110,6 +113,40 @@ enum PendingDeleteTarget {
         workspace_key: String,
         task_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TaskRemovalAction {
+    #[default]
+    Remove,
+    RemoveAndIgnore,
+    Cancel,
+}
+
+impl TaskRemovalAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Remove => "Remove Issue",
+            Self::RemoveAndIgnore => "Remove and Ignore Issue",
+            Self::Cancel => "Cancel",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Remove => Self::RemoveAndIgnore,
+            Self::RemoveAndIgnore => Self::Cancel,
+            Self::Cancel => Self::Remove,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Remove => Self::Cancel,
+            Self::RemoveAndIgnore => Self::Remove,
+            Self::Cancel => Self::RemoveAndIgnore,
+        }
+    }
 }
 
 struct TuiState {
@@ -138,6 +175,7 @@ struct TuiState {
     custom_link_action: Option<CustomLinkModalAction>,
     custom_link_original_value: Option<String>,
     pending_delete_target: Option<PendingDeleteTarget>,
+    pending_task_removal_action: TaskRemovalAction,
     attached_session: Option<AttachedSession>,
     starting_workspace_key: Option<String>,
     started_wait_since: Option<Instant>,
@@ -1237,7 +1275,7 @@ fn help_line(
                         if selected_workspace_can_compare {
                             push_hotkey(&mut spans, "c", " compare  ");
                         }
-                        push_hotkey(&mut spans, "x", " delete  ");
+                        push_hotkey(&mut spans, "x", " remove issue  ");
                         push_hotkey(&mut spans, "q", " quit");
                         if !status.is_empty() {
                             spans.push(Span::raw(" | "));
@@ -1341,6 +1379,12 @@ fn help_line(
         }
         UiMode::ConfirmDelete => {
             spans.push(Span::raw("Delete item: "));
+            push_hotkey(&mut spans, "Enter", " confirm, ");
+            push_hotkey(&mut spans, "Esc", " cancel");
+        }
+        UiMode::ConfirmTaskRemoval => {
+            spans.push(Span::raw("Remove issue: "));
+            push_hotkey(&mut spans, "←/→", " select action, ");
             push_hotkey(&mut spans, "Enter", " confirm, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }

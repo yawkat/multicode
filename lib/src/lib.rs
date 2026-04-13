@@ -131,6 +131,8 @@ pub struct PersistentWorkspaceSnapshot {
     #[serde(default)]
     pub custom_links: CustomLinksPersistentSnapshot,
     #[serde(default)]
+    pub ignored_issue_urls: Vec<String>,
+    #[serde(default)]
     pub tasks: Vec<WorkspaceTaskPersistentSnapshot>,
 }
 
@@ -146,6 +148,7 @@ impl Default for PersistentWorkspaceSnapshot {
             archive_format: None,
             agent_provided: AgentProvidedPersistentSnapshot::default(),
             custom_links: CustomLinksPersistentSnapshot::default(),
+            ignored_issue_urls: Vec::new(),
             tasks: Vec::new(),
         }
     }

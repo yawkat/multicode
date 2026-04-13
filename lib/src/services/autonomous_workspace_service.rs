@@ -155,6 +155,21 @@ async fn watch_workspace(
 
         let assigned_repository = assigned_repository.expect("checked above");
         let repository_label = compact_repository_label(&assigned_repository);
+        if snapshot.persistent.automation_paused {
+            watched_issue_url = None;
+            issue_status_rx = None;
+            task_issue_status_rxs.clear();
+            task_pr_status_rxs.clear();
+            next_scan_at = None;
+            blocked_start_scan_request_nonce = None;
+            previous_active_issue_url = None;
+            previous_root_status = snapshot.root_session_status;
+            set_paused_automation_state(&workspace, repository_label);
+            if workspace_rx.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
         sync_task_runtime_state(&workspace, &snapshot);
         snapshot = workspace.subscribe().borrow().clone();
         recover_codex_task_sessions(
@@ -288,22 +303,6 @@ async fn watch_workspace(
                 scan_requested,
                 "autonomous workspace loop snapshot"
             );
-        }
-        if snapshot.persistent.automation_paused {
-            watched_issue_url = None;
-            issue_status_rx = None;
-            task_issue_status_rxs.clear();
-            task_pr_status_rxs.clear();
-            next_scan_at = None;
-            blocked_start_scan_request_nonce = None;
-            previous_active_issue_url = None;
-            previous_root_status = snapshot.root_session_status;
-            clear_automation_runtime_state(&workspace);
-            set_automation_status(&workspace, Some(format!("Paused {repository_label}")));
-            if workspace_rx.changed().await.is_err() {
-                break;
-            }
-            continue;
         }
         if scan_requested {
             blocked_start_scan_request_nonce = None;
@@ -1186,6 +1185,11 @@ fn clear_automation_runtime_state(workspace: &Workspace) {
     });
 }
 
+fn set_paused_automation_state(workspace: &Workspace, repository_label: &str) {
+    clear_automation_runtime_state(workspace);
+    set_automation_status(workspace, Some(format!("Paused {repository_label}")));
+}
+
 fn lease_task_issue(workspace: &Workspace, snapshot: &WorkspaceSnapshot, issue_url: &str) {
     let next_task_id = task_id_for_issue(snapshot, issue_url);
     workspace.update(|next| {
@@ -1384,6 +1388,7 @@ fn reserved_issue_urls(
                 .iter()
                 .map(|task| task.issue_url.clone()),
         );
+        urls.extend(snapshot.persistent.ignored_issue_urls.iter().cloned());
     }
     for key in workspace_keys {
         if key == current_workspace_key {
@@ -3300,7 +3305,10 @@ fn pull_request_has_closing_issue_reference(
             format!("{keyword} {issue_url}"),
         ];
         refs.iter()
-            .any(|candidate| body.contains(candidate) || title.contains(candidate))
+            .any(|candidate| {
+                contains_standalone_reference(&body, candidate)
+                    || contains_standalone_reference(&title, candidate)
+            })
     })
 }
 
@@ -3317,20 +3325,71 @@ fn pull_request_mentions_issue_reference(
     [pr.title.as_str(), pr.body.as_deref().unwrap_or_default()]
         .iter()
         .any(|text| {
-            text.contains(&issue_number_ref)
-                || text.contains(&repo_issue_ref)
-                || text.to_ascii_lowercase().contains(&issue_text)
-                || text.contains(issue_url)
+            contains_standalone_reference(text, &issue_number_ref)
+                || contains_standalone_reference(text, &repo_issue_ref)
+                || contains_standalone_reference(&text.to_ascii_lowercase(), &issue_text)
+                || contains_standalone_reference(text, issue_url)
         })
 }
 
 fn pull_request_head_matches_issue_number(issue: &SelectedIssue, pr: &SelectedPullRequest) -> bool {
     let issue_number = issue.number.to_string();
     pr.head_ref_name.as_deref().is_some_and(|head_ref_name| {
-        head_ref_name
+        let segments = head_ref_name
             .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .any(|segment| segment == issue_number)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+
+        segments.iter().enumerate().any(|(index, segment)| {
+            if *segment != issue_number {
+                return false;
+            }
+            if issue.number >= 10 {
+                return true;
+            }
+
+            index
+                .checked_sub(1)
+                .and_then(|previous| segments.get(previous))
+                .copied()
+                .is_some_and(is_issue_branch_keyword)
+                || segments
+                    .get(index + 1)
+                    .copied()
+                    .is_some_and(is_issue_branch_keyword)
+        })
     })
+}
+
+fn contains_standalone_reference(text: &str, reference: &str) -> bool {
+    if reference.is_empty() {
+        return false;
+    }
+
+    let mut start_index = 0usize;
+    while let Some(offset) = text[start_index..].find(reference) {
+        let match_start = start_index + offset;
+        let match_end = match_start + reference.len();
+        let previous = text[..match_start].chars().next_back();
+        let next = text[match_end..].chars().next();
+        if is_reference_boundary(previous) && is_reference_boundary(next) {
+            return true;
+        }
+        start_index = match_end;
+    }
+
+    false
+}
+
+fn is_reference_boundary(character: Option<char>) -> bool {
+    character.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+}
+
+fn is_issue_branch_keyword(segment: &str) -> bool {
+    matches!(
+        segment,
+        "issue" | "issues" | "fix" | "fixes" | "fixed" | "bug" | "bugs" | "feature"
+    )
 }
 
 async fn find_or_create_dependency_upgrade_issue(
@@ -4216,6 +4275,58 @@ mod tests {
     }
 
     #[test]
+    fn discover_issue_backing_pr_url_does_not_match_partial_issue_reference() {
+        let issue = test_issue(
+            7,
+            "Redis issue",
+            "https://github.com/example/repo/issues/7",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+        let unrelated = test_pull_request(
+            735,
+            "chore(deps): update softprops/action-gh-release action to v2.6.2",
+            "https://github.com/example/repo/pull/735",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            Some(
+                "This release fixes #705, #708, and #741 while discussing issue #764 in the changelog.",
+            ),
+        );
+
+        let discovered = discover_issue_backing_pr_url("example/repo", &issue, &[unrelated]);
+
+        assert_eq!(discovered, None);
+    }
+
+    #[test]
+    fn discover_issue_backing_pr_url_allows_single_digit_issue_branch_with_keyword() {
+        let issue = test_issue(
+            7,
+            "Redis issue",
+            "https://github.com/example/repo/issues/7",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+        let mut branch_match = test_pull_request(
+            22,
+            "Fix redis issue",
+            "https://github.com/example/repo/pull/22",
+            vec![],
+            None,
+        );
+        branch_match.head_ref_name = Some("issue-7-redis-timeout".to_string());
+
+        let discovered = discover_issue_backing_pr_url("example/repo", &issue, &[branch_match]);
+
+        assert_eq!(
+            discovered.as_deref(),
+            Some("https://github.com/example/repo/pull/22")
+        );
+    }
+
+    #[test]
     fn issue_number_from_url_extracts_issue_number() {
         assert_eq!(
             issue_number_from_url("https://github.com/example/repo/issues/322"),
@@ -4497,6 +4608,72 @@ mod tests {
         assert_eq!(task_state.session_id.as_deref(), Some("thread-48"));
         assert_eq!(task_state.agent_state, Some(AutomationAgentState::Review));
         assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
+        assert!(!task_state.waiting_on_vm);
+    }
+
+    #[test]
+    fn set_paused_automation_state_is_idempotent() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.persistent.assigned_repository = Some("example/repo".to_string());
+            snapshot.active_task_id = Some("task-48".to_string());
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-48".to_string(),
+                    "https://github.com/example/repo/issues/48".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.automation_session_id = Some("thread-48".to_string());
+            snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+            snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+            snapshot.task_states.insert(
+                "task-48".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-48".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    waiting_on_vm: true,
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_paused_automation_state(&workspace, "repo");
+        let paused_once = workspace.subscribe().borrow().clone();
+        set_paused_automation_state(&workspace, "repo");
+        let paused_twice = workspace.subscribe().borrow().clone();
+
+        assert_eq!(paused_once.automation_status, paused_twice.automation_status);
+        assert_eq!(
+            paused_once.automation_session_id,
+            paused_twice.automation_session_id
+        );
+        assert_eq!(
+            paused_once.automation_agent_state,
+            paused_twice.automation_agent_state
+        );
+        assert_eq!(
+            paused_once.automation_session_status,
+            paused_twice.automation_session_status
+        );
+        assert_eq!(paused_once.task_states, paused_twice.task_states);
+        assert_eq!(
+            paused_twice.automation_status.as_deref(),
+            Some("Paused repo")
+        );
+        assert!(paused_twice.automation_session_id.is_none());
+        assert!(paused_twice.automation_agent_state.is_none());
+        assert!(paused_twice.automation_session_status.is_none());
+        let task_state = paused_twice
+            .task_states
+            .get("task-48")
+            .expect("task state should remain");
+        assert!(task_state.session_id.is_none());
+        assert!(task_state.agent_state.is_none());
+        assert!(task_state.session_status.is_none());
         assert!(!task_state.waiting_on_vm);
     }
 

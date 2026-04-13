@@ -11,6 +11,8 @@ mod tests {
     use crate::app::{
         compact_github_tooltip_target, count_codex_session_turn_metrics,
         last_user_message_from_codex_session_log_contents, restored_selected_row,
+        snapshot_attach_cwd_for_selection,
+        snapshot_attach_target_for_selection,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach,
         should_resume_codex_task_after_incomplete_attached_turn, starting_modal_failure_status,
@@ -775,6 +777,61 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_attach_target_for_selection_falls_back_to_workspace_attach_when_paused_task_has_no_session(
+    ) {
+        let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
+        started.root_session_id = Some("ses-root-1".to_string());
+        started.persistent.automation_paused = true;
+        assign_active_task(
+            &mut started,
+            "https://github.com/example/repo/issues/42",
+        );
+
+        let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
+            .expect("paused task selection should fall back to workspace attach");
+
+        assert_eq!(
+            target,
+            AttachTarget::Opencode {
+                uri: "http://127.0.0.1:3000/".to_string(),
+                username: "opencode".to_string(),
+                password: "secret".to_string(),
+                session_id: Some("ses-root-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_attach_target_for_selection_prefers_task_attach_when_task_session_exists() {
+        let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
+        started.root_session_id = Some("ses-root-1".to_string());
+        assign_active_task(
+            &mut started,
+            "https://github.com/example/repo/issues/42",
+        );
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("ses-task-42".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
+            .expect("task session should still be preferred");
+
+        assert_eq!(
+            target,
+            AttachTarget::Opencode {
+                uri: "http://127.0.0.1:3000/".to_string(),
+                username: "opencode".to_string(),
+                password: "secret".to_string(),
+                session_id: Some("ses-task-42".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn attach_cli_args_use_codex_resume_for_codex_target() {
         let target = AttachTarget::Codex {
             uri: "ws://127.0.0.1:3456".to_string(),
@@ -1251,6 +1308,47 @@ mod tests {
         assert_eq!(
             compare_target_path(&started, &HashMap::new(), workspace.path()),
             None
+        );
+    }
+
+    #[test]
+    fn snapshot_attach_cwd_for_selection_prefers_task_checkout() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-serialization".to_string());
+        assign_active_task(
+            &mut started,
+            "https://github.com/micronaut-projects/micronaut-serialization/issues/921",
+        );
+        let workspace = TestDir::new();
+        let task_checkout = workspace.path().join("work/micronaut-serialization-921");
+        fs::create_dir_all(&task_checkout).expect("task checkout should be created");
+        fs::write(task_checkout.join(".git"), "gitdir: /tmp/mock-worktree\n")
+            .expect("task checkout git file should be created");
+
+        assert_eq!(
+            snapshot_attach_cwd_for_selection(
+                &started,
+                Some("task-42"),
+                &HashMap::new(),
+                workspace.path(),
+            ),
+            Some(task_checkout)
+        );
+    }
+
+    #[test]
+    fn snapshot_attach_cwd_for_selection_falls_back_to_workspace_checkout() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-serialization".to_string());
+        let workspace = TestDir::new();
+        let repo_root = workspace.path().join("micronaut-serialization/.git");
+        fs::create_dir_all(&repo_root).expect("workspace repo should be created");
+
+        assert_eq!(
+            snapshot_attach_cwd_for_selection(&started, None, &HashMap::new(), workspace.path()),
+            Some(workspace.path().join("micronaut-serialization"))
         );
     }
 
@@ -1999,7 +2097,7 @@ mod tests {
 
         assert!(text.contains("Enter attach"));
         assert!(text.contains("c compare"));
-        assert!(text.contains("x delete"));
+        assert!(text.contains("x remove issue"));
         assert!(!text.contains("i issue"));
         assert!(!text.contains("d edit description"));
         assert!(!text.contains("a archive"));
@@ -2112,6 +2210,36 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Delete item:"));
+        assert!(text.contains("Enter"));
+    }
+
+    #[test]
+    fn help_line_shows_confirm_task_removal_message() {
+        let line = help_line(
+            UiMode::ConfirmTaskRemoval,
+            1,
+            1,
+            Some(&snapshot(false, None)),
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Remove issue:"));
+        assert!(text.contains("←/→"));
         assert!(text.contains("Enter"));
     }
 

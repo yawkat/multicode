@@ -404,6 +404,7 @@ impl TuiState {
             custom_link_action: None,
             custom_link_original_value: None,
             pending_delete_target: None,
+            pending_task_removal_action: TaskRemovalAction::default(),
             attached_session: None,
             starting_workspace_key: None,
             started_wait_since: None,
@@ -516,6 +517,12 @@ impl TuiState {
                 UiMode::ConfirmDelete => {
                     self.mode = UiMode::Normal;
                     self.pending_delete_target = None;
+                    self.pending_task_removal_action = TaskRemovalAction::default();
+                }
+                UiMode::ConfirmTaskRemoval => {
+                    self.mode = UiMode::Normal;
+                    self.pending_delete_target = None;
+                    self.pending_task_removal_action = TaskRemovalAction::default();
                 }
                 _ => {}
             }
@@ -557,19 +564,22 @@ impl TuiState {
             }
         }
 
-        if self.mode == UiMode::ConfirmDelete
-            && self
-                .pending_delete_target
-                .as_ref()
-                .is_some_and(|target| match target {
-                    PendingDeleteTarget::Workspace { workspace_key }
-                    | PendingDeleteTarget::Task { workspace_key, .. } => {
-                        !self.snapshots.contains_key(workspace_key)
-                    }
-                })
+        if matches!(
+            self.mode,
+            UiMode::ConfirmDelete | UiMode::ConfirmTaskRemoval
+        ) && self
+            .pending_delete_target
+            .as_ref()
+            .is_some_and(|target| match target {
+                PendingDeleteTarget::Workspace { workspace_key }
+                | PendingDeleteTarget::Task { workspace_key, .. } => {
+                    !self.snapshots.contains_key(workspace_key)
+                }
+            })
         {
             self.mode = UiMode::Normal;
             self.pending_delete_target = None;
+            self.pending_task_removal_action = TaskRemovalAction::default();
         }
     }
 
@@ -1074,12 +1084,7 @@ impl TuiState {
             .snapshots
             .get(key)
             .ok_or_else(|| io::Error::other(format!("workspace snapshot missing for '{key}'")))?;
-        if let Some(task_id) = self.selected_task_id()
-            && let Some(task_state) = task_runtime_snapshot(snapshot, task_id)
-        {
-            return task_attach_target(snapshot, task_state);
-        }
-        workspace_attach_target(snapshot)
+        snapshot_attach_target_for_selection(snapshot, self.selected_task_id())
     }
 
     fn record_attached_session(&mut self, key: &str, target: &AttachTarget) {
@@ -1148,6 +1153,17 @@ impl TuiState {
         )]
     }
 
+    fn attach_cwd_for_workspace(&self, key: &str) -> Option<PathBuf> {
+        let snapshot = self.snapshots.get(key)?;
+        let workspace_path = self.service.workspace_directory_path().join(key);
+        snapshot_attach_cwd_for_selection(
+            snapshot,
+            self.selected_task_id(),
+            &self.workspace_link_validation_results,
+            &workspace_path,
+        )
+    }
+
     pub(crate) async fn handle_key(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -1164,6 +1180,7 @@ impl TuiState {
             UiMode::EditIssue => self.handle_issue_key(key).await,
             UiMode::EditCustomLink => self.handle_custom_link_key(key),
             UiMode::ConfirmDelete => self.handle_confirm_delete_key(key).await,
+            UiMode::ConfirmTaskRemoval => self.handle_confirm_task_removal_key(key).await,
             UiMode::StartingModal => {}
             UiMode::ToolProgressModal => self.handle_tool_progress_key(key),
         }
@@ -1193,6 +1210,7 @@ impl TuiState {
                     terminal,
                     self.service.agent_command(),
                     &target,
+                    self.attach_cwd_for_workspace(&key).as_deref(),
                     &self.attach_env_for_workspace(&key),
                     &key,
                     &custom_description,
@@ -1647,6 +1665,7 @@ impl TuiState {
             terminal,
             &inherited_env,
             tmux_command,
+            None,
             workspace_key,
             &custom_description,
         )
@@ -1700,6 +1719,7 @@ impl TuiState {
             terminal,
             &inherited_env,
             tmux_command,
+            None,
             workspace_key,
             &custom_description,
         )
@@ -1939,6 +1959,7 @@ impl TuiState {
                                         terminal,
                                         self.service.agent_command(),
                                         &target,
+                                        self.attach_cwd_for_workspace(&key).as_deref(),
                                         &self.attach_env_for_workspace(&key),
                                         &key,
                                         &custom_description,
@@ -2248,6 +2269,7 @@ impl TuiState {
                     Some(TableEntry::Workspace { workspace_key }) => {
                         self.pending_delete_target =
                             Some(PendingDeleteTarget::Workspace { workspace_key });
+                        self.pending_task_removal_action = TaskRemovalAction::default();
                         self.mode = UiMode::ConfirmDelete;
                     }
                     Some(TableEntry::Task {
@@ -2258,7 +2280,8 @@ impl TuiState {
                             workspace_key,
                             task_id,
                         });
-                        self.mode = UiMode::ConfirmDelete;
+                        self.pending_task_removal_action = TaskRemovalAction::default();
+                        self.mode = UiMode::ConfirmTaskRemoval;
                     }
                     _ => {}
                 }
@@ -2429,6 +2452,7 @@ impl TuiState {
             KeyCode::Esc => {
                 self.mode = UiMode::Normal;
                 self.pending_delete_target = None;
+                self.pending_task_removal_action = TaskRemovalAction::default();
             }
             KeyCode::Enter => {
                 let Some(target) = self.pending_delete_target.clone() else {
@@ -2472,6 +2496,82 @@ impl TuiState {
                 }
                 self.mode = UiMode::Normal;
                 self.pending_delete_target = None;
+                self.pending_task_removal_action = TaskRemovalAction::default();
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_confirm_task_removal_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = UiMode::Normal;
+                self.pending_delete_target = None;
+                self.pending_task_removal_action = TaskRemovalAction::default();
+            }
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+                self.pending_task_removal_action = self.pending_task_removal_action.previous();
+            }
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                self.pending_task_removal_action = self.pending_task_removal_action.next();
+            }
+            KeyCode::Enter => {
+                let Some(PendingDeleteTarget::Task {
+                    workspace_key,
+                    task_id,
+                }) = self.pending_delete_target.clone()
+                else {
+                    self.mode = UiMode::Normal;
+                    self.pending_delete_target = None;
+                    self.pending_task_removal_action = TaskRemovalAction::default();
+                    return;
+                };
+
+                match self.pending_task_removal_action {
+                    TaskRemovalAction::Remove => {
+                        match self
+                            .service
+                            .remove_workspace_task(&workspace_key, &task_id, false)
+                            .await
+                        {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "Removed task '{task_id}' from workspace '{workspace_key}'"
+                                );
+                            }
+                            Err(err) => {
+                                self.status = format!(
+                                    "Failed to remove task '{task_id}' from workspace '{workspace_key}': {}",
+                                    err.summary()
+                                );
+                            }
+                        }
+                    }
+                    TaskRemovalAction::RemoveAndIgnore => {
+                        match self
+                            .service
+                            .remove_workspace_task(&workspace_key, &task_id, true)
+                            .await
+                        {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "Removed and ignored task '{task_id}' in workspace '{workspace_key}'"
+                                );
+                            }
+                            Err(err) => {
+                                self.status = format!(
+                                    "Failed to remove and ignore task '{task_id}' from workspace '{workspace_key}': {}",
+                                    err.summary()
+                                );
+                            }
+                        }
+                    }
+                    TaskRemovalAction::Cancel => {}
+                }
+
+                self.mode = UiMode::Normal;
+                self.pending_delete_target = None;
+                self.pending_task_removal_action = TaskRemovalAction::default();
             }
             _ => {}
         }
@@ -2586,6 +2686,36 @@ impl TuiState {
             _ => {}
         }
     }
+}
+
+pub(crate) fn snapshot_attach_target_for_selection(
+    snapshot: &WorkspaceSnapshot,
+    selected_task_id: Option<&str>,
+) -> io::Result<AttachTarget> {
+    if let Some(task_id) = selected_task_id
+        && let Some(task_state) = task_runtime_snapshot(snapshot, task_id)
+    {
+        if snapshot.persistent.automation_paused && task_state.session_id.is_none() {
+            return workspace_attach_target(snapshot);
+        }
+        return task_attach_target(snapshot, task_state);
+    }
+    workspace_attach_target(snapshot)
+}
+
+pub(crate) fn snapshot_attach_cwd_for_selection(
+    snapshot: &WorkspaceSnapshot,
+    selected_task_id: Option<&str>,
+    validations: &HashMap<WorkspaceLink, WorkspaceLinkValidationResult>,
+    workspace_path: &Path,
+) -> Option<PathBuf> {
+    if let Some(task_id) = selected_task_id
+        && let Some(task) = task_persistent_snapshot(snapshot, task_id)
+    {
+        return compare_target_path_for_task(snapshot, task, workspace_path);
+    }
+
+    compare_target_path(snapshot, validations, workspace_path)
 }
 
 pub(crate) fn starting_modal_failure_status(

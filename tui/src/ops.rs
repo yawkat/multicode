@@ -386,6 +386,7 @@ pub(crate) async fn attach_in_tmux(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent_command: &str,
     target: &AttachTarget,
+    cwd: Option<&Path>,
     extra_env: &[(String, String)],
     workspace_key: &str,
     custom_description: &str,
@@ -412,6 +413,7 @@ pub(crate) async fn attach_in_tmux(
         terminal,
         &session_env,
         attach_command,
+        cwd,
         workspace_key,
         custom_description,
     )
@@ -422,6 +424,7 @@ pub(crate) async fn run_tmux_new_session_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     env: &[(String, String)],
     command: Vec<String>,
+    cwd: Option<&Path>,
     workspace_key: &str,
     custom_description: &str,
 ) -> io::Result<()> {
@@ -434,7 +437,7 @@ pub(crate) async fn run_tmux_new_session_command(
             command = %debug_command,
             "tmux unavailable; running interactive command directly"
         );
-        return run_interactive_command(terminal, env, &command).await;
+        return run_interactive_command(terminal, env, &command, cwd).await;
     }
 
     restore_terminal(terminal)?;
@@ -461,11 +464,11 @@ pub(crate) async fn run_tmux_new_session_command(
 
     let mut create_process = Command::new("tmux");
     create_process.env("TERM", "xterm-256color");
+    create_process.arg("new-session").arg("-d").arg("-s").arg(&session_name);
+    if let Some(cwd) = cwd {
+        create_process.arg("-c").arg(cwd);
+    }
     let create_result = create_process
-        .arg("new-session")
-        .arg("-d")
-        .arg("-s")
-        .arg(&session_name)
         .arg("env")
         .args(env.iter().map(|(name, value)| format!("{name}={value}")))
         .args(command)
@@ -577,20 +580,24 @@ async fn run_interactive_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     env: &[(String, String)],
     command: &[String],
+    cwd: Option<&Path>,
 ) -> io::Result<()> {
     let Some((program, args)) = command.split_first() else {
         return Err(io::Error::other("interactive command must not be empty"));
     };
 
     restore_terminal(terminal)?;
-    let status = Command::new(program)
+    let mut process = Command::new(program);
+    process
         .args(args)
         .envs(env.iter().cloned())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await;
+        .stderr(Stdio::inherit());
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    let status = process.status().await;
     let setup_result = setup_terminal().map(|new_terminal| {
         *terminal = new_terminal;
     });
