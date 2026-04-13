@@ -3,8 +3,13 @@ name: autonomous-state
 description: Maintain the multicode autonomous state file while working autonomously so the host can detect working, question, review, idle, and stalled states.
 ---
 
-When operating in a multicode autonomous workspace, the environment variable `MULTICODE_AUTONOMOUS_STATE_PATH`
-points to a writable state file owned by multicode. You must keep this file updated.
+When operating in a multicode autonomous workspace, multicode may either:
+
+- provide an explicit task-specific state file path in the prompt, or
+- provide a fallback path via the environment variable `MULTICODE_AUTONOMOUS_STATE_PATH`.
+
+Always prefer the explicit task-specific path from the prompt when one is provided. Only fall back to
+`MULTICODE_AUTONOMOUS_STATE_PATH` when no explicit task file path was given.
 
 Write exactly one line to that file.
 
@@ -25,8 +30,9 @@ If no session/thread id was provided, fall back to the plain state word:
 Use shell commands like:
 
 ```sh
-mkdir -p "$(dirname "$MULTICODE_AUTONOMOUS_STATE_PATH")"
-printf '%s\n' working > "$MULTICODE_AUTONOMOUS_STATE_PATH"
+STATE_FILE="${MULTICODE_AUTONOMOUS_STATE_PATH}"
+mkdir -p "$(dirname "$STATE_FILE")"
+printf '%s\n' working > "$STATE_FILE"
 ```
 
 Required workflow:

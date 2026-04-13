@@ -16,7 +16,10 @@ use tokio::{
 use super::{
     CombinedService, GithubStatus,
     codex_app_server::CodexAppServerClient,
-    runtime::{AUTOMATION_STATE_ENV, automation_state_file_source, synthetic_codex_home_source},
+    runtime::{
+        automation_state_file_source, automation_task_state_file_source,
+        synthetic_codex_home_source,
+    },
     workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{
@@ -32,8 +35,20 @@ const ISSUE_PRIORITY_LABELS: [&str; 4] = [
     "type: enhancement",
 ];
 const ISSUE_PRIORITY_BOOST_LABELS: [&str; 2] = ["type: regression", "priority: high"];
+const DEPENDENCY_UPGRADE_LABEL: &str = "type: dependency-upgrade";
+const NON_MAJOR_DEPENDENCY_UPGRADE_LABELS: [&str; 4] = ["minor", "patch", "pin", "digest"];
+const MAJOR_DEPENDENCY_UPGRADE_LABELS: [&str; 1] = ["major"];
+const RENOVATE_LOGINS: [&str; 2] = ["renovate[bot]", "app/renovate"];
+const DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX: &str = "Dependency upgrade follow-up for PR #";
+const DEPENDENCY_UPGRADE_PR_MARKER_PREFIX: &str = "<!-- multicode:dependency-upgrade-pr=";
 const IN_PROGRESS_LABEL: &str = "status: in progress";
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+struct QueuedIssueCandidate {
+    issue: SelectedIssue,
+    backing_pr_url: Option<String>,
+}
 
 #[derive(Debug)]
 pub enum AutonomousWorkspaceServiceError {
@@ -89,6 +104,8 @@ async fn watch_workspace(
     let mut issue_status_rx: Option<watch::Receiver<Option<GithubStatus>>> = None;
     let mut task_issue_status_rxs: HashMap<String, watch::Receiver<Option<GithubStatus>>> =
         HashMap::new();
+    let mut task_pr_status_rxs: HashMap<String, watch::Receiver<Option<GithubStatus>>> =
+        HashMap::new();
     let mut previous_root_status: Option<RootSessionStatus> = None;
     let mut previous_scan_request_nonce: u64 = 0;
     let mut blocked_start_scan_request_nonce: Option<u64> = None;
@@ -121,6 +138,7 @@ async fn watch_workspace(
             watched_issue_url = None;
             issue_status_rx = None;
             task_issue_status_rxs.clear();
+            task_pr_status_rxs.clear();
             next_scan_at = None;
             blocked_start_scan_request_nonce = None;
             previous_active_issue_url = None;
@@ -156,6 +174,7 @@ async fn watch_workspace(
         .await;
         snapshot = workspace.subscribe().borrow().clone();
         sync_task_issue_status_receivers(&service, &snapshot, &mut task_issue_status_rxs);
+        sync_task_pr_status_receivers(&service, &snapshot, &mut task_pr_status_rxs);
         let current_issue_url = active_issue_url_for_snapshot(&snapshot);
         if previous_active_issue_url != current_issue_url {
             request_refresh_for_task_issues(
@@ -172,6 +191,9 @@ async fn watch_workspace(
         );
         if !closed_background_issue_urls.is_empty() {
             for closed_issue_url in &closed_background_issue_urls {
+                if let Some(task_id) = task_id_for_issue(&snapshot, closed_issue_url) {
+                    clear_task_automation_state_file(&service, &workspace_key, &task_id).await;
+                }
                 if let Err(err) = service
                     .remove_workspace_task_checkout(
                         &workspace_key,
@@ -189,6 +211,64 @@ async fn watch_workspace(
                 }
                 clear_automation_issue_claim(&workspace, closed_issue_url);
                 task_issue_status_rxs.remove(closed_issue_url);
+                task_pr_status_rxs.remove(closed_issue_url);
+            }
+            next_scan_at = Some(Instant::now());
+            set_automation_status(&workspace, Some(format!("Next issue {repository_label}")));
+            previous_root_status = snapshot.root_session_status;
+            continue;
+        }
+        let merged_pr_issue_urls =
+            merged_dependency_upgrade_issue_urls(&snapshot, &task_pr_status_rxs);
+        if !merged_pr_issue_urls.is_empty() {
+            let token = match resolved_gh_token(&service).await {
+                Ok(token) => token,
+                Err(err) => {
+                    set_automation_status(
+                        &workspace,
+                        Some(format!("Merge close failed {repository_label}: {err}")),
+                    );
+                    previous_root_status = snapshot.root_session_status;
+                    if workspace_rx.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            for issue_url in &merged_pr_issue_urls {
+                if let Some(task_id) = task_id_for_issue(&snapshot, issue_url) {
+                    clear_task_automation_state_file(&service, &workspace_key, &task_id).await;
+                }
+                if let Err(err) = close_dependency_upgrade_issue(
+                    &assigned_repository,
+                    issue_url,
+                    &snapshot,
+                    &token,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        workspace_key,
+                        issue_url = %issue_url,
+                        error = %err,
+                        "failed to close dependency-upgrade issue after backing PR merged"
+                    );
+                    continue;
+                }
+                if let Err(err) = service
+                    .remove_workspace_task_checkout(&workspace_key, &assigned_repository, issue_url)
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_key,
+                        issue_url = %issue_url,
+                        error = ?err,
+                        "failed to remove merged dependency-upgrade task worktree"
+                    );
+                }
+                clear_automation_issue_claim(&workspace, issue_url);
+                task_issue_status_rxs.remove(issue_url);
+                task_pr_status_rxs.remove(issue_url);
             }
             next_scan_at = Some(Instant::now());
             set_automation_status(&workspace, Some(format!("Next issue {repository_label}")));
@@ -211,6 +291,7 @@ async fn watch_workspace(
             watched_issue_url = None;
             issue_status_rx = None;
             task_issue_status_rxs.clear();
+            task_pr_status_rxs.clear();
             next_scan_at = None;
             blocked_start_scan_request_nonce = None;
             previous_active_issue_url = None;
@@ -238,8 +319,7 @@ async fn watch_workspace(
             set_automation_status(&workspace, Some(format!("Scan now {repository_label}")));
         }
 
-        if active_task_id_for_snapshot(&snapshot).is_none()
-        {
+        if active_task_id_for_snapshot(&snapshot).is_none() {
             if let Some(next_issue_url) = next_schedulable_task_issue_url(&snapshot, None) {
                 tracing::info!(
                     workspace_key,
@@ -342,6 +422,32 @@ async fn watch_workspace(
                     .and_then(|state| state.session_id.as_deref()),
                 "autonomous workspace has active issue candidate"
             );
+            let active_task_can_yield = active_task_can_yield_vm(&snapshot);
+            let next_schedulable_issue_url =
+                next_schedulable_task_issue_url(&snapshot, Some(current_issue_url.as_str()));
+            tracing::warn!(
+                workspace_key,
+                issue_url = %current_issue_url,
+                active_task_can_yield,
+                next_schedulable_issue_url = next_schedulable_issue_url.as_deref(),
+                task_states = ?snapshot
+                    .persistent
+                    .tasks
+                    .iter()
+                    .map(|task| {
+                        let task_state = snapshot.task_states.get(&task.id);
+                        (
+                            task.id.as_str(),
+                            task.issue_url.as_str(),
+                            task_state.and_then(|state| state.session_id.as_deref()),
+                            task_state.and_then(|state| state.agent_state),
+                            task_state.and_then(|state| state.session_status),
+                            task_state.is_some_and(|state| state.waiting_on_vm),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                "autonomous workspace scheduling decision"
+            );
             if scan_requested {
                 let available_slots = service
                     .config
@@ -362,9 +468,7 @@ async fn watch_workspace(
                         Ok(queued) if queued > 0 => {
                             set_automation_status(
                                 &workspace,
-                                Some(format!(
-                                    "Queued {queued} issue(s) for {repository_label}"
-                                )),
+                                Some(format!("Queued {queued} issue(s) for {repository_label}")),
                             );
                             previous_root_status = snapshot.root_session_status;
                             continue;
@@ -390,10 +494,7 @@ async fn watch_workspace(
                     }
                 }
             }
-            if active_task_can_yield_vm(&snapshot)
-                && let Some(next_issue_url) =
-                    next_schedulable_task_issue_url(&snapshot, Some(current_issue_url.as_str()))
-            {
+            if active_task_can_yield && let Some(next_issue_url) = next_schedulable_issue_url {
                 lease_task_issue(&workspace, &snapshot, &next_issue_url);
                 clear_automation_state_file(&service, &workspace_key).await;
                 watched_issue_url = None;
@@ -465,6 +566,7 @@ async fn watch_workspace(
                         watched_issue_url = None;
                         issue_status_rx = None;
                         task_issue_status_rxs.remove(&current_issue_url);
+                        task_pr_status_rxs.remove(&current_issue_url);
                         previous_active_issue_url = None;
                         next_scan_at = Some(Instant::now() + issue_scan_delay);
                         set_automation_status(
@@ -529,6 +631,7 @@ async fn watch_workspace(
                 watched_issue_url = None;
                 issue_status_rx = None;
                 task_issue_status_rxs.remove(&current_issue_url);
+                task_pr_status_rxs.remove(&current_issue_url);
                 previous_active_issue_url = None;
                 next_scan_at = Some(Instant::now());
                 set_automation_status(&workspace, Some(format!("Next issue {repository_label}")));
@@ -610,8 +713,7 @@ async fn watch_workspace(
             Ok(queued) if queued > 0 => {
                 next_scan_at = None;
                 let post_enqueue_snapshot = workspace.subscribe().borrow().clone();
-                let next_issue_url =
-                    next_schedulable_task_issue_url(&post_enqueue_snapshot, None);
+                let next_issue_url = next_schedulable_task_issue_url(&post_enqueue_snapshot, None);
                 tracing::warn!(
                     workspace_key,
                     queued,
@@ -622,11 +724,7 @@ async fn watch_workspace(
                     "autonomous workspace post-enqueue state"
                 );
                 if let Some(next_issue_url) = next_issue_url {
-                    lease_task_issue(
-                        &workspace,
-                        &post_enqueue_snapshot,
-                        &next_issue_url,
-                    );
+                    lease_task_issue(&workspace, &post_enqueue_snapshot, &next_issue_url);
                 }
                 set_automation_status(
                     &workspace,
@@ -677,11 +775,16 @@ async fn start_assigned_issue_work(
     let Some(issue) = fetch_issue(assigned_repository, issue_url, &token).await? else {
         return Ok(None);
     };
+    let backing_pr_url = issue.backing_pr_url().map(ToOwned::to_owned).or_else(|| {
+        task_persistent_snapshot_for_issue(snapshot, &issue.url)
+            .and_then(|task| task.backing_pr_url.clone())
+    });
 
     ensure_workspace_task_claim(
         workspace,
         assigned_repository,
         &issue,
+        backing_pr_url.as_deref(),
         WorkspaceTaskSource::Manual,
     );
     let task_session_id = ensure_task_session(
@@ -705,12 +808,24 @@ async fn start_assigned_issue_work(
         Some(format!("Claiming {}", issue.display_reference())),
     );
     clear_automation_state_file(service, workspace_key).await;
+    let task_id = workspace
+        .subscribe()
+        .borrow()
+        .persistent
+        .tasks
+        .iter()
+        .find(|task| task.issue_url == issue.url)
+        .map(|task| task.id.clone())
+        .ok_or_else(|| format!("failed to resolve task id for issue {}", issue.url))?;
 
     if let Err(err) = prompt_task_session(
         service,
         snapshot,
+        workspace_key,
         assigned_repository,
+        &task_id,
         &issue,
+        backing_pr_url.as_deref(),
         &task_session_id,
         task_cwd_path(service, workspace_key, assigned_repository, &issue.url),
     )
@@ -770,12 +885,17 @@ async fn enqueue_next_issues(
         let current_snapshot = workspace.subscribe().borrow().clone();
         let excluded_issue_urls =
             reserved_issue_urls(service, workspace_key, Some(&current_snapshot));
-        let Some(issue) =
+        let Some(candidate) =
             find_next_issue(assigned_repository, &excluded_issue_urls, &token).await?
         else {
             break;
         };
-        queue_issue_task(workspace, &issue, WorkspaceTaskSource::Scan);
+        queue_issue_task(
+            workspace,
+            &candidate.issue,
+            candidate.backing_pr_url.as_deref(),
+            WorkspaceTaskSource::Scan,
+        );
         queued += 1;
     }
 
@@ -787,6 +907,7 @@ fn ensure_workspace_task_claim(
     workspace: &Workspace,
     assigned_repository: &str,
     issue: &SelectedIssue,
+    backing_pr_url: Option<&str>,
     source: WorkspaceTaskSource,
 ) {
     workspace.update(|snapshot| {
@@ -800,11 +921,22 @@ fn ensure_workspace_task_claim(
                 format!("task-{}", issue.number),
                 issue.url.clone(),
                 source,
-            );
+            )
+            .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned));
             let task_id = task.id.clone();
             snapshot.persistent.tasks.push(task);
             task_id
         });
+        if let Some(task) = snapshot
+            .persistent
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            && task.backing_pr_url.as_deref() != backing_pr_url
+        {
+            task.backing_pr_url = backing_pr_url.map(ToOwned::to_owned);
+            changed = true;
+        }
         if snapshot.active_task_id.as_deref() != Some(task_id.as_str()) {
             snapshot.active_task_id = Some(task_id);
             changed = true;
@@ -813,24 +945,40 @@ fn ensure_workspace_task_claim(
     });
 }
 
-fn queue_issue_task(workspace: &Workspace, issue: &SelectedIssue, source: WorkspaceTaskSource) {
+fn queue_issue_task(
+    workspace: &Workspace,
+    issue: &SelectedIssue,
+    backing_pr_url: Option<&str>,
+    source: WorkspaceTaskSource,
+) {
     workspace.update(|snapshot| {
-        if snapshot
+        if let Some(existing) = snapshot
             .persistent
             .tasks
             .iter()
-            .any(|task| task.issue_url == issue.url)
+            .find(|task| task.issue_url == issue.url)
+            .map(|task| task.id.clone())
         {
+            if let Some(task) = snapshot
+                .persistent
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == existing)
+                && task.backing_pr_url.as_deref() != backing_pr_url
+            {
+                task.backing_pr_url = backing_pr_url.map(ToOwned::to_owned);
+                return true;
+            }
             return false;
         }
-        snapshot
-            .persistent
-            .tasks
-            .push(WorkspaceTaskPersistentSnapshot::new(
+        snapshot.persistent.tasks.push(
+            WorkspaceTaskPersistentSnapshot::new(
                 format!("task-{}", issue.number),
                 issue.url.clone(),
                 source,
-            ));
+            )
+            .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned)),
+        );
         true
     });
 }
@@ -958,7 +1106,7 @@ fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) 
             .as_deref()
             .filter(|task_id| active_task_lease_must_be_preserved(next, task_id))
             .map(ToOwned::to_owned)
-            .or_else(|| active_task_id_for_snapshot(snapshot));
+            .or_else(|| snapshot.resolved_active_task_id());
         if next.active_task_id != resolved_active_task_id {
             next.active_task_id = resolved_active_task_id.clone();
             changed = true;
@@ -985,25 +1133,25 @@ fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) 
         for task in &snapshot.persistent.tasks {
             let is_active = next.active_task_id.as_deref() == Some(task.id.as_str());
             let task_state = next.task_states.entry(task.id.clone()).or_default();
-            let should_wait = !is_active
-                && !matches!(
-                    task_state.agent_state,
-                    Some(
-                        AutomationAgentState::Question
-                            | AutomationAgentState::Review
-                            | AutomationAgentState::Idle
-                            | AutomationAgentState::Stale
-                    )
-                );
+            let normalized_agent_state = normalized_task_agent_state(task_state);
+            if task_state.agent_state != normalized_agent_state {
+                task_state.agent_state = normalized_agent_state;
+                changed = true;
+            }
+            if is_active {
+                if next.automation_agent_state != normalized_agent_state {
+                    next.automation_agent_state = normalized_agent_state;
+                    changed = true;
+                }
+                let normalized_session_status = normalized_agent_state.map(agent_state_root_status);
+                if next.automation_session_status != normalized_session_status {
+                    next.automation_session_status = normalized_session_status;
+                    changed = true;
+                }
+            }
+            let should_wait = task_should_wait_on_vm(is_active, normalized_agent_state);
             if task_state.waiting_on_vm != should_wait {
                 task_state.waiting_on_vm = should_wait;
-                if should_wait {
-                    task_state.agent_state = Some(AutomationAgentState::WaitingOnVm);
-                } else if !should_wait
-                    && task_state.agent_state == Some(AutomationAgentState::WaitingOnVm)
-                {
-                    task_state.agent_state = None;
-                }
                 changed = true;
             }
         }
@@ -1013,12 +1161,10 @@ fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) 
 
 fn active_task_lease_must_be_preserved(snapshot: &WorkspaceSnapshot, task_id: &str) -> bool {
     task_persistent_snapshot(snapshot, task_id).is_some()
-        && snapshot
-            .task_states
-            .get(task_id)
-            .is_some_and(|task_state| {
-                task_state.session_id.is_some() && !task_can_yield_vm(task_state.agent_state)
-            })
+        && snapshot.task_states.get(task_id).is_some_and(|task_state| {
+            task_state.session_id.is_some()
+                && !task_can_yield_vm(normalized_task_agent_state(task_state))
+        })
 }
 
 fn active_task_id_for_snapshot(snapshot: &WorkspaceSnapshot) -> Option<String> {
@@ -1038,6 +1184,17 @@ fn task_persistent_snapshot<'a>(
     task_id: &str,
 ) -> Option<&'a WorkspaceTaskPersistentSnapshot> {
     snapshot.task_persistent_snapshot(task_id)
+}
+
+fn task_persistent_snapshot_for_issue<'a>(
+    snapshot: &'a WorkspaceSnapshot,
+    issue_url: &str,
+) -> Option<&'a WorkspaceTaskPersistentSnapshot> {
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .find(|task| task.issue_url == issue_url)
 }
 
 fn set_automation_runtime_state(
@@ -1062,8 +1219,8 @@ fn set_automation_runtime_state(
         }
         if let Some(active_task_id) = snapshot.active_task_id.clone() {
             let task_state = snapshot.task_states.entry(active_task_id).or_default();
-            let can_update_task_state = task_state.session_id.is_none()
-                || task_state.session_id == session_id;
+            let can_update_task_state =
+                task_state.session_id.is_none() || task_state.session_id == session_id;
             if can_update_task_state {
                 if task_state.session_id != session_id {
                     task_state.session_id = session_id.clone();
@@ -1133,19 +1290,24 @@ fn next_schedulable_task_issue_url(
         .tasks
         .iter()
         .find(|task| {
-            Some(task.issue_url.as_str()) != exclude_issue_url
-                && !matches!(
-                    snapshot
-                        .task_states
-                        .get(&task.id)
-                        .and_then(|state| state.agent_state),
-                    Some(
-                        AutomationAgentState::Working
-                            | AutomationAgentState::Question
-                            | AutomationAgentState::Review
-                            | AutomationAgentState::Idle
-                    )
+            if Some(task.issue_url.as_str()) == exclude_issue_url {
+                return false;
+            }
+            let Some(task_state) = snapshot.task_states.get(&task.id) else {
+                return true;
+            };
+            if task_state.waiting_on_vm {
+                return true;
+            }
+            !matches!(
+                normalized_task_agent_state(task_state),
+                Some(
+                    AutomationAgentState::Working
+                        | AutomationAgentState::Question
+                        | AutomationAgentState::Review
+                        | AutomationAgentState::Idle
                 )
+            )
         })
         .map(|task| task.issue_url.clone())
 }
@@ -1162,6 +1324,10 @@ fn task_can_yield_vm(agent_state: Option<AutomationAgentState>) -> bool {
     )
 }
 
+fn task_should_wait_on_vm(is_active: bool, agent_state: Option<AutomationAgentState>) -> bool {
+    !is_active && !task_can_yield_vm(agent_state)
+}
+
 fn active_task_can_yield_vm(snapshot: &WorkspaceSnapshot) -> bool {
     let Some(active_task_id) = snapshot.active_task_id.as_deref() else {
         return false;
@@ -1172,7 +1338,32 @@ fn active_task_can_yield_vm(snapshot: &WorkspaceSnapshot) -> bool {
     if task_state.session_id.is_none() {
         return false;
     }
-    task_can_yield_vm(task_state.agent_state)
+    task_can_yield_vm(normalized_task_agent_state(task_state))
+}
+
+fn normalized_task_agent_state(
+    task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+) -> Option<AutomationAgentState> {
+    match task_state.session_status {
+        Some(RootSessionStatus::Question) => Some(AutomationAgentState::Question),
+        Some(RootSessionStatus::Idle) if task_state.session_id.is_some() => {
+            Some(AutomationAgentState::Review)
+        }
+        Some(RootSessionStatus::Idle) => Some(AutomationAgentState::Idle),
+        Some(RootSessionStatus::Busy)
+            if matches!(
+                task_state.agent_state,
+                Some(AutomationAgentState::WaitingOnVm)
+            ) =>
+        {
+            Some(AutomationAgentState::Working)
+        }
+        Some(RootSessionStatus::Busy) => task_state.agent_state,
+        None => match task_state.agent_state {
+            Some(AutomationAgentState::WaitingOnVm) => None,
+            other => other,
+        },
+    }
 }
 
 fn task_id_for_issue(snapshot: &WorkspaceSnapshot, issue_url: &str) -> Option<String> {
@@ -1247,6 +1438,17 @@ fn root_status_to_agent_state(status: RootSessionStatus) -> AutomationAgentState
     }
 }
 
+fn agent_state_root_status(state: AutomationAgentState) -> RootSessionStatus {
+    match state {
+        AutomationAgentState::Working => RootSessionStatus::Busy,
+        AutomationAgentState::Question => RootSessionStatus::Question,
+        AutomationAgentState::WaitingOnVm
+        | AutomationAgentState::Review
+        | AutomationAgentState::Idle
+        | AutomationAgentState::Stale => RootSessionStatus::Idle,
+    }
+}
+
 #[derive(Debug, QueryableByName)]
 struct CodexStateThreadRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -1257,6 +1459,14 @@ struct CodexStateThreadRow {
     updated_at: i64,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     has_user_event: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexRecoveredThreadCandidate {
+    id: String,
+    cwd: String,
+    sort_key: String,
+    has_user_event: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1350,6 +1560,7 @@ async fn reconcile_codex_task_runtime_states(
     let _ = (workspace_key, assigned_repository);
     let client = CodexAppServerClient::new(uri);
     let active_task_id = snapshot.active_task_id.as_deref();
+    let mut clear_state_file = false;
     for task in &snapshot.persistent.tasks {
         let Some(task_state) = snapshot.task_states.get(&task.id) else {
             continue;
@@ -1357,10 +1568,43 @@ async fn reconcile_codex_task_runtime_states(
         let Some(task_session_id) = task_state.session_id.clone() else {
             continue;
         };
+        let task_cwd = task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url);
 
         let response = match client.thread_read_with_turns(&task_session_id, true).await {
             Ok(response) => response,
             Err(error) => {
+                if !task_session_id_is_current(workspace, &task.id, &task_session_id) {
+                    continue;
+                }
+                if (error.contains("thread not loaded") || error.contains("thread not found"))
+                    && let Some(recovered_session_id) = recover_latest_codex_task_session_id(
+                        service.workspace_directory_path(),
+                        workspace_key,
+                        &task_cwd,
+                        Some(&task_session_id),
+                    )
+                    .await
+                {
+                    tracing::info!(
+                        workspace_key,
+                        task_id = %task.id,
+                        issue_url = %task.issue_url,
+                        previous_task_session_id = %task_session_id,
+                        recovered_task_session_id = %recovered_session_id,
+                        cwd = %task_cwd.display(),
+                        "recovered newer codex task session from persisted session history"
+                    );
+                    workspace.update(|snapshot| {
+                        let task_state = snapshot.task_states.entry(task.id.clone()).or_default();
+                        if task_state.session_id.as_deref() == Some(recovered_session_id.as_str()) {
+                            false
+                        } else {
+                            task_state.session_id = Some(recovered_session_id.clone());
+                            true
+                        }
+                    });
+                    continue;
+                }
                 if error.contains("thread not loaded") {
                     let (session_status, agent_state) = unloaded_codex_task_runtime(task_state);
                     set_task_runtime_state_from_codex(
@@ -1374,6 +1618,14 @@ async fn reconcile_codex_task_runtime_states(
                             ..Default::default()
                         }),
                     );
+                    write_authoritative_task_state_file(
+                        service.workspace_directory_path(),
+                        workspace_key,
+                        &task.id,
+                        &task_session_id,
+                        agent_state,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -1381,16 +1633,67 @@ async fn reconcile_codex_task_runtime_states(
         let Some(status) = response.thread.status.as_ref() else {
             continue;
         };
-
-        let next_session_status = codex_thread_status_to_root_session_status(status);
-        let next_agent_state = codex_task_thread_status_to_agent_state(status);
-        let next_agent_state = if active_task_id != Some(task.id.as_str())
-            && next_agent_state == AutomationAgentState::Working
+        if matches!(
+            status,
+            super::codex_app_server::CodexThreadStatus::NotLoaded
+        ) && let Some(recovered_session_id) = recover_latest_codex_task_session_id(
+            service.workspace_directory_path(),
+            workspace_key,
+            &task_cwd,
+            Some(&task_session_id),
+        )
+        .await
         {
-            AutomationAgentState::WaitingOnVm
+            tracing::info!(
+                workspace_key,
+                task_id = %task.id,
+                issue_url = %task.issue_url,
+                previous_task_session_id = %task_session_id,
+                recovered_task_session_id = %recovered_session_id,
+                cwd = %task_cwd.display(),
+                "recovered newer codex task session from persisted session history after not-loaded status"
+            );
+            workspace.update(|snapshot| {
+                let task_state = snapshot.task_states.entry(task.id.clone()).or_default();
+                if task_state.session_id.as_deref() == Some(recovered_session_id.as_str()) {
+                    false
+                } else {
+                    task_state.session_id = Some(recovered_session_id.clone());
+                    true
+                }
+            });
+            continue;
+        }
+
+        let (next_session_status, next_agent_state) = if matches!(
+            status,
+            super::codex_app_server::CodexThreadStatus::NotLoaded
+        ) {
+            unloaded_codex_task_runtime(task_state)
         } else {
-            next_agent_state
+            codex_runtime_state_for_task(status, task_state)
         };
+        tracing::warn!(
+            workspace_key,
+            task_id = %task.id,
+            issue_url = %task.issue_url,
+            task_session_id = %task_session_id,
+            previous_agent_state = ?task_state.agent_state,
+            previous_session_status = ?task_state.session_status,
+            status = ?status,
+            next_agent_state = ?next_agent_state,
+            next_session_status = ?next_session_status,
+            "reconciled codex task runtime state"
+        );
+        if !task_session_id_is_current(workspace, &task.id, &task_session_id) {
+            tracing::info!(
+                workspace_key,
+                task_id = %task.id,
+                task_session_id = %task_session_id,
+                "skipping stale codex task reconciliation update because task session changed"
+            );
+            continue;
+        }
         let metadata = codex_task_metadata_from_turns(&response.thread.turns, &task.issue_url);
         set_task_runtime_state_from_codex(
             workspace,
@@ -1400,6 +1703,61 @@ async fn reconcile_codex_task_runtime_states(
             next_agent_state,
             Some(metadata),
         );
+        write_authoritative_task_state_file(
+            service.workspace_directory_path(),
+            workspace_key,
+            &task.id,
+            &task_session_id,
+            next_agent_state,
+        )
+        .await;
+        if active_task_id == Some(task.id.as_str())
+            && next_agent_state != AutomationAgentState::Working
+        {
+            clear_state_file = true;
+        }
+    }
+
+    if clear_state_file {
+        clear_automation_state_file(service, workspace_key).await;
+    }
+}
+
+fn task_session_id_is_current(workspace: &Workspace, task_id: &str, session_id: &str) -> bool {
+    workspace
+        .subscribe()
+        .borrow()
+        .task_states
+        .get(task_id)
+        .and_then(|task_state| task_state.session_id.as_deref())
+        == Some(session_id)
+}
+
+async fn write_authoritative_task_state_file(
+    workspace_directory_path: &Path,
+    workspace_key: &str,
+    task_id: &str,
+    task_session_id: &str,
+    agent_state: AutomationAgentState,
+) {
+    let line = format!(
+        "{}:{task_session_id}\n",
+        authoritative_task_state_label(agent_state)
+    );
+    let path = automation_task_state_file_source(workspace_directory_path, workspace_key, task_id);
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::write(path, line).await;
+}
+
+fn authoritative_task_state_label(agent_state: AutomationAgentState) -> &'static str {
+    match agent_state {
+        AutomationAgentState::Working | AutomationAgentState::WaitingOnVm => "working",
+        AutomationAgentState::Question => "question",
+        AutomationAgentState::Review => "review",
+        AutomationAgentState::Idle => "idle",
+        AutomationAgentState::Stale => "stale",
     }
 }
 
@@ -1427,10 +1785,53 @@ fn latest_codex_state_db_path(codex_home: &Path) -> Option<PathBuf> {
     candidates.pop().map(|(_, path)| path)
 }
 
+fn latest_codex_sessions_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join("sessions")
+}
+
+fn recover_latest_codex_thread_candidate_for_cwd(
+    codex_home: &Path,
+    cwd: &str,
+) -> Option<CodexRecoveredThreadCandidate> {
+    let mut candidate = recover_codex_thread_candidates_from_state_db(codex_home, &[cwd.to_string()])
+        .ok()
+        .and_then(|mut entries| entries.remove(cwd));
+
+    let log_candidate = recover_codex_thread_candidates_from_session_logs(codex_home, &[cwd.to_string()])
+        .remove(cwd);
+    if should_prefer_recovered_candidate(log_candidate.as_ref(), candidate.as_ref()) {
+        candidate = log_candidate;
+    }
+
+    candidate
+}
+
 fn recover_codex_thread_ids_from_state_db(
     codex_home: &Path,
     task_cwds: &[(String, String)],
 ) -> Result<HashMap<String, String>, String> {
+    let cwd_candidates = recover_codex_thread_candidates_from_state_db(
+        codex_home,
+        &task_cwds
+            .iter()
+            .map(|(_, cwd)| cwd.clone())
+            .collect::<Vec<_>>(),
+    )?;
+
+    Ok(task_cwds
+        .iter()
+        .filter_map(|(task_id, cwd)| {
+            cwd_candidates
+                .get(cwd)
+                .map(|candidate| (task_id.clone(), candidate.id.clone()))
+        })
+        .collect())
+}
+
+fn recover_codex_thread_candidates_from_state_db(
+    codex_home: &Path,
+    task_cwds: &[String],
+) -> Result<HashMap<String, CodexRecoveredThreadCandidate>, String> {
     let Some(state_db_path) = latest_codex_state_db_path(codex_home) else {
         return Ok(HashMap::new());
     };
@@ -1446,29 +1847,130 @@ fn recover_codex_thread_ids_from_state_db(
     .load::<CodexStateThreadRow>(&mut connection)
     .map_err(|error| error.to_string())?;
 
-    let mut threads_by_cwd = HashMap::<String, CodexStateThreadRow>::new();
+    let mut threads_by_cwd = HashMap::<String, CodexRecoveredThreadCandidate>::new();
     for row in rows {
+        if !task_cwds.iter().any(|cwd| cwd == &row.cwd) {
+            continue;
+        }
+        let row_candidate = CodexRecoveredThreadCandidate {
+            id: row.id.clone(),
+            cwd: row.cwd.clone(),
+            sort_key: format!("{:020}", row.updated_at),
+            has_user_event: row.has_user_event != 0,
+        };
         let prefer_row = match threads_by_cwd.get(&row.cwd) {
             None => true,
             Some(existing) => {
-                (row.has_user_event != 0 && existing.has_user_event == 0)
-                    || (row.has_user_event == existing.has_user_event
-                        && row.updated_at > existing.updated_at)
+                should_prefer_recovered_candidate(Some(&row_candidate), Some(existing))
             }
         };
         if prefer_row {
-            threads_by_cwd.insert(row.cwd.clone(), row);
+            threads_by_cwd.insert(row.cwd.clone(), row_candidate);
         }
     }
 
-    Ok(task_cwds
-        .iter()
-        .filter_map(|(task_id, cwd)| {
-            threads_by_cwd
-                .get(cwd)
-                .map(|row| (task_id.clone(), row.id.clone()))
-        })
-        .collect())
+    Ok(threads_by_cwd)
+}
+
+fn recover_codex_thread_candidates_from_session_logs(
+    codex_home: &Path,
+    task_cwds: &[String],
+) -> HashMap<String, CodexRecoveredThreadCandidate> {
+    let sessions_dir = latest_codex_sessions_dir(codex_home);
+    let mut results = HashMap::<String, CodexRecoveredThreadCandidate>::new();
+    let mut stack = vec![sessions_dir];
+
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(candidate) = recover_codex_thread_candidate_from_session_log(&entry.path()) else {
+                continue;
+            };
+            if !task_cwds.iter().any(|cwd| cwd == &candidate.cwd) {
+                continue;
+            }
+            if should_prefer_recovered_candidate(
+                Some(&candidate),
+                results.get(candidate.cwd.as_str()),
+            ) {
+                results.insert(candidate.cwd.clone(), candidate);
+            }
+        }
+    }
+
+    results
+}
+
+fn recover_codex_thread_candidate_from_session_log(
+    path: &Path,
+) -> Option<CodexRecoveredThreadCandidate> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let first_line = contents.lines().next()?;
+    let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let id = payload.get("id").and_then(serde_json::Value::as_str)?.to_string();
+    let cwd = payload.get("cwd").and_then(serde_json::Value::as_str)?.to_string();
+    let timestamp = payload
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(CodexRecoveredThreadCandidate {
+        id,
+        cwd,
+        sort_key: timestamp,
+        has_user_event: true,
+    })
+}
+
+fn should_prefer_recovered_candidate(
+    next: Option<&CodexRecoveredThreadCandidate>,
+    current: Option<&CodexRecoveredThreadCandidate>,
+) -> bool {
+    match (next, current) {
+        (Some(_), None) => true,
+        (Some(next), Some(current)) => {
+            (next.has_user_event && !current.has_user_event)
+                || (next.has_user_event == current.has_user_event
+                    && next.sort_key > current.sort_key)
+        }
+        _ => false,
+    }
+}
+
+async fn recover_latest_codex_task_session_id(
+    workspace_directory_path: &Path,
+    workspace_key: &str,
+    task_cwd: &Path,
+    current_session_id: Option<&str>,
+) -> Option<String> {
+    let codex_home = synthetic_codex_home_source(workspace_directory_path, workspace_key);
+    let cwd = task_cwd.to_string_lossy().into_owned();
+    let current_session_id = current_session_id.map(ToOwned::to_owned);
+    spawn_blocking(move || {
+        recover_latest_codex_thread_candidate_for_cwd(&codex_home, &cwd)
+            .and_then(|candidate| {
+                (current_session_id.as_deref() != Some(candidate.id.as_str())).then_some(candidate.id)
+            })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn unloaded_codex_task_runtime(
@@ -1481,6 +1983,14 @@ fn unloaded_codex_task_runtime(
         Some(AutomationAgentState::Stale) => (RootSessionStatus::Idle, AutomationAgentState::Stale),
         _ => (RootSessionStatus::Idle, AutomationAgentState::Review),
     }
+}
+
+fn codex_runtime_state_for_task(
+    status: &super::codex_app_server::CodexThreadStatus,
+    task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+) -> (RootSessionStatus, AutomationAgentState) {
+    let next_agent_state = codex_task_thread_status_to_agent_state(status, task_state.agent_state);
+    (agent_state_root_status(next_agent_state), next_agent_state)
 }
 
 fn codex_task_metadata_from_turns(
@@ -1534,20 +2044,9 @@ fn extract_multicode_tag_values(text: &str, tag: &str) -> Vec<String> {
     values
 }
 
-fn codex_thread_status_to_root_session_status(
-    status: &super::codex_app_server::CodexThreadStatus,
-) -> RootSessionStatus {
-    if status.waits_for_human_input() {
-        RootSessionStatus::Question
-    } else if status.is_idle() {
-        RootSessionStatus::Idle
-    } else {
-        RootSessionStatus::Busy
-    }
-}
-
 fn codex_task_thread_status_to_agent_state(
     status: &super::codex_app_server::CodexThreadStatus,
+    _previous_state: Option<AutomationAgentState>,
 ) -> AutomationAgentState {
     match status {
         super::codex_app_server::CodexThreadStatus::SystemError => AutomationAgentState::Stale,
@@ -1568,6 +2067,7 @@ fn set_task_runtime_state_from_codex(
     workspace.update(|snapshot| {
         let mut changed = false;
         let is_active = snapshot.active_task_id.as_deref() == Some(task_id);
+        let next_status_text = codex_task_status_text(agent_state, metadata.as_ref(), task_id, snapshot);
         if is_active {
             if snapshot.automation_session_id.as_deref() != Some(session_id) {
                 snapshot.automation_session_id = Some(session_id.to_string());
@@ -1595,8 +2095,13 @@ fn set_task_runtime_state_from_codex(
             task_state.session_status = Some(session_status);
             changed = true;
         }
-        if task_state.waiting_on_vm {
-            task_state.waiting_on_vm = false;
+        if task_state.status != next_status_text {
+            task_state.status = next_status_text.clone();
+            changed = true;
+        }
+        let should_wait = task_should_wait_on_vm(is_active, Some(agent_state));
+        if task_state.waiting_on_vm != should_wait {
+            task_state.waiting_on_vm = should_wait;
             changed = true;
         }
         if let Some(metadata) = metadata {
@@ -1615,6 +2120,28 @@ fn set_task_runtime_state_from_codex(
         }
         changed
     });
+}
+
+fn codex_task_status_text(
+    agent_state: AutomationAgentState,
+    metadata: Option<&CodexTaskMetadata>,
+    task_id: &str,
+    snapshot: &WorkspaceSnapshot,
+) -> Option<String> {
+    if agent_state != AutomationAgentState::Review {
+        return None;
+    }
+
+    metadata
+        .and_then(|metadata| metadata.prs.first())
+        .or_else(|| {
+            snapshot
+                .task_states
+                .get(task_id)
+                .and_then(|task_state| task_state.pr.first())
+        })
+        .and_then(|pr| pull_request_reference(pr))
+        .map(|pr| format!("PR created {pr}"))
 }
 
 fn issue_progress_status(
@@ -1673,6 +2200,34 @@ fn sync_task_issue_status_receivers(
     }
 }
 
+fn sync_task_pr_status_receivers(
+    service: &CombinedService,
+    snapshot: &WorkspaceSnapshot,
+    task_pr_status_rxs: &mut HashMap<String, watch::Receiver<Option<GithubStatus>>>,
+) {
+    let tracked_issue_urls = snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| task.backing_pr_url.is_some())
+        .map(|task| task.issue_url.as_str())
+        .collect::<HashSet<_>>();
+    task_pr_status_rxs.retain(|issue_url, _| tracked_issue_urls.contains(issue_url.as_str()));
+    for task in &snapshot.persistent.tasks {
+        let Some(backing_pr_url) = task.backing_pr_url.as_deref() else {
+            continue;
+        };
+        task_pr_status_rxs
+            .entry(task.issue_url.clone())
+            .or_insert_with(|| {
+                service
+                    .github_status_service()
+                    .watch_status(backing_pr_url)
+                    .expect("dependency-upgrade tasks must have valid GitHub PR URLs")
+            });
+    }
+}
+
 fn request_refresh_for_task_issues<'a>(
     service: &CombinedService,
     issue_urls: impl Iterator<Item = &'a str>,
@@ -1697,9 +2252,71 @@ fn closed_background_task_issue_urls(
         .iter()
         .filter(|task| Some(task.issue_url.as_str()) != active_issue_url)
         .filter_map(|task| {
-            issue_is_closed(task_issue_status_rxs.get(&task.issue_url)).then(|| task.issue_url.clone())
+            issue_is_closed(task_issue_status_rxs.get(&task.issue_url))
+                .then(|| task.issue_url.clone())
         })
         .collect()
+}
+
+fn merged_dependency_upgrade_issue_urls(
+    snapshot: &WorkspaceSnapshot,
+    task_pr_status_rxs: &HashMap<String, watch::Receiver<Option<GithubStatus>>>,
+) -> Vec<String> {
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| task.backing_pr_url.is_some())
+        .filter_map(|task| {
+            matches!(
+                task_pr_status_rxs.get(&task.issue_url).and_then(|receiver| *receiver.borrow()),
+                Some(GithubStatus::Pr(pr_status))
+                    if pr_status.state == super::github_status_service::GithubPrState::Merged
+            )
+            .then(|| task.issue_url.clone())
+        })
+        .collect()
+}
+
+async fn close_dependency_upgrade_issue(
+    assigned_repository: &str,
+    issue_url: &str,
+    snapshot: &WorkspaceSnapshot,
+    token: &str,
+) -> Result<(), String> {
+    let Some(task) = task_persistent_snapshot_for_issue(snapshot, issue_url) else {
+        return Ok(());
+    };
+    let Some(backing_pr_url) = task.backing_pr_url.as_deref() else {
+        return Ok(());
+    };
+
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "close",
+            issue_url,
+            "--repo",
+            assigned_repository,
+            "--comment",
+            &format!(
+                "Closed automatically after dependency-upgrade PR {backing_pr_url} was merged."
+            ),
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh issue close for {issue_url}: {err}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gh issue close failed for {issue_url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 async fn wait_for_workspace_change_until(
@@ -1763,8 +2380,10 @@ async fn ensure_task_session(
                 Ok(response) => {
                     reuse_existing = response.thread.id.as_deref() == Some(existing.as_str())
                         && response.thread.status.as_ref().is_some_and(|status| {
-                            !matches!(status, super::codex_app_server::CodexThreadStatus::NotLoaded)
-                                && !status.requires_replacement()
+                            !matches!(
+                                status,
+                                super::codex_app_server::CodexThreadStatus::NotLoaded
+                            ) && !status.requires_replacement()
                         });
                 }
                 Err(error) => {
@@ -1831,7 +2450,10 @@ async fn ensure_task_session(
                 .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
             let client = CodexAppServerClient::new(uri);
             let session_id = client
-                .thread_start(task_cwd.to_string_lossy().as_ref(), &service.config.agent.codex)
+                .thread_start(
+                    task_cwd.to_string_lossy().as_ref(),
+                    &service.config.agent.codex,
+                )
                 .await?
                 .thread
                 .id;
@@ -1865,12 +2487,27 @@ async fn ensure_task_session(
 async fn prompt_task_session(
     service: &CombinedService,
     snapshot: &WorkspaceSnapshot,
+    workspace_key: &str,
     assigned_repository: &str,
+    task_id: &str,
     issue: &SelectedIssue,
+    backing_pr_url: Option<&str>,
     task_session_id: &str,
     cwd: std::path::PathBuf,
 ) -> Result<(), String> {
-    let prompt = build_issue_prompt(assigned_repository, issue, task_session_id, &cwd);
+    let task_state_path = automation_task_state_file_source(
+        service.workspace_directory_path(),
+        workspace_key,
+        task_id,
+    );
+    let prompt = build_issue_prompt(
+        assigned_repository,
+        issue,
+        backing_pr_url,
+        task_session_id,
+        &cwd,
+        &task_state_path,
+    );
     match service.agent_provider() {
         AgentProvider::Opencode => {
             let opencode_client = snapshot
@@ -1952,7 +2589,10 @@ async fn wait_for_codex_task_thread_ready(
         match client.thread_read(task_session_id).await {
             Ok(response) => {
                 let status_ready = response.thread.status.as_ref().is_some_and(|status| {
-                    !matches!(status, super::codex_app_server::CodexThreadStatus::NotLoaded)
+                    !matches!(
+                        status,
+                        super::codex_app_server::CodexThreadStatus::NotLoaded
+                    )
                 });
                 if status_ready {
                     return Ok(());
@@ -1998,19 +2638,56 @@ async fn clear_automation_state_file(service: &CombinedService, workspace_key: &
     }
 }
 
+async fn clear_task_automation_state_file(
+    service: &CombinedService,
+    workspace_key: &str,
+    task_id: &str,
+) {
+    let path = automation_task_state_file_source(
+        service.workspace_directory_path(),
+        workspace_key,
+        task_id,
+    );
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                workspace_key,
+                task_id,
+                error = %err,
+                "failed to clear task automation state file"
+            );
+        }
+    }
+}
+
 fn build_issue_prompt(
     assigned_repository: &str,
     issue: &SelectedIssue,
+    backing_pr_url: Option<&str>,
     task_session_id: &str,
     cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
 ) -> String {
+    let publish_instruction = if let Some(backing_pr_url) = backing_pr_url {
+        format!(
+            "7. This task is backed by Renovate pull request {backing_pr_url}. Confirm it is still a non-major dependency upgrade.\n\
+8. If CI for {backing_pr_url} is already passing, rebase the branch if needed, merge it without waiting for human review, and close GitHub issue {issue_url}.\n\
+9. If CI is not passing, investigate the failure and only stop for human input if you cannot safely get the dependency upgrade merged.\n\
+10. If you merge the PR, summarize the merge result and make sure the issue is closed before stopping.",
+            issue_url = issue.url
+        )
+    } else {
+        "7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing. When the change is ready, stop and ask for permission.".to_string()
+    };
     format!(
         "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
 Start work on GitHub issue {issue_url}.\n\
 Issue title: {issue_title}\n\
 Primary checkout for this task: {cwd}\n\
 Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
-The environment variable `{automation_state_env}` points to a multicode-owned state file. Maintain it throughout the run using the `autonomous-state` skill so multicode can track whether you are working, waiting for a question, or ready for review.\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
 For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\
 Your job is to:\n\
 1. Use the existing checkout at `{cwd}` for this issue. Keep this task isolated to that checkout instead of sharing another task's repository state.\n\
@@ -2019,14 +2696,15 @@ Your job is to:\n\
 4. Run focused verification and summarize the evidence.\n\
 5. Emit the machine-readable repository / issue / PR tags while you work.\n\
 6. Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission.\n\
-7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing. When the change is ready, stop and ask for permission.\n\
+{publish_instruction}\n\
 \n\
 Prefer an upstream pull request if you have write access. Keep going until the workspace is ready for review or you need human feedback.",
-        automation_state_env = AUTOMATION_STATE_ENV,
         issue_url = issue.url,
         issue_title = issue.title,
         task_session_id = task_session_id,
-        cwd = cwd.display()
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+        publish_instruction = publish_instruction
     )
 }
 
@@ -2034,7 +2712,7 @@ async fn find_next_issue(
     assigned_repository: &str,
     excluded_issue_urls: &HashSet<String>,
     token: &str,
-) -> Result<Option<SelectedIssue>, String> {
+) -> Result<Option<QueuedIssueCandidate>, String> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
@@ -2047,11 +2725,21 @@ async fn find_next_issue(
             {
                 continue;
             }
-            candidates.push(issue);
+            candidates.push(QueuedIssueCandidate {
+                issue,
+                backing_pr_url: None,
+            });
         }
     }
 
-    Ok(candidates.into_iter().min_by(issue_priority_cmp))
+    if let Some(candidate) = candidates
+        .into_iter()
+        .min_by(|left, right| issue_priority_cmp(&left.issue, &right.issue))
+    {
+        return Ok(Some(candidate));
+    }
+
+    find_next_dependency_upgrade_issue(assigned_repository, excluded_issue_urls, token).await
 }
 
 async fn list_issues_for_label(
@@ -2101,7 +2789,7 @@ async fn fetch_issue(
             "--repo",
             assigned_repository,
             "--json",
-            "number,title,createdAt,labels,url,state",
+            "number,title,createdAt,labels,url,state,body",
         ])
         .output()
         .await
@@ -2114,8 +2802,13 @@ async fn fetch_issue(
         ));
     }
 
-    let issue = serde_json::from_slice::<SelectedIssue>(&output.stdout)
+    let mut issue = serde_json::from_slice::<SelectedIssue>(&output.stdout)
         .map_err(|err| format!("failed to parse gh issue view output: {err}"))?;
+    issue.dependency_upgrade_pr_url = issue
+        .body
+        .as_deref()
+        .and_then(extract_dependency_upgrade_pr_marker)
+        .map(ToOwned::to_owned);
     Ok(issue.is_open_issue_candidate().then_some(issue))
 }
 
@@ -2139,6 +2832,247 @@ fn issue_search_args(assigned_repository: &str, label: &str) -> Vec<String> {
         "number,title,createdAt,labels,url,state,isPullRequest".to_string(),
         "--".to_string(),
         "-linked:pr".to_string(),
+    ]
+}
+
+async fn find_next_dependency_upgrade_issue(
+    assigned_repository: &str,
+    excluded_issue_urls: &HashSet<String>,
+    token: &str,
+) -> Result<Option<QueuedIssueCandidate>, String> {
+    let pull_requests = list_dependency_upgrade_prs(assigned_repository, token).await?;
+    for pr in pull_requests {
+        if !pr.is_open_dependency_upgrade_candidate() || !pr.is_non_major_dependency_upgrade() {
+            continue;
+        }
+        let Some(mut issue) =
+            find_or_create_dependency_upgrade_issue(assigned_repository, &pr, token).await?
+        else {
+            continue;
+        };
+        if issue.has_label(IN_PROGRESS_LABEL) || excluded_issue_urls.contains(&issue.url) {
+            continue;
+        }
+        issue.dependency_upgrade_pr_url = Some(pr.url.clone());
+        return Ok(Some(QueuedIssueCandidate {
+            issue,
+            backing_pr_url: Some(pr.url),
+        }));
+    }
+
+    Ok(None)
+}
+
+async fn list_dependency_upgrade_prs(
+    assigned_repository: &str,
+    token: &str,
+) -> Result<Vec<SelectedPullRequest>, String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "search",
+            "prs",
+            "--repo",
+            assigned_repository,
+            "--state",
+            "open",
+            "--label",
+            DEPENDENCY_UPGRADE_LABEL,
+            "--sort",
+            "created",
+            "--order",
+            "desc",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,url,labels,state,isDraft,body,author",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh search prs for {assigned_repository}: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh search prs failed for {assigned_repository}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    serde_json::from_slice::<Vec<SelectedPullRequest>>(&output.stdout)
+        .map_err(|err| format!("failed to parse gh search prs output: {err}"))
+}
+
+async fn find_or_create_dependency_upgrade_issue(
+    assigned_repository: &str,
+    pr: &SelectedPullRequest,
+    token: &str,
+) -> Result<Option<SelectedIssue>, String> {
+    if let Some(issue) =
+        find_existing_dependency_upgrade_issue(assigned_repository, pr, token).await?
+    {
+        return Ok(Some(issue));
+    }
+
+    create_dependency_upgrade_issue(assigned_repository, pr, token)
+        .await
+        .map(Some)
+}
+
+async fn find_existing_dependency_upgrade_issue(
+    assigned_repository: &str,
+    pr: &SelectedPullRequest,
+    token: &str,
+) -> Result<Option<SelectedIssue>, String> {
+    for query in dependency_upgrade_issue_search_queries(pr) {
+        let mut command = Command::new(gh_program());
+        apply_gh_env(&mut command, token);
+        let output = command
+            .args([
+                "search",
+                "issues",
+                "--repo",
+                assigned_repository,
+                "--state",
+                "open",
+                "--sort",
+                "created",
+                "--order",
+                "desc",
+                "--limit",
+                "10",
+                "--json",
+                "number,title,createdAt,labels,url,state,isPullRequest,body",
+                "--",
+                &query,
+            ])
+            .output()
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to run gh search issues for dependency upgrade PR {}: {err}",
+                    pr.url
+                )
+            })?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "gh search issues failed while locating dependency-upgrade issue for {}: {}",
+                pr.url,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let mut issues =
+            serde_json::from_slice::<Vec<SelectedIssue>>(&output.stdout).map_err(|err| {
+                format!("failed to parse gh dependency-upgrade issue search output: {err}")
+            })?;
+        if let Some(mut issue) = issues
+            .drain(..)
+            .find(|issue| issue.is_open_issue_candidate())
+        {
+            issue.dependency_upgrade_pr_url = Some(pr.url.clone());
+            return Ok(Some(issue));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn create_dependency_upgrade_issue(
+    assigned_repository: &str,
+    pr: &SelectedPullRequest,
+    token: &str,
+) -> Result<SelectedIssue, String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "create",
+            "--repo",
+            assigned_repository,
+            "--title",
+            &dependency_upgrade_issue_title(pr),
+            "--body",
+            &dependency_upgrade_issue_body(pr),
+        ])
+        .output()
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to run gh issue create for dependency upgrade PR {}: {err}",
+                pr.url
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh issue create failed for dependency upgrade PR {}: {}",
+            pr.url,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let created_issue_url = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with("https://github.com/"))
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "gh issue create for dependency upgrade PR {} did not return an issue URL",
+                pr.url
+            )
+        })?;
+
+    let mut issue = fetch_issue(assigned_repository, &created_issue_url, token)
+        .await?
+        .ok_or_else(|| {
+            format!("created dependency-upgrade issue {created_issue_url} could not be fetched")
+        })?;
+    issue.dependency_upgrade_pr_url = Some(pr.url.clone());
+
+    if let Err(err) =
+        add_issue_label(assigned_repository, &issue, DEPENDENCY_UPGRADE_LABEL, token).await
+    {
+        tracing::info!(
+            issue_url = %issue.url,
+            pr_url = %pr.url,
+            error = %err,
+            "failed to add dependency-upgrade label to synthetic issue"
+        );
+    }
+
+    Ok(issue)
+}
+
+fn dependency_upgrade_issue_title(pr: &SelectedPullRequest) -> String {
+    format!(
+        "{DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX}{}: {}",
+        pr.number, pr.title
+    )
+}
+
+fn dependency_upgrade_issue_body(pr: &SelectedPullRequest) -> String {
+    format!(
+        "Track dependency-upgrade automation for Renovate pull request {pr_url}.\n\n\
+This issue was created automatically by multicode so the autonomous queue can process the PR.\n\
+If the update is still a non-major version bump and CI is passing, rebase and merge the PR without waiting for human review, then close this issue.\n\n\
+{marker}{pr_url} -->",
+        pr_url = pr.url,
+        marker = DEPENDENCY_UPGRADE_PR_MARKER_PREFIX
+    )
+}
+
+fn dependency_upgrade_issue_search_queries(pr: &SelectedPullRequest) -> [String; 2] {
+    [
+        format!(
+            "\"{DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX}{}\" in:title",
+            pr.number
+        ),
+        format!("\"{}\" in:body", pr.url),
     ]
 }
 
@@ -2269,6 +3203,15 @@ pub(crate) fn issue_reference(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}#{number}"))
 }
 
+fn pull_request_reference(url: &str) -> Option<String> {
+    let stripped = url.strip_prefix("https://github.com/")?;
+    let segments = stripped.split('/').collect::<Vec<_>>();
+    if segments.len() < 4 || segments[2] != "pull" {
+        return None;
+    }
+    Some(format!("#{}", segments[3]))
+}
+
 pub(crate) fn normalize_github_issue_spec(
     assigned_repository: &str,
     input: &str,
@@ -2343,7 +3286,11 @@ struct SelectedIssue {
     state: Option<String>,
     #[serde(rename = "isPullRequest")]
     is_pull_request: Option<bool>,
+    #[serde(default)]
+    body: Option<String>,
     labels: Vec<SelectedIssueLabel>,
+    #[serde(skip)]
+    dependency_upgrade_pr_url: Option<String>,
 }
 
 impl SelectedIssue {
@@ -2374,6 +3321,14 @@ impl SelectedIssue {
         matches!(self.state.as_deref(), Some("OPEN") | Some("open"))
             && self.is_pull_request != Some(true)
     }
+
+    fn backing_pr_url(&self) -> Option<&str> {
+        self.dependency_upgrade_pr_url.as_deref().or_else(|| {
+            self.body
+                .as_deref()
+                .and_then(extract_dependency_upgrade_pr_marker)
+        })
+    }
 }
 
 fn issue_priority_cmp(left: &SelectedIssue, right: &SelectedIssue) -> std::cmp::Ordering {
@@ -2392,11 +3347,113 @@ struct SelectedIssueLabel {
     name: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SelectedPullRequest {
+    number: u64,
+    title: String,
+    url: String,
+    state: Option<String>,
+    #[serde(rename = "isDraft")]
+    is_draft: Option<bool>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<SelectedIssueLabel>,
+    author: Option<SelectedGithubActor>,
+}
+
+impl SelectedPullRequest {
+    fn has_label(&self, label: &str) -> bool {
+        self.labels
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(label))
+    }
+
+    fn author_login(&self) -> Option<&str> {
+        self.author.as_ref().map(|author| author.login.as_str())
+    }
+
+    fn is_open_dependency_upgrade_candidate(&self) -> bool {
+        matches!(self.state.as_deref(), Some("OPEN") | Some("open"))
+            && !self.is_draft.unwrap_or(false)
+            && self.has_label(DEPENDENCY_UPGRADE_LABEL)
+            && self
+                .author_login()
+                .is_some_and(|login| RENOVATE_LOGINS.iter().any(|candidate| login == *candidate))
+    }
+
+    fn is_non_major_dependency_upgrade(&self) -> bool {
+        if MAJOR_DEPENDENCY_UPGRADE_LABELS
+            .iter()
+            .any(|label| self.has_label(label))
+        {
+            return false;
+        }
+        if NON_MAJOR_DEPENDENCY_UPGRADE_LABELS
+            .iter()
+            .any(|label| self.has_label(label))
+        {
+            return true;
+        }
+        dependency_upgrade_versions_from_text(&self.title)
+            .or_else(|| {
+                self.body
+                    .as_deref()
+                    .and_then(dependency_upgrade_versions_from_text)
+            })
+            .is_some_and(|(from_major, to_major)| from_major == to_major)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SelectedGithubActor {
+    login: String,
+}
+
+fn extract_dependency_upgrade_pr_marker(body: &str) -> Option<&str> {
+    let marker_start = body.find(DEPENDENCY_UPGRADE_PR_MARKER_PREFIX)?;
+    let content_start = marker_start + DEPENDENCY_UPGRADE_PR_MARKER_PREFIX.len();
+    let content_end = body[content_start..]
+        .find("-->")
+        .map(|index| content_start + index)
+        .unwrap_or(body.len());
+    let value = body[content_start..content_end].trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn dependency_upgrade_versions_from_text(text: &str) -> Option<(u64, u64)> {
+    let lower = text.to_ascii_lowercase();
+    let from_index = lower.find(" from ")?;
+    let to_index = lower[from_index + 6..].find(" to ")? + from_index + 6;
+    let from_version = extract_leading_version(&text[from_index + 6..to_index])?;
+    let to_version = extract_leading_version(&text[to_index + 4..])?;
+    Some((from_version, to_version))
+}
+
+fn extract_leading_version(text: &str) -> Option<u64> {
+    let token = text
+        .split_whitespace()
+        .find(|candidate| candidate.chars().any(|ch| ch.is_ascii_digit()))?;
+    let token = token
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '-')
+        .trim_start_matches(['v', 'V']);
+    let major = token
+        .split(['.', '-'])
+        .next()
+        .filter(|segment| !segment.is_empty())?;
+    major.parse::<u64>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::codex_app_server::{CodexThreadActiveFlag, CodexThreadStatus};
     use crate::WorkspaceSnapshot;
+    use crate::services::codex_app_server::{CodexThreadActiveFlag, CodexThreadStatus};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn normalize_github_repository_spec_accepts_owner_repo_and_urls() {
@@ -2457,29 +3514,118 @@ mod tests {
         assert!(!start_retry_is_blocked(None, 4));
     }
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("multicode-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn recover_codex_thread_candidates_from_session_logs_prefers_latest_for_matching_cwd() {
+        let codex_home = unique_test_dir("codex-session-recovery");
+        let sessions_dir = latest_codex_sessions_dir(&codex_home).join("2026/04/13");
+        fs::create_dir_all(&sessions_dir).expect("session dir should be created");
+
+        let cwd = "/tmp/multicode-codex-workspaces/e2e-test/work/multicode-test-39";
+        let older = sessions_dir.join("rollout-2026-04-13T07-41-03-019d85c9.jsonl");
+        let newer = sessions_dir.join("rollout-2026-04-13T07-46-51-019d85ce.jsonl");
+        let unrelated = sessions_dir.join("rollout-2026-04-13T07-50-00-019d85ff.jsonl");
+
+        fs::write(
+            &older,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019d85c9\",\"cwd\":\"{cwd}\",\"timestamp\":\"2026-04-13T07:41:03.609Z\"}}}}\n"
+            ),
+        )
+        .expect("older session log should be written");
+        fs::write(
+            &newer,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019d85ce\",\"cwd\":\"{cwd}\",\"timestamp\":\"2026-04-13T07:46:51.609Z\"}}}}\n"
+            ),
+        )
+        .expect("newer session log should be written");
+        fs::write(
+            &unrelated,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019d85ff\",\"cwd\":\"/tmp/other\",\"timestamp\":\"2026-04-13T07:50:00.000Z\"}}\n",
+        )
+        .expect("unrelated session log should be written");
+
+        let recovered = recover_codex_thread_candidates_from_session_logs(
+            &codex_home,
+            &[cwd.to_string()],
+        );
+
+        assert_eq!(
+            recovered.get(cwd).map(|candidate| candidate.id.as_str()),
+            Some("019d85ce")
+        );
+
+        let _ = fs::remove_dir_all(&codex_home);
+    }
+
+    fn test_issue(
+        number: u64,
+        title: &str,
+        url: &str,
+        created_at: &str,
+        labels: Vec<SelectedIssueLabel>,
+    ) -> SelectedIssue {
+        SelectedIssue {
+            number,
+            title: title.to_string(),
+            url: url.to_string(),
+            created_at: created_at.to_string(),
+            state: Some("OPEN".to_string()),
+            is_pull_request: Some(false),
+            body: None,
+            labels,
+            dependency_upgrade_pr_url: None,
+        }
+    }
+
+    fn test_pull_request(
+        number: u64,
+        title: &str,
+        url: &str,
+        labels: Vec<SelectedIssueLabel>,
+        body: Option<&str>,
+    ) -> SelectedPullRequest {
+        SelectedPullRequest {
+            number,
+            title: title.to_string(),
+            url: url.to_string(),
+            state: Some("OPEN".to_string()),
+            is_draft: Some(false),
+            body: body.map(ToOwned::to_owned),
+            labels,
+            author: Some(SelectedGithubActor {
+                login: "renovate[bot]".to_string(),
+            }),
+        }
+    }
+
     #[test]
     fn find_next_issue_prioritizes_boost_labels_then_base_priority_then_newest() {
         let excluded = HashSet::from(["https://github.com/example/repo/issue/5".to_string()]);
         let mut issues = vec![
-            SelectedIssue {
-                number: 5,
-                title: "already claimed".to_string(),
-                url: "https://github.com/example/repo/issue/5".to_string(),
-                created_at: "2026-04-09T10:00:00Z".to_string(),
-                state: Some("OPEN".to_string()),
-                is_pull_request: Some(false),
-                labels: vec![SelectedIssueLabel {
+            test_issue(
+                5,
+                "already claimed",
+                "https://github.com/example/repo/issue/5",
+                "2026-04-09T10:00:00Z",
+                vec![SelectedIssueLabel {
                     name: "type: bug".to_string(),
                 }],
-            },
-            SelectedIssue {
-                number: 6,
-                title: "busy".to_string(),
-                url: "https://github.com/example/repo/issue/6".to_string(),
-                created_at: "2026-04-09T11:00:00Z".to_string(),
-                state: Some("OPEN".to_string()),
-                is_pull_request: Some(false),
-                labels: vec![
+            ),
+            test_issue(
+                6,
+                "busy",
+                "https://github.com/example/repo/issue/6",
+                "2026-04-09T11:00:00Z",
+                vec![
                     SelectedIssueLabel {
                         name: "type: bug".to_string(),
                     },
@@ -2487,26 +3633,22 @@ mod tests {
                         name: IN_PROGRESS_LABEL.to_string(),
                     },
                 ],
-            },
-            SelectedIssue {
-                number: 7,
-                title: "plain bug".to_string(),
-                url: "https://github.com/example/repo/issue/7".to_string(),
-                created_at: "2026-04-09T09:00:00Z".to_string(),
-                state: Some("OPEN".to_string()),
-                is_pull_request: Some(false),
-                labels: vec![SelectedIssueLabel {
+            ),
+            test_issue(
+                7,
+                "plain bug",
+                "https://github.com/example/repo/issue/7",
+                "2026-04-09T09:00:00Z",
+                vec![SelectedIssueLabel {
                     name: "type: bug".to_string(),
                 }],
-            },
-            SelectedIssue {
-                number: 8,
-                title: "high priority enhancement".to_string(),
-                url: "https://github.com/example/repo/issue/8".to_string(),
-                created_at: "2026-04-09T08:00:00Z".to_string(),
-                state: Some("OPEN".to_string()),
-                is_pull_request: Some(false),
-                labels: vec![
+            ),
+            test_issue(
+                8,
+                "high priority enhancement",
+                "https://github.com/example/repo/issue/8",
+                "2026-04-09T08:00:00Z",
+                vec![
                     SelectedIssueLabel {
                         name: "type: enhancement".to_string(),
                     },
@@ -2514,15 +3656,13 @@ mod tests {
                         name: "priority: high".to_string(),
                     },
                 ],
-            },
-            SelectedIssue {
-                number: 9,
-                title: "regression bug".to_string(),
-                url: "https://github.com/example/repo/issue/9".to_string(),
-                created_at: "2026-04-09T07:00:00Z".to_string(),
-                state: Some("OPEN".to_string()),
-                is_pull_request: Some(false),
-                labels: vec![
+            ),
+            test_issue(
+                9,
+                "regression bug",
+                "https://github.com/example/repo/issue/9",
+                "2026-04-09T07:00:00Z",
+                vec![
                     SelectedIssueLabel {
                         name: "type: bug".to_string(),
                     },
@@ -2530,7 +3670,7 @@ mod tests {
                         name: "type: regression".to_string(),
                     },
                 ],
-            },
+            ),
         ];
 
         issues.sort_by(issue_priority_cmp);
@@ -2547,28 +3687,24 @@ mod tests {
 
     #[test]
     fn issue_priority_cmp_prefers_newer_issue_with_same_priority_bucket() {
-        let older = SelectedIssue {
-            number: 10,
-            title: "older".to_string(),
-            url: "https://github.com/example/repo/issues/10".to_string(),
-            created_at: "2026-04-09T07:00:00Z".to_string(),
-            state: Some("OPEN".to_string()),
-            is_pull_request: Some(false),
-            labels: vec![SelectedIssueLabel {
+        let older = test_issue(
+            10,
+            "older",
+            "https://github.com/example/repo/issues/10",
+            "2026-04-09T07:00:00Z",
+            vec![SelectedIssueLabel {
                 name: "type: bug".to_string(),
             }],
-        };
-        let newer = SelectedIssue {
-            number: 11,
-            title: "newer".to_string(),
-            url: "https://github.com/example/repo/issues/11".to_string(),
-            created_at: "2026-04-09T08:00:00Z".to_string(),
-            state: Some("OPEN".to_string()),
-            is_pull_request: Some(false),
-            labels: vec![SelectedIssueLabel {
+        );
+        let newer = test_issue(
+            11,
+            "newer",
+            "https://github.com/example/repo/issues/11",
+            "2026-04-09T08:00:00Z",
+            vec![SelectedIssueLabel {
                 name: "type: bug".to_string(),
             }],
-        };
+        );
 
         assert_eq!(
             issue_priority_cmp(&older, &newer),
@@ -2598,15 +3734,13 @@ mod tests {
 
     #[test]
     fn selected_issue_candidate_must_be_open_and_not_a_pull_request() {
-        let open_issue = SelectedIssue {
-            number: 1,
-            title: "candidate".to_string(),
-            url: "https://github.com/example/repo/issues/1".to_string(),
-            created_at: "2026-04-09T10:00:00Z".to_string(),
-            state: Some("OPEN".to_string()),
-            is_pull_request: Some(false),
-            labels: vec![],
-        };
+        let open_issue = test_issue(
+            1,
+            "candidate",
+            "https://github.com/example/repo/issues/1",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
         assert!(open_issue.is_open_issue_candidate());
 
         let closed_issue = SelectedIssue {
@@ -2625,20 +3759,19 @@ mod tests {
     #[test]
     fn ensure_workspace_task_claim_updates_workspace_state() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
-        let issue = SelectedIssue {
-            number: 810,
-            title: "candidate".to_string(),
-            url: "https://github.com/example/repo/issues/810".to_string(),
-            created_at: "2026-04-09T10:00:00Z".to_string(),
-            state: Some("OPEN".to_string()),
-            is_pull_request: Some(false),
-            labels: vec![],
-        };
+        let issue = test_issue(
+            810,
+            "candidate",
+            "https://github.com/example/repo/issues/810",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
 
         ensure_workspace_task_claim(
             &workspace,
             "example/repo",
             &issue,
+            None,
             WorkspaceTaskSource::Scan,
         );
 
@@ -2777,22 +3910,70 @@ mod tests {
     }
 
     #[test]
+    fn sync_task_runtime_state_releases_yielded_active_task_lease() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-48".to_string(),
+                    "https://github.com/example/repo/issues/48".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-48".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/48".to_string());
+            snapshot.task_states.insert(
+                "task-48".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-48".to_string()),
+                    agent_state: Some(AutomationAgentState::Review),
+                    session_status: Some(RootSessionStatus::Idle),
+                    ..Default::default()
+                },
+            );
+            snapshot.automation_session_id = Some("thread-48".to_string());
+            snapshot.automation_agent_state = Some(AutomationAgentState::Review);
+            snapshot.automation_session_status = Some(RootSessionStatus::Idle);
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert!(next.active_task_id.is_none());
+        assert!(next.persistent.automation_issue.is_none());
+        assert!(next.automation_session_id.is_none());
+        assert!(next.automation_agent_state.is_none());
+        assert!(next.automation_session_status.is_none());
+        let task_state = next
+            .task_states
+            .get("task-48")
+            .expect("task state should remain");
+        assert_eq!(task_state.session_id.as_deref(), Some("thread-48"));
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Review));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
+        assert!(!task_state.waiting_on_vm);
+    }
+
+    #[test]
     fn clear_automation_issue_claim_only_clears_matching_issue() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
-        let issue = SelectedIssue {
-            number: 810,
-            title: "candidate".to_string(),
-            url: "https://github.com/example/repo/issues/810".to_string(),
-            created_at: "2026-04-09T10:00:00Z".to_string(),
-            state: Some("OPEN".to_string()),
-            is_pull_request: Some(false),
-            labels: vec![],
-        };
+        let issue = test_issue(
+            810,
+            "candidate",
+            "https://github.com/example/repo/issues/810",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
 
         ensure_workspace_task_claim(
             &workspace,
             "example/repo",
             &issue,
+            None,
             WorkspaceTaskSource::Scan,
         );
         clear_automation_issue_claim(&workspace, "https://github.com/example/repo/issues/999");
@@ -2810,6 +3991,24 @@ mod tests {
             cleared.persistent.assigned_repository.as_deref(),
             Some("example/repo")
         );
+    }
+
+    #[test]
+    fn task_session_id_is_current_rejects_stale_session_id() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.task_states.insert(
+                "task-39".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-new".to_string()),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        assert!(task_session_id_is_current(&workspace, "task-39", "thread-new"));
+        assert!(!task_session_id_is_current(&workspace, "task-39", "thread-old"));
     }
 
     #[test]
@@ -2968,30 +4167,33 @@ mod tests {
         sync_task_runtime_state(&workspace, &snapshot);
 
         let next = workspace.subscribe().borrow().clone();
-        assert!(!next
-            .task_states
-            .get("task-1")
-            .expect("active task should exist")
-            .waiting_on_vm);
-        assert!(!next
-            .task_states
-            .get("task-2")
-            .expect("question task should exist")
-            .waiting_on_vm);
-        assert!(!next
-            .task_states
-            .get("task-3")
-            .expect("idle task should exist")
-            .waiting_on_vm);
+        assert!(
+            !next
+                .task_states
+                .get("task-1")
+                .expect("active task should exist")
+                .waiting_on_vm
+        );
+        assert!(
+            !next
+                .task_states
+                .get("task-2")
+                .expect("question task should exist")
+                .waiting_on_vm
+        );
+        assert!(
+            !next
+                .task_states
+                .get("task-3")
+                .expect("idle task should exist")
+                .waiting_on_vm
+        );
         let waiting_task = next
             .task_states
             .get("task-4")
             .expect("blocked task should exist");
         assert!(waiting_task.waiting_on_vm);
-        assert_eq!(
-            waiting_task.agent_state,
-            Some(AutomationAgentState::WaitingOnVm)
-        );
+        assert_eq!(waiting_task.agent_state, None);
     }
 
     #[test]
@@ -3036,9 +4238,95 @@ mod tests {
             .get("task-2")
             .expect("blocked task should exist");
         assert!(task_state.waiting_on_vm);
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+    }
+
+    #[test]
+    fn sync_task_runtime_state_prefers_claimed_issue_over_stale_unpreserved_active_task() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-2".to_string(),
+                    "https://github.com/example/repo/issues/2".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/2".to_string());
+            snapshot.task_states.insert(
+                "task-1".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-1".to_string()),
+                    agent_state: Some(AutomationAgentState::Review),
+                    session_status: Some(RootSessionStatus::Idle),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert_eq!(next.active_task_id.as_deref(), Some("task-2"));
         assert_eq!(
-            task_state.agent_state,
-            Some(AutomationAgentState::WaitingOnVm)
+            next.persistent.automation_issue.as_deref(),
+            Some("https://github.com/example/repo/issues/2")
+        );
+    }
+
+    #[test]
+    fn sync_task_runtime_state_updates_bridge_state_from_normalized_active_task() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/1".to_string());
+            snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+            snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+            snapshot.task_states.insert(
+                "task-1".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-1".to_string()),
+                    session_status: Some(RootSessionStatus::Idle),
+                    agent_state: Some(AutomationAgentState::Working),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        assert_eq!(
+            next.automation_agent_state,
+            Some(AutomationAgentState::Review)
+        );
+        assert_eq!(
+            next.automation_session_status,
+            Some(RootSessionStatus::Idle)
         );
     }
 
@@ -3173,6 +4461,51 @@ mod tests {
                 Some("https://github.com/example/repo/issues/4")
             ),
             None
+        );
+    }
+
+    #[test]
+    fn next_schedulable_task_issue_url_includes_waiting_on_vm_task_with_working_state() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-1".to_string(),
+                "https://github.com/example/repo/issues/1".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-2".to_string(),
+                "https://github.com/example/repo/issues/2".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.task_states.insert(
+            "task-1".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                agent_state: Some(AutomationAgentState::Review),
+                session_status: Some(RootSessionStatus::Idle),
+                session_id: Some("thread-1".to_string()),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                agent_state: Some(AutomationAgentState::Working),
+                session_status: Some(RootSessionStatus::Busy),
+                session_id: Some("thread-2".to_string()),
+                waiting_on_vm: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            next_schedulable_task_issue_url(&snapshot, None).as_deref(),
+            Some("https://github.com/example/repo/issues/2")
         );
     }
 
@@ -3358,11 +4691,11 @@ mod tests {
     #[test]
     fn codex_task_thread_status_maps_idle_to_review() {
         assert_eq!(
-            codex_task_thread_status_to_agent_state(&CodexThreadStatus::Idle),
+            codex_task_thread_status_to_agent_state(&CodexThreadStatus::Idle, None),
             AutomationAgentState::Review
         );
         assert_eq!(
-            codex_thread_status_to_root_session_status(&CodexThreadStatus::Idle),
+            agent_state_root_status(AutomationAgentState::Review),
             RootSessionStatus::Idle
         );
     }
@@ -3374,12 +4707,28 @@ mod tests {
         };
 
         assert_eq!(
-            codex_task_thread_status_to_agent_state(&status),
+            codex_task_thread_status_to_agent_state(&status, None),
             AutomationAgentState::Question
         );
         assert_eq!(
-            codex_thread_status_to_root_session_status(&status),
+            agent_state_root_status(AutomationAgentState::Question),
             RootSessionStatus::Question
+        );
+    }
+
+    #[test]
+    fn codex_task_thread_status_preserves_review_for_ambiguous_active_state() {
+        let status = CodexThreadStatus::Active {
+            active_flags: vec![],
+        };
+
+        assert_eq!(
+            codex_task_thread_status_to_agent_state(&status, Some(AutomationAgentState::Review)),
+            AutomationAgentState::Review
+        );
+        assert_eq!(
+            codex_task_thread_status_to_agent_state(&status, Some(AutomationAgentState::Question)),
+            AutomationAgentState::Question
         );
     }
 
@@ -3452,6 +4801,139 @@ mod tests {
     }
 
     #[test]
+    fn set_task_runtime_state_from_codex_keeps_blocked_task_waiting_on_vm() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-2".to_string(),
+                    "https://github.com/example/repo/issues/2".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.task_states.insert(
+                "task-2".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("task-session-2".to_string()),
+                    waiting_on_vm: true,
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-2",
+            "task-session-2",
+            RootSessionStatus::Busy,
+            AutomationAgentState::Working,
+            None,
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-2")
+            .expect("blocked task should exist");
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Busy));
+        assert!(task_state.waiting_on_vm);
+    }
+
+    #[test]
+    fn set_task_runtime_state_from_codex_sets_pr_created_status_for_review_tasks() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-33".to_string(),
+                    "https://github.com/example/repo/issues/33".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-33".to_string());
+            snapshot.task_states.insert(
+                "task-33".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    status: Some("Resuming in background".to_string()),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-33",
+            "task-session-33",
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review,
+            Some(CodexTaskMetadata {
+                prs: vec!["https://github.com/example/repo/pull/56".to_string()],
+                ..Default::default()
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-33")
+            .expect("task state should exist");
+        assert_eq!(task_state.status.as_deref(), Some("PR created #56"));
+    }
+
+    #[test]
+    fn set_task_runtime_state_from_codex_clears_resuming_status_once_task_is_working() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-33".to_string(),
+                    "https://github.com/example/repo/issues/33".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.task_states.insert(
+                "task-33".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    status: Some("Resuming in background".to_string()),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-33",
+            "task-session-33",
+            RootSessionStatus::Busy,
+            AutomationAgentState::Working,
+            Some(CodexTaskMetadata::default()),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-33")
+            .expect("task state should exist");
+        assert_eq!(task_state.status, None);
+    }
+
+    #[test]
     fn unloaded_codex_task_runtime_preserves_question_state() {
         let task_state = crate::WorkspaceTaskRuntimeSnapshot {
             agent_state: Some(AutomationAgentState::Question),
@@ -3467,12 +4949,10 @@ mod tests {
     #[test]
     fn codex_task_metadata_from_turns_extracts_issue_and_pr_tags() {
         let turns = vec![crate::services::codex_app_server::CodexThreadTurn {
-            items: vec![
-                serde_json::json!({
-                    "type": "agentMessage",
-                    "text": "<multicode:repo>/tmp/multicode-codex-workspaces/e2e-test/work/multicode-test-1</multicode:repo>\n<multicode:issue>https://github.com/graemerocher/multicode-test/issues/1</multicode:issue>\n<multicode:pr>https://github.com/graemerocher/multicode-test/pull/8</multicode:pr>"
-                }),
-            ],
+            items: vec![serde_json::json!({
+                "type": "agentMessage",
+                "text": "<multicode:repo>/tmp/multicode-codex-workspaces/e2e-test/work/multicode-test-1</multicode:repo>\n<multicode:issue>https://github.com/graemerocher/multicode-test/issues/1</multicode:issue>\n<multicode:pr>https://github.com/graemerocher/multicode-test/pull/8</multicode:pr>"
+            })],
         }];
 
         let metadata = codex_task_metadata_from_turns(
@@ -3495,23 +4975,82 @@ mod tests {
     }
 
     #[test]
-    fn non_active_codex_working_task_is_rendered_waiting_on_vm() {
+    fn non_active_codex_working_task_keeps_working_state_for_runtime_tracking() {
         let status = CodexThreadStatus::Active {
             active_flags: vec![],
         };
-        let mut snapshot = WorkspaceSnapshot::default();
-        snapshot.active_task_id = Some("task-12".to_string());
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot::default();
+        assert_eq!(
+            codex_runtime_state_for_task(&status, &task_state),
+            (RootSessionStatus::Busy, AutomationAgentState::Working)
+        );
+    }
 
-        let next_agent_state = codex_task_thread_status_to_agent_state(&status);
-        let next_agent_state = if snapshot.active_task_id.as_deref() != Some("task-7")
-            && next_agent_state == AutomationAgentState::Working
-        {
-            AutomationAgentState::WaitingOnVm
-        } else {
-            next_agent_state
+    #[test]
+    fn active_codex_thread_does_not_preserve_review_state() {
+        let status = CodexThreadStatus::Active {
+            active_flags: vec![],
+        };
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            ..Default::default()
         };
 
-        assert_eq!(next_agent_state, AutomationAgentState::WaitingOnVm);
+        assert_eq!(
+            codex_runtime_state_for_task(&status, &task_state),
+            (RootSessionStatus::Busy, AutomationAgentState::Working)
+        );
+    }
+
+    #[test]
+    fn unloaded_codex_status_preserves_review_runtime_state() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            ..Default::default()
+        };
+
+        let runtime = if matches!(CodexThreadStatus::NotLoaded, CodexThreadStatus::NotLoaded) {
+            unloaded_codex_task_runtime(&task_state)
+        } else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            runtime,
+            (RootSessionStatus::Idle, AutomationAgentState::Review)
+        );
+    }
+
+    #[test]
+    fn normalized_task_agent_state_recovers_legacy_waiting_on_vm_review_state() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-8".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::WaitingOnVm),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalized_task_agent_state(&task_state),
+            Some(AutomationAgentState::Review)
+        );
+    }
+
+    #[test]
+    fn normalized_task_agent_state_prefers_idle_session_status_over_stale_working_state() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-9".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalized_task_agent_state(&task_state),
+            Some(AutomationAgentState::Review)
+        );
     }
 
     #[test]
@@ -3605,35 +5144,132 @@ mod tests {
 
     #[test]
     fn build_issue_prompt_requires_skills_and_publish_approval() {
-        let issue = SelectedIssue {
-            number: 980,
-            title: "candidate".to_string(),
-            url: "https://github.com/example/repo/issues/980".to_string(),
-            created_at: "2026-04-09T10:00:00Z".to_string(),
-            state: Some("OPEN".to_string()),
-            is_pull_request: Some(false),
-            labels: vec![],
-        };
+        let issue = test_issue(
+            980,
+            "candidate",
+            "https://github.com/example/repo/issues/980",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
 
         let prompt = build_issue_prompt(
             "example/repo",
             &issue,
+            None,
             "thread-task-980",
             std::path::Path::new("/tmp/work/example-repo-980"),
+            std::path::Path::new("/tmp/state/task-980.state"),
         );
 
         assert!(prompt.contains("`independent-fix`"));
         assert!(prompt.contains("`machine-readable-pr`"));
         assert!(prompt.contains("`autonomous-state`"));
-        assert!(prompt.contains(AUTOMATION_STATE_ENV));
         assert!(prompt.contains("Primary checkout for this task: /tmp/work/example-repo-980"));
+        assert!(prompt.contains("write autonomous state updates to `/tmp/state/task-980.state`"));
         assert!(prompt.contains("Use the existing checkout at `/tmp/work/example-repo-980`"));
-        assert!(prompt.contains(
-            "write autonomous state updates in the format `<state>:thread-task-980`"
-        ));
+        assert!(
+            prompt
+                .contains("write autonomous state updates in the format `<state>:thread-task-980`")
+        );
         assert!(prompt.contains(
             "Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission."
         ));
         assert!(prompt.contains("Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing."));
+    }
+
+    #[test]
+    fn build_issue_prompt_for_dependency_upgrade_allows_direct_merge() {
+        let issue = test_issue(
+            981,
+            "dependency upgrade",
+            "https://github.com/example/repo/issues/981",
+            "2026-04-09T10:00:00Z",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+        );
+
+        let prompt = build_issue_prompt(
+            "example/repo",
+            &issue,
+            Some("https://github.com/example/repo/pull/88"),
+            "thread-task-981",
+            std::path::Path::new("/tmp/work/example-repo-981"),
+            std::path::Path::new("/tmp/state/task-981.state"),
+        );
+
+        assert!(
+            prompt.contains(
+                "backed by Renovate pull request https://github.com/example/repo/pull/88"
+            )
+        );
+        assert!(prompt.contains("merge it without waiting for human review"));
+        assert!(prompt.contains("close GitHub issue https://github.com/example/repo/issues/981"));
+        assert!(!prompt.contains("explicitly approves publishing"));
+    }
+
+    #[test]
+    fn selected_pull_request_non_major_detection_prefers_safe_signals() {
+        let patch = test_pull_request(
+            88,
+            "Update dependency io.micronaut:micronaut-http-client from 4.4.0 to 4.4.1",
+            "https://github.com/example/repo/pull/88",
+            vec![
+                SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                },
+                SelectedIssueLabel {
+                    name: "patch".to_string(),
+                },
+            ],
+            None,
+        );
+        assert!(patch.is_open_dependency_upgrade_candidate());
+        assert!(patch.is_non_major_dependency_upgrade());
+
+        let major = test_pull_request(
+            89,
+            "Update dependency io.micronaut:micronaut-http-client from 4.4.1 to 5.0.0",
+            "https://github.com/example/repo/pull/89",
+            vec![
+                SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                },
+                SelectedIssueLabel {
+                    name: "major".to_string(),
+                },
+            ],
+            None,
+        );
+        assert!(!major.is_non_major_dependency_upgrade());
+
+        let inferred_minor = test_pull_request(
+            90,
+            "Update dependency io.micronaut:micronaut-http-client from 4.4.1 to 4.5.0",
+            "https://github.com/example/repo/pull/90",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            None,
+        );
+        assert!(inferred_minor.is_non_major_dependency_upgrade());
+    }
+
+    #[test]
+    fn extract_dependency_upgrade_pr_marker_reads_hidden_comment() {
+        let body = dependency_upgrade_issue_body(&test_pull_request(
+            91,
+            "Update dependency io.micronaut:micronaut-core from 4.4.1 to 4.4.2",
+            "https://github.com/example/repo/pull/91",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            None,
+        ));
+
+        assert_eq!(
+            extract_dependency_upgrade_pr_marker(&body),
+            Some("https://github.com/example/repo/pull/91")
+        );
     }
 }

@@ -1812,6 +1812,7 @@ dependencies = [
  "multicode-lib",
  "ratatui",
  "rustix",
+ "serde_json",
  "size",
  "tokio",
  "toml 1.0.6+spec-1.1.0",

@@ -144,6 +144,21 @@ pub(crate) fn automation_state_file_source(workspace_directory_path: &Path, key:
     automation_state_dir_source(workspace_directory_path, key).join(AUTOMATION_STATE_FILE_NAME)
 }
 
+pub(crate) fn automation_task_state_dir_source(
+    workspace_directory_path: &Path,
+    key: &str,
+) -> PathBuf {
+    automation_state_dir_source(workspace_directory_path, key).join("tasks")
+}
+
+pub(crate) fn automation_task_state_file_source(
+    workspace_directory_path: &Path,
+    key: &str,
+    task_id: &str,
+) -> PathBuf {
+    automation_task_state_dir_source(workspace_directory_path, key).join(format!("{task_id}.state"))
+}
+
 async fn prepare_synthetic_codex_home(
     source_root: &Path,
     added_skills: &[super::config::AddedSkillMount],
@@ -199,16 +214,12 @@ async fn write_synthetic_codex_config(
     target: &Path,
     config: &CodexAgentConfig,
 ) -> Result<(), std::io::Error> {
-    let mut contents = match tokio::fs::read_to_string(target).await {
+    let contents = match tokio::fs::read_to_string(target).await {
         Ok(existing) => existing,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
-
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(&render_multicode_codex_config_overrides(config));
+    let contents = rewrite_synthetic_codex_config(&contents, config);
     tokio::fs::write(target, contents).await
 }
 
@@ -243,6 +254,84 @@ fn render_multicode_codex_config_overrides(config: &CodexAgentConfig) -> String 
     ));
 
     lines.join("\n") + "\n"
+}
+
+fn rewrite_synthetic_codex_config(existing: &str, config: &CodexAgentConfig) -> String {
+    let mut root_lines = Vec::new();
+    let mut section_lines = Vec::new();
+    let mut in_root = true;
+    let mut skipping_managed_block = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == "# Managed by multicode" {
+            skipping_managed_block = true;
+            continue;
+        }
+        if skipping_managed_block {
+            if trimmed.is_empty() || is_root_codex_override_line(trimmed, config) {
+                continue;
+            }
+            skipping_managed_block = false;
+        }
+
+        if trimmed.starts_with('[') {
+            in_root = false;
+        }
+
+        if in_root && is_root_codex_override_line(trimmed, config) {
+            continue;
+        }
+
+        if in_root {
+            root_lines.push(line);
+        } else {
+            section_lines.push(line);
+        }
+    }
+
+    while root_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        root_lines.pop();
+    }
+
+    let mut rewritten = String::new();
+    if !root_lines.is_empty() {
+        rewritten.push_str(&root_lines.join("\n"));
+        rewritten.push('\n');
+        if !rewritten.ends_with("\n\n") {
+            rewritten.push('\n');
+        }
+    }
+    rewritten.push_str(&render_multicode_codex_config_overrides(config));
+
+    let section_body = section_lines.join("\n");
+    if !section_body.trim().is_empty() {
+        if !rewritten.ends_with("\n\n") {
+            rewritten.push('\n');
+        }
+        rewritten.push_str(&section_body);
+        if !rewritten.ends_with('\n') {
+            rewritten.push('\n');
+        }
+    }
+
+    rewritten
+}
+
+fn is_root_codex_override_line(line: &str, config: &CodexAgentConfig) -> bool {
+    if line.starts_with("approval_policy =") || line.starts_with("sandbox_mode =") {
+        return true;
+    }
+    if config.profile.is_some() && line.starts_with("profile =") {
+        return true;
+    }
+    if config.model.is_some() && line.starts_with("model =") {
+        return true;
+    }
+    if config.model_provider.is_some() && line.starts_with("model_provider =") {
+        return true;
+    }
+    false
 }
 
 fn codex_approval_policy_config_value(policy: CodexApprovalPolicy) -> &'static str {
@@ -2309,6 +2398,105 @@ mod tests {
                 "model_provider = \"openai\"\n",
                 "approval_policy = \"never\"\n",
                 "sandbox_mode = \"danger-full-access\"\n",
+            )
+        );
+    }
+
+    #[test]
+    fn synthetic_codex_config_rewrites_root_overrides_before_tables() {
+        let existing = concat!(
+            "approval_policy = \"on-request\"\n",
+            "model_provider = \"oca\"\n",
+            "model = \"gpt-5.4\"\n",
+            "profile = \"gpt-5-3-codex\"\n",
+            "sandbox_mode = \"workspace-write\"\n",
+            "web_search_request = true\n",
+            "\n",
+            "[profiles.gpt-5-4]\n",
+            "model = \"gpt-5.4\"\n",
+            "\n",
+            "[notice.model_migrations]\n",
+            "\"gpt-5.3-codex\" = \"gpt-5.4\"\n",
+            "# Managed by multicode\n",
+            "approval_policy = \"never\"\n",
+            "sandbox_mode = \"danger-full-access\"\n",
+        );
+
+        let rewritten = rewrite_synthetic_codex_config(
+            existing,
+            &CodexAgentConfig {
+                commands: vec!["codex".to_string()],
+                profile: Some("default".to_string()),
+                model: Some("gpt-5-codex".to_string()),
+                model_provider: Some("openai".to_string()),
+                approval_policy: CodexApprovalPolicy::Never,
+                sandbox_mode: CodexSandboxMode::ExternalSandbox,
+                network_access: CodexNetworkAccess::Enabled,
+            },
+        );
+
+        assert_eq!(
+            rewritten,
+            concat!(
+                "web_search_request = true\n",
+                "\n",
+                "# Managed by multicode\n",
+                "profile = \"default\"\n",
+                "model = \"gpt-5-codex\"\n",
+                "model_provider = \"openai\"\n",
+                "approval_policy = \"never\"\n",
+                "sandbox_mode = \"danger-full-access\"\n",
+                "\n",
+                "[profiles.gpt-5-4]\n",
+                "model = \"gpt-5.4\"\n",
+                "\n",
+                "[notice.model_migrations]\n",
+                "\"gpt-5.3-codex\" = \"gpt-5.4\"\n",
+            )
+        );
+    }
+
+    #[test]
+    fn synthetic_codex_config_preserves_host_provider_when_not_overridden() {
+        let existing = concat!(
+            "approval_policy = \"on-request\"\n",
+            "model_provider = \"oca\"\n",
+            "model = \"gpt-5.4\"\n",
+            "profile = \"gpt-5-3-codex\"\n",
+            "sandbox_mode = \"workspace-write\"\n",
+            "web_search_request = true\n",
+            "\n",
+            "[profiles.gpt-5-4]\n",
+            "model = \"gpt-5.4\"\n",
+        );
+
+        let rewritten = rewrite_synthetic_codex_config(
+            existing,
+            &CodexAgentConfig {
+                commands: vec!["codex".to_string()],
+                profile: None,
+                model: None,
+                model_provider: None,
+                approval_policy: CodexApprovalPolicy::Never,
+                sandbox_mode: CodexSandboxMode::ExternalSandbox,
+                network_access: CodexNetworkAccess::Enabled,
+            },
+        );
+
+        assert_eq!(
+            rewritten,
+            concat!(
+                "model_provider = \"oca\"\n",
+                "model = \"gpt-5.4\"\n",
+                "profile = \"gpt-5-3-codex\"\n",
+                "web_search_request = true\n",
+                "\n",
+                "# Managed by multicode\n",
+                "approval_policy = \"never\"\n",
+                "sandbox_mode = \"danger-full-access\"\n",
+                "\n",
+                "[profiles.gpt-5-4]\n",
+                "model = \"gpt-5.4\"\n",
             )
         );
     }

@@ -1,11 +1,180 @@
 use crate::ops::*;
 use crate::system::*;
 use crate::*;
-use multicode_lib::services::GithubTokenConfig;
+use multicode_lib::services::{
+    GithubTokenConfig,
+    codex_app_server::{CodexAppServerClient, CodexThreadStatus},
+};
 use std::os::unix::fs::FileTypeExt;
 
 const NERD_FONT_GITHUB_GLYPH: &str = "\u{f408}";
 const CODEX_AUTO_RESUME_PROMPT: &str = "Continue autonomously from where you left off. Do not wait for approval for repository commands, builds, Gradle tasks, or focused tests. Only stop to ask before committing, pushing, commenting on GitHub, or opening or updating a pull request.";
+
+pub(crate) fn count_codex_session_turn_metrics(contents: &str) -> CodexSessionTurnMetrics {
+    CodexSessionTurnMetrics {
+        started: contents.matches("\"type\":\"task_started\"").count(),
+        completed: contents.matches("\"type\":\"task_complete\"").count(),
+        aborted: contents.matches("\"type\":\"turn_aborted\"").count(),
+    }
+}
+
+fn codex_session_log_root(
+    workspace_directory_path: &std::path::Path,
+    workspace_key: &str,
+) -> PathBuf {
+    workspace_directory_path
+        .join(".multicode")
+        .join("codex")
+        .join(workspace_key)
+        .join("home")
+        .join("sessions")
+}
+
+fn find_codex_session_log_path(
+    workspace_directory_path: &std::path::Path,
+    workspace_key: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let root = codex_session_log_root(workspace_directory_path, workspace_key);
+    let mut stack = vec![root];
+    let suffix = format!("{session_id}.jsonl");
+    while let Some(path) = stack.pop() {
+        let entries = std::fs::read_dir(&path).ok()?;
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry_path);
+                continue;
+            }
+            if file_type.is_file()
+                && entry_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            {
+                return Some(entry_path);
+            }
+        }
+    }
+    None
+}
+
+fn read_codex_session_turn_metrics(
+    workspace_directory_path: &std::path::Path,
+    workspace_key: &str,
+    session_id: &str,
+) -> Option<CodexSessionTurnMetrics> {
+    let path = find_codex_session_log_path(workspace_directory_path, workspace_key, session_id)?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    Some(count_codex_session_turn_metrics(&contents))
+}
+
+pub(crate) fn last_user_message_from_codex_session_log_contents(contents: &str) -> Option<String> {
+    contents.lines().filter_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(serde_json::Value::as_str) != Some("user_message") {
+            return None;
+        }
+        payload
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(ToOwned::to_owned)
+    })
+    .last()
+}
+
+fn first_user_message_from_codex_session_log_contents(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(serde_json::Value::as_str) != Some("user_message") {
+            return None;
+        }
+        payload
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn interrupted_codex_resume_prompt_from_session_log_contents(contents: &str) -> Option<String> {
+    let first = first_user_message_from_codex_session_log_contents(contents);
+    let last = last_user_message_from_codex_session_log_contents(contents);
+    match (first, last) {
+        (Some(first), Some(last)) if first != last => Some(format!(
+            "{first}\n\nAdditional user instruction from the interrupted interactive attach:\n{last}"
+        )),
+        (_, Some(last)) => Some(last),
+        (Some(first), None) => Some(first),
+        (None, None) => None,
+    }
+}
+
+async fn read_last_codex_session_user_message(
+    workspace_directory_path: std::path::PathBuf,
+    workspace_key: String,
+    session_id: String,
+) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        let path =
+            find_codex_session_log_path(&workspace_directory_path, &workspace_key, &session_id)?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        last_user_message_from_codex_session_log_contents(&contents)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn read_interrupted_codex_resume_prompt(
+    workspace_directory_path: std::path::PathBuf,
+    workspace_key: String,
+    session_id: String,
+) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        let path =
+            find_codex_session_log_path(&workspace_directory_path, &workspace_key, &session_id)?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        interrupted_codex_resume_prompt_from_session_log_contents(&contents)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+pub(crate) fn should_resume_codex_task_after_incomplete_attached_turn(
+    initial_metrics: Option<CodexSessionTurnMetrics>,
+    current_metrics: Option<CodexSessionTurnMetrics>,
+    thread_status: Option<&CodexThreadStatus>,
+) -> bool {
+    let Some(initial_metrics) = initial_metrics else {
+        return false;
+    };
+    let Some(current_metrics) = current_metrics else {
+        return false;
+    };
+    let started_new_turn = current_metrics.started > initial_metrics.started;
+    let aborted_new_turn = current_metrics.aborted > initial_metrics.aborted;
+    if !started_new_turn && !aborted_new_turn {
+        return false;
+    }
+    if current_metrics.completed > initial_metrics.completed && !aborted_new_turn {
+        return false;
+    }
+    match thread_status {
+        Some(CodexThreadStatus::Active { .. }) => false,
+        Some(CodexThreadStatus::SystemError) => false,
+        Some(CodexThreadStatus::Idle | CodexThreadStatus::NotLoaded) | None => true,
+    }
+}
 
 pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
     let url = Url::parse(target).ok()?;
@@ -70,6 +239,34 @@ pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
     }
 }
 
+pub(crate) fn should_auto_resume_task_codex_after_attach(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    attached_session_id: Option<&str>,
+    initial_agent_state: Option<AutomationAgentState>,
+) -> bool {
+    let Some(task_state) = task_state else {
+        return matches!(initial_agent_state, Some(AutomationAgentState::Working));
+    };
+
+    if let Some(attached_session_id) = attached_session_id
+        && task_state.session_id.as_deref() != Some(attached_session_id)
+    {
+        return false;
+    }
+
+    match task_effective_agent_state(Some(task_state)) {
+        Some(AutomationAgentState::Working) => true,
+        Some(
+            AutomationAgentState::WaitingOnVm
+            | AutomationAgentState::Question
+            | AutomationAgentState::Review
+            | AutomationAgentState::Idle
+            | AutomationAgentState::Stale,
+        ) => false,
+        None => matches!(initial_agent_state, Some(AutomationAgentState::Working)),
+    }
+}
+
 pub(crate) fn restored_selected_row(
     entries: &[TableEntry],
     previous_selected_entry: Option<&TableEntry>,
@@ -84,7 +281,10 @@ pub(crate) fn restored_selected_row(
         return 0;
     }
 
-    if let Some(position) = entries.iter().position(|entry| entry == previous_selected_entry) {
+    if let Some(position) = entries
+        .iter()
+        .position(|entry| entry == previous_selected_entry)
+    {
         return position;
     }
 
@@ -194,6 +394,7 @@ impl TuiState {
             custom_link_action: None,
             custom_link_original_value: None,
             pending_delete_target: None,
+            attached_session: None,
             starting_workspace_key: None,
             started_wait_since: None,
             previous_machine_cpu_totals: None,
@@ -446,19 +647,19 @@ impl TuiState {
         };
 
         candidates
-        .into_iter()
-        .filter(|candidate| candidate.kind == link.kind)
-        .filter_map(|candidate| {
-            self.workspace_link_validation_results
-                .get(&candidate)
-                .and_then(|result| match result {
-                    WorkspaceLinkValidationResult::Valid(argument) => {
-                        Some((candidate, argument.clone()))
-                    }
-                    WorkspaceLinkValidationResult::Invalid(_) => None,
-                })
-        })
-        .collect()
+            .into_iter()
+            .filter(|candidate| candidate.kind == link.kind)
+            .filter_map(|candidate| {
+                self.workspace_link_validation_results
+                    .get(&candidate)
+                    .and_then(|result| match result {
+                        WorkspaceLinkValidationResult::Valid(argument) => {
+                            Some((candidate, argument.clone()))
+                        }
+                        WorkspaceLinkValidationResult::Invalid(_) => None,
+                    })
+            })
+            .collect()
     }
 
     fn normalize_selected_link_target_index(&mut self) {
@@ -599,10 +800,7 @@ impl TuiState {
             active_links.extend(workspace_links(snapshot));
             active_links.extend(workspace_issue_pr_links(snapshot));
             for task in &snapshot.persistent.tasks {
-                active_links.extend(task_links(
-                    task,
-                    task_runtime_snapshot(snapshot, &task.id),
-                ));
+                active_links.extend(task_links(task, task_runtime_snapshot(snapshot, &task.id)));
             }
         }
 
@@ -662,13 +860,9 @@ impl TuiState {
     fn refresh_github_link_statuses(&mut self) {
         let mut active_issue_or_pr_links = HashSet::new();
         for snapshot in self.snapshots.values() {
-            active_issue_or_pr_links.extend(
-                workspace_issue_pr_links(snapshot)
-                    .into_iter()
-                    .filter(|link| {
-                        matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr)
-                    }),
-            );
+            active_issue_or_pr_links.extend(workspace_issue_pr_links(snapshot).into_iter().filter(
+                |link| matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr),
+            ));
             for task in &snapshot.persistent.tasks {
                 active_issue_or_pr_links.extend(
                     task_links(task, task_runtime_snapshot(snapshot, &task.id))
@@ -874,6 +1068,54 @@ impl TuiState {
         workspace_attach_target(snapshot)
     }
 
+    fn record_attached_session(&mut self, key: &str, target: &AttachTarget) {
+        let task_id = self.selected_task_id().map(str::to_string);
+        let initial_agent_state = self.snapshots.get(key).and_then(|snapshot| {
+            task_id
+                .as_deref()
+                .and_then(|task_id| task_runtime_snapshot(snapshot, task_id))
+                .and_then(|task_state| task_effective_agent_state(Some(task_state)))
+                .or_else(|| {
+                    if task_id.is_none() {
+                        snapshot.automation_agent_state
+                    } else {
+                        None
+                    }
+                })
+        });
+        let session_id = match target {
+            AttachTarget::Opencode { session_id, .. } => session_id.clone(),
+            AttachTarget::Codex { thread_id, .. } => thread_id.clone(),
+        };
+        let initial_turn_metrics =
+            if self.service.agent_provider() == multicode_lib::services::AgentProvider::Codex {
+                session_id.as_deref().and_then(|session_id| {
+                    read_codex_session_turn_metrics(
+                        self.service.workspace_directory_path(),
+                        key,
+                        session_id,
+                    )
+                })
+            } else {
+                None
+            };
+        tracing::info!(
+            workspace_key = %key,
+            task_id = task_id.as_deref().unwrap_or("<root>"),
+            session_id = session_id.as_deref().unwrap_or("<none>"),
+            initial_agent_state = ?initial_agent_state,
+            initial_turn_metrics = ?initial_turn_metrics,
+            "recorded attached session"
+        );
+        self.attached_session = Some(AttachedSession {
+            workspace_key: key.to_string(),
+            task_id,
+            session_id,
+            initial_agent_state,
+            initial_turn_metrics,
+        });
+    }
+
     fn attach_env_for_workspace(&self, key: &str) -> Vec<(String, String)> {
         if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
             return Vec::new();
@@ -927,6 +1169,7 @@ impl TuiState {
 
         match self.snapshot_attach_target(&key) {
             Ok(target) => {
+                self.record_attached_session(&key, &target);
                 let custom_description = self
                     .snapshots
                     .get(&key)
@@ -946,7 +1189,14 @@ impl TuiState {
                         self.handle_attach_exit(&key).await;
                     }
                     Err(err) => {
-                        self.status = format!("Failed to attach to workspace '{key}': {err}");
+                        tracing::warn!(
+                            workspace_key = %key,
+                            error = %err,
+                            "attach session exited with error"
+                        );
+                        if !self.handle_attach_exit_after_error(&key, &err).await {
+                            self.status = format!("Failed to attach to workspace '{key}': {err}");
+                        }
                     }
                 }
             }
@@ -957,48 +1207,277 @@ impl TuiState {
     }
 
     async fn handle_attach_exit(&mut self, key: &str) {
+        tracing::info!(workspace_key = %key, "handling attach exit");
         if self.maybe_resume_autonomous_codex_after_attach(key).await {
             return;
         }
         self.status = format!("Detached from workspace '{key}' agent session");
     }
 
+    async fn handle_attach_exit_after_error(&mut self, key: &str, err: &io::Error) -> bool {
+        tracing::info!(
+            workspace_key = %key,
+            error = %err,
+            attached_session = ?self.attached_session,
+            "handling attach exit after error"
+        );
+        if self
+            .attached_session
+            .as_ref()
+            .is_some_and(|attached| attached.workspace_key == key)
+            && self.maybe_resume_autonomous_codex_after_attach(key).await
+        {
+            return true;
+        }
+        false
+    }
+
+    fn mark_task_resuming_in_background(&mut self, workspace_key: &str, task_id: &str) {
+        let Ok(workspace) = self.service.manager.get_workspace(workspace_key) else {
+            return;
+        };
+        workspace.update(|snapshot| {
+            let task_state = snapshot.task_states.entry(task_id.to_string()).or_default();
+            let mut changed = false;
+            if task_state.agent_state != Some(AutomationAgentState::Working) {
+                task_state.agent_state = Some(AutomationAgentState::Working);
+                changed = true;
+            }
+            if task_state.session_status != Some(RootSessionStatus::Busy) {
+                task_state.session_status = Some(RootSessionStatus::Busy);
+                changed = true;
+            }
+            let task_status = Some("Resuming in background".to_string());
+            if task_state.status != task_status {
+                task_state.status = task_status;
+                changed = true;
+            }
+            if task_state.waiting_on_vm {
+                task_state.waiting_on_vm = false;
+                changed = true;
+            }
+            if snapshot.active_task_id.as_deref() != Some(task_id) {
+                snapshot.active_task_id = Some(task_id.to_string());
+                changed = true;
+            }
+            if snapshot.automation_agent_state != Some(AutomationAgentState::Working) {
+                snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+                changed = true;
+            }
+            if snapshot.automation_session_status != Some(RootSessionStatus::Busy) {
+                snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+                changed = true;
+            }
+            let automation_status = Some(format!("Resuming {task_id} in background"));
+            if snapshot.automation_status != automation_status {
+                snapshot.automation_status = automation_status;
+                changed = true;
+            }
+            changed
+        });
+    }
+
     async fn maybe_resume_autonomous_codex_after_attach(&mut self, key: &str) -> bool {
         if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            tracing::info!(
+                workspace_key = %key,
+                provider = ?self.service.agent_provider(),
+                "skipping codex auto-resume because agent provider is not Codex"
+            );
+            self.attached_session = None;
             return false;
         }
 
-        for _ in 0..10 {
+        let attached_session = self.attached_session.clone();
+        tracing::info!(
+            workspace_key = %key,
+            attached_session = ?attached_session,
+            "evaluating codex auto-resume after attach"
+        );
+        for _ in 0..8 {
             self.sync_from_manager();
             let snapshot = self.snapshots.get(key).cloned();
             let Some(snapshot) = snapshot else {
+                tracing::info!(
+                    workspace_key = %key,
+                    "workspace disappeared while evaluating codex auto-resume after attach"
+                );
+                self.attached_session = None;
                 return false;
             };
 
-            if should_auto_resume_autonomous_codex_after_attach(&snapshot) {
-                match self
-                    .service
-                    .prompt_root_session(&snapshot, CODEX_AUTO_RESUME_PROMPT)
-                    .await
-                {
-                    Ok(()) => {
-                        self.status = format!(
-                            "Detached from workspace '{key}'; autonomous Codex work was no longer running interactively, so multicode resumed it automatically"
-                        );
-                    }
-                    Err(err) => {
-                        self.status = format!(
-                            "Detached from workspace '{key}'; autonomous Codex work stopped after attach, but multicode failed to resume it automatically: {err}"
-                        );
+            let interrupted_resume_prompt = match attached_session.as_ref() {
+                Some(AttachedSession {
+                    workspace_key,
+                    task_id: Some(_),
+                    session_id: Some(session_id),
+                    initial_turn_metrics,
+                    ..
+                }) if workspace_key == key => {
+                    let should_resume_interrupted = self
+                        .should_resume_interrupted_task_codex_after_attach(
+                            &snapshot,
+                            workspace_key,
+                            Some(session_id.as_str()),
+                            *initial_turn_metrics,
+                        )
+                        .await;
+                    if should_resume_interrupted {
+                        read_interrupted_codex_resume_prompt(
+                            self.service.workspace_directory_path().to_path_buf(),
+                            workspace_key.clone(),
+                            session_id.clone(),
+                        )
+                        .await
+                    } else {
+                        None
                     }
                 }
+                _ => None,
+            };
+
+            let should_resume = match attached_session.as_ref() {
+                Some(AttachedSession {
+                    workspace_key,
+                    task_id: Some(task_id),
+                    session_id,
+                    initial_agent_state,
+                    ..
+                }) if workspace_key == key => {
+                    should_auto_resume_task_codex_after_attach(
+                        task_runtime_snapshot(&snapshot, task_id),
+                        session_id.as_deref(),
+                        *initial_agent_state,
+                    ) || interrupted_resume_prompt.is_some()
+                }
+                _ => should_auto_resume_autonomous_codex_after_attach(&snapshot),
+            };
+            tracing::info!(
+                workspace_key = %key,
+                should_resume,
+                automation_agent_state = ?snapshot.automation_agent_state,
+                automation_session_status = ?snapshot.automation_session_status,
+                root_session_status = ?snapshot.root_session_status,
+                "evaluated codex auto-resume after attach"
+            );
+
+            if should_resume {
+                if let Some(AttachedSession {
+                    workspace_key,
+                    task_id: Some(task_id),
+                    ..
+                }) = attached_session.as_ref()
+                    && workspace_key == key
+                {
+                    self.mark_task_resuming_in_background(key, task_id);
+                    self.sync_from_manager();
+                }
+                let service = self.service.clone();
+                let workspace_key = key.to_string();
+                let snapshot_for_resume = snapshot.clone();
+                let attached_session_for_resume = attached_session.clone();
+                tokio::spawn(async move {
+                    let resume_result = match attached_session_for_resume.as_ref() {
+                        Some(AttachedSession {
+                            workspace_key: attached_workspace_key,
+                            task_id: Some(task_id),
+                            session_id: Some(session_id),
+                            ..
+                        }) if attached_workspace_key == &workspace_key => {
+                            if let Some(resume_prompt) = interrupted_resume_prompt.clone() {
+                                service
+                                    .restart_task_session(
+                                        &workspace_key,
+                                        &snapshot_for_resume,
+                                        task_id,
+                                        &resume_prompt,
+                                    )
+                                    .await
+                            } else {
+                                let resume_prompt = read_last_codex_session_user_message(
+                                    service.workspace_directory_path().to_path_buf(),
+                                    workspace_key.clone(),
+                                    session_id.clone(),
+                                )
+                                .await
+                                .unwrap_or_else(|| CODEX_AUTO_RESUME_PROMPT.to_string());
+                                service
+                                    .prompt_task_session(
+                                        &workspace_key,
+                                        &snapshot_for_resume,
+                                        task_id,
+                                        &resume_prompt,
+                                    )
+                                    .await
+                            }
+                        }
+                        _ => {
+                            service
+                                .prompt_root_session(
+                                    &snapshot_for_resume,
+                                    CODEX_AUTO_RESUME_PROMPT,
+                                )
+                                .await
+                        }
+                    };
+                    tracing::info!(
+                        workspace_key = %workspace_key,
+                        resume_result = ?resume_result,
+                        "finished codex auto-resume attempt after attach"
+                    );
+                });
+                self.status = format!(
+                    "Detached from workspace '{key}'; autonomous Codex resume was scheduled in the background"
+                );
+                self.attached_session = None;
                 return true;
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        self.attached_session = None;
         false
+    }
+
+    async fn should_resume_interrupted_task_codex_after_attach(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        workspace_key: &str,
+        session_id: Option<&str>,
+        initial_turn_metrics: Option<CodexSessionTurnMetrics>,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        let current_turn_metrics = read_codex_session_turn_metrics(
+            self.service.workspace_directory_path(),
+            workspace_key,
+            session_id,
+        );
+        let current_thread_status = match snapshot.transient.as_ref() {
+            Some(transient) => CodexAppServerClient::new(transient.uri.clone())
+                .thread_read(session_id)
+                .await
+                .ok()
+                .and_then(|response| response.thread.status),
+            None => None,
+        };
+        let should_resume = should_resume_codex_task_after_incomplete_attached_turn(
+            initial_turn_metrics,
+            current_turn_metrics,
+            current_thread_status.as_ref(),
+        );
+        tracing::info!(
+            workspace_key = %workspace_key,
+            session_id,
+            initial_turn_metrics = ?initial_turn_metrics,
+            current_turn_metrics = ?current_turn_metrics,
+            current_thread_status = ?current_thread_status,
+            should_resume,
+            "evaluated interrupted codex task resume after attach"
+        );
+        should_resume
     }
 
     pub(crate) fn poll_running_prompt_tool(&mut self) {
@@ -1439,6 +1918,7 @@ impl TuiState {
                             }
                             match self.snapshot_attach_target(&key) {
                                 Ok(target) => {
+                                    self.record_attached_session(&key, &target);
                                     let custom_description = self
                                         .snapshots
                                         .get(&key)
@@ -1458,9 +1938,19 @@ impl TuiState {
                                             self.handle_attach_exit(&key).await;
                                         }
                                         Err(err) => {
-                                            self.status = format!(
-                                                "Failed to attach to workspace '{key}': {err}"
-                                            )
+                                            tracing::warn!(
+                                                workspace_key = %key,
+                                                error = %err,
+                                                "attach session exited with error"
+                                            );
+                                            if !self
+                                                .handle_attach_exit_after_error(&key, &err)
+                                                .await
+                                            {
+                                                self.status = format!(
+                                                    "Failed to attach to workspace '{key}': {err}"
+                                                );
+                                            }
                                         }
                                     }
                                 }

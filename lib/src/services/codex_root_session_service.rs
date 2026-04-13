@@ -275,8 +275,10 @@ async fn refresh_root_session(
     );
 
     let current_root_session_id = workspace.subscribe().borrow().root_session_id.clone();
-    let thread = match select_thread_for_tracking(current_root_session_id.as_deref(), &response.data)
-    {
+    let thread = match select_thread_for_tracking(
+        current_root_session_id.as_deref(),
+        &response.data,
+    ) {
         Some(thread) => thread,
         None => {
             if let Some(current_root_session_id) = current_root_session_id.as_deref() {
@@ -295,7 +297,11 @@ async fn refresh_root_session(
                                     status = ?status,
                                     "clearing stale codex root thread after thread/read"
                                 );
-                                clear_tracked_root_session(workspace, key, Some(current_root_session_id));
+                                clear_tracked_root_session(
+                                    workspace,
+                                    key,
+                                    Some(current_root_session_id),
+                                );
                             } else {
                                 tracing::debug!(
                                     uri = %key.uri,
@@ -499,8 +505,7 @@ fn clear_tracked_root_session(
         {
             return false;
         }
-        if expected_thread_id.is_some()
-            && snapshot.root_session_id.as_deref() != expected_thread_id
+        if expected_thread_id.is_some() && snapshot.root_session_id.as_deref() != expected_thread_id
         {
             return false;
         }

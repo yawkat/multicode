@@ -74,6 +74,8 @@ pub struct WorkspaceTaskPersistentSnapshot {
     pub id: String,
     pub issue_url: String,
     #[serde(default)]
+    pub backing_pr_url: Option<String>,
+    #[serde(default)]
     pub source: WorkspaceTaskSource,
     #[serde(default)]
     pub created_at: Option<SystemTime>,
@@ -84,9 +86,15 @@ impl WorkspaceTaskPersistentSnapshot {
         Self {
             id,
             issue_url,
+            backing_pr_url: None,
             source,
             created_at: Some(SystemTime::now()),
         }
+    }
+
+    pub fn with_backing_pr_url(mut self, backing_pr_url: Option<String>) -> Self {
+        self.backing_pr_url = backing_pr_url;
+        self
     }
 }
 
@@ -252,7 +260,10 @@ impl Default for WorkspaceSnapshot {
 }
 
 impl WorkspaceSnapshot {
-    pub fn task_persistent_snapshot(&self, task_id: &str) -> Option<&WorkspaceTaskPersistentSnapshot> {
+    pub fn task_persistent_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Option<&WorkspaceTaskPersistentSnapshot> {
         self.persistent.tasks.iter().find(|task| task.id == task_id)
     }
 
@@ -265,18 +276,22 @@ impl WorkspaceSnapshot {
         if self
             .active_task_id
             .as_deref()
-            .is_some_and(|task_id| self.task_persistent_snapshot(task_id).is_some())
+            .is_some_and(|task_id| task_holds_vm_lease(self, task_id))
         {
             return self.active_task_id.clone();
         }
 
-        self.persistent.automation_issue.as_deref().and_then(|issue_url| {
-            self.persistent
-                .tasks
-                .iter()
-                .find(|task| task.issue_url == issue_url)
-                .map(|task| task.id.clone())
-        })
+        self.persistent
+            .automation_issue
+            .as_deref()
+            .and_then(|issue_url| {
+                self.persistent
+                    .tasks
+                    .iter()
+                    .find(|task| task.issue_url == issue_url)
+                    .map(|task| task.id.clone())
+            })
+            .filter(|task_id| task_holds_vm_lease(self, task_id))
     }
 
     pub fn resolved_active_issue_url(&self) -> Option<String> {
@@ -286,4 +301,29 @@ impl WorkspaceSnapshot {
             .map(ToOwned::to_owned)
             .or_else(|| self.persistent.automation_issue.clone())
     }
+}
+
+fn task_holds_vm_lease(snapshot: &WorkspaceSnapshot, task_id: &str) -> bool {
+    let Some(_task) = snapshot.task_persistent_snapshot(task_id) else {
+        return false;
+    };
+    let Some(task_state) = snapshot.task_states.get(task_id) else {
+        return true;
+    };
+    let Some(session_id) = task_state.session_id.as_deref() else {
+        return true;
+    };
+    let _ = session_id;
+    !matches!(
+        task_state.session_status,
+        Some(RootSessionStatus::Question | RootSessionStatus::Idle)
+    ) && !matches!(
+        task_state.agent_state,
+        Some(
+            AutomationAgentState::Question
+                | AutomationAgentState::Review
+                | AutomationAgentState::Idle
+                | AutomationAgentState::Stale
+        )
+    )
 }

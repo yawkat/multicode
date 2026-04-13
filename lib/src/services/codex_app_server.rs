@@ -17,9 +17,8 @@ use super::config::{CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess, C
 const INITIALIZE_REQUEST_ID: i64 = 1;
 const INITIAL_REQUEST_ID: i64 = 2;
 
-type CodexSocket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type CodexSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(INITIAL_REQUEST_ID);
 static SHARED_CONNECTIONS: OnceLock<std::sync::Mutex<HashMap<String, Arc<SharedCodexConnection>>>> =
@@ -143,15 +142,15 @@ impl CodexAppServerClient {
             .await
     }
 
-    async fn connect_initialized(
-        &self,
-    ) -> Result<CodexSocket, String> {
+    async fn connect_initialized(&self) -> Result<CodexSocket, String> {
         connect_initialized_socket(&self.uri).await
     }
 
     fn shared_connection(&self) -> Arc<SharedCodexConnection> {
         let registry = SHARED_CONNECTIONS.get_or_init(Default::default);
-        let mut registry = registry.lock().expect("codex shared connection registry poisoned");
+        let mut registry = registry
+            .lock()
+            .expect("codex shared connection registry poisoned");
         registry
             .entry(self.uri.clone())
             .or_insert_with(|| {
@@ -187,7 +186,10 @@ impl SharedCodexConnection {
                 continue;
             };
 
-            if let Err(err) = active_socket.send(Message::Text(request.clone().into())).await {
+            if let Err(err) = active_socket
+                .send(Message::Text(request.clone().into()))
+                .await
+            {
                 *socket = None;
                 if attempt == 0 {
                     continue;

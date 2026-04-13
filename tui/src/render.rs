@@ -246,26 +246,28 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                 let issue_link = task_links
                     .iter()
                     .find(|link| link.kind == WorkspaceLinkKind::Issue);
-                let pr_link = task_links.iter().find(|link| link.kind == WorkspaceLinkKind::Pr);
+                let pr_link = task_links
+                    .iter()
+                    .find(|link| link.kind == WorkspaceLinkKind::Pr);
                 let issue_status = issue_link.and_then(|link| app.github_link_statuses.get(link));
                 let pr_status = pr_link.and_then(|link| app.github_link_statuses.get(link));
-                let issue_cell = if let Some(GithubLinkStatusView::Issue(issue_status)) = issue_status
-                {
-                    let (kind, color) = issue_icon_kind_and_color(issue_status.state);
-                    status_icon_cell(
-                        kind,
-                        if archived { Color::DarkGray } else { color },
-                        selected_link_kind == Some(WorkspaceLinkKind::Issue),
-                    )
-                } else {
-                    Cell::from(github_link_badge(task_issue_link(task, task_state))).style(
-                        if selected_link_kind == Some(WorkspaceLinkKind::Issue) {
-                            Style::default().add_modifier(Modifier::REVERSED)
-                        } else {
-                            Style::default()
-                        },
-                    )
-                };
+                let issue_cell =
+                    if let Some(GithubLinkStatusView::Issue(issue_status)) = issue_status {
+                        let (kind, color) = issue_icon_kind_and_color(issue_status.state);
+                        status_icon_cell(
+                            kind,
+                            if archived { Color::DarkGray } else { color },
+                            selected_link_kind == Some(WorkspaceLinkKind::Issue),
+                        )
+                    } else {
+                        Cell::from(github_link_badge(task_issue_link(task, task_state))).style(
+                            if selected_link_kind == Some(WorkspaceLinkKind::Issue) {
+                                Style::default().add_modifier(Modifier::REVERSED)
+                            } else {
+                                Style::default()
+                            },
+                        )
+                    };
                 let pr_cell = if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
                     let (kind, color) = pr_icon_kind_and_color(*pr_status);
                     status_icon_cell(
@@ -274,12 +276,18 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         selected_link_kind == Some(WorkspaceLinkKind::Pr),
                     )
                 } else {
-                    Cell::from(task_pr_link(task_state).map(github_link_badge).unwrap_or_default())
-                        .style(if selected_link_kind == Some(WorkspaceLinkKind::Pr) {
+                    Cell::from(
+                        task_pr_link(task, task_state)
+                            .map(github_link_badge)
+                            .unwrap_or_default(),
+                    )
+                    .style(
+                        if selected_link_kind == Some(WorkspaceLinkKind::Pr) {
                             Style::default().add_modifier(Modifier::REVERSED)
                         } else {
                             Style::default()
-                        })
+                        },
+                    )
                 };
                 rows.push(
                     Row::new(vec![

@@ -2,12 +2,18 @@ use crate::*;
 
 #[cfg(test)]
 mod tests {
-    use multicode_lib::{AutomationAgentState, services::HandlerConfig};
+    use multicode_lib::{
+        AutomationAgentState, RootSessionStatus,
+        services::{HandlerConfig, codex_app_server::CodexThreadStatus},
+    };
 
     use super::*;
     use crate::app::{
-        compact_github_tooltip_target, restored_selected_row,
-        should_auto_resume_autonomous_codex_after_attach, starting_modal_failure_status,
+        compact_github_tooltip_target, count_codex_session_turn_metrics,
+        last_user_message_from_codex_session_log_contents, restored_selected_row,
+        should_auto_resume_autonomous_codex_after_attach,
+        should_auto_resume_task_codex_after_attach,
+        should_resume_codex_task_after_incomplete_attached_turn, starting_modal_failure_status,
     };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
@@ -258,6 +264,38 @@ mod tests {
     }
 
     #[test]
+    fn last_user_message_from_codex_session_log_prefers_real_user_events() {
+        let contents = r#"{"type":"event_msg","payload":{"type":"user_message","message":"first prompt"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"create a PR"}}"#;
+
+        assert_eq!(
+            last_user_message_from_codex_session_log_contents(contents).as_deref(),
+            Some("create a PR")
+        );
+    }
+
+    #[test]
+    fn task_links_fall_back_to_persistent_backing_pr_url() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-1".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/1".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        )
+        .with_backing_pr_url(Some(
+            "https://github.com/graemerocher/multicode-test/pull/8".to_string(),
+        ));
+
+        let links = crate::task_links(&task, None);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[1].kind, WorkspaceLinkKind::Pr);
+        assert_eq!(
+            links[1].value,
+            "https://github.com/graemerocher/multicode-test/pull/8"
+        );
+    }
+
+    #[test]
     fn workspace_links_hide_issue_and_pr_when_tasks_exist() {
         let mut started = snapshot(true, Some("http://example"));
         started.persistent.agent_provided.repo = vec!["/tmp/repo-a".to_string()];
@@ -275,7 +313,9 @@ mod tests {
         let mut stopped = WorkspaceSnapshot::default();
         stopped.persistent.assigned_repository =
             Some("micronaut-projects/micronaut-serialization".to_string());
-        assert!(crate::app::should_request_autonomous_issue_scan(&stopped, 5));
+        assert!(crate::app::should_request_autonomous_issue_scan(
+            &stopped, 5
+        ));
 
         stopped
             .persistent
@@ -286,14 +326,23 @@ mod tests {
                     .to_string(),
                 multicode_lib::WorkspaceTaskSource::Manual,
             ));
-        assert!(crate::app::should_request_autonomous_issue_scan(&stopped, 5));
-        assert!(!crate::app::should_request_autonomous_issue_scan(&stopped, 1));
+        assert!(crate::app::should_request_autonomous_issue_scan(
+            &stopped, 5
+        ));
+        assert!(!crate::app::should_request_autonomous_issue_scan(
+            &stopped, 1
+        ));
 
         stopped.persistent.archived = true;
-        assert!(!crate::app::should_request_autonomous_issue_scan(&stopped, 5));
+        assert!(!crate::app::should_request_autonomous_issue_scan(
+            &stopped, 5
+        ));
 
         let unassigned = WorkspaceSnapshot::default();
-        assert!(!crate::app::should_request_autonomous_issue_scan(&unassigned, 5));
+        assert!(!crate::app::should_request_autonomous_issue_scan(
+            &unassigned,
+            5
+        ));
     }
 
     #[test]
@@ -322,6 +371,153 @@ mod tests {
         snapshot.persistent.tasks.clear();
         snapshot.root_session_status = Some(RootSessionStatus::Busy);
         assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
+    }
+
+    #[test]
+    fn task_server_label_prefers_idle_session_status_over_stale_working_agent_state() {
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-39".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-39".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/39".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+
+        assert_eq!(crate::task_server_label(Some(&task_state)), "Idle");
+        assert_eq!(
+            crate::task_description(&task, Some(&task_state)),
+            "Review multicode-test#39"
+        );
+    }
+
+    #[test]
+    fn task_auto_resume_after_attach_only_resumes_when_task_is_still_working() {
+        let review_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-4".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        assert!(!should_auto_resume_task_codex_after_attach(
+            Some(&review_state),
+            Some("thread-4"),
+            Some(AutomationAgentState::Review)
+        ));
+
+        let busy_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-4".to_string()),
+            session_status: Some(RootSessionStatus::Busy),
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        assert!(should_auto_resume_task_codex_after_attach(
+            Some(&busy_state),
+            Some("thread-4"),
+            Some(AutomationAgentState::Working)
+        ));
+    }
+
+    #[test]
+    fn codex_session_turn_metrics_count_started_and_completed_turns() {
+        let metrics = count_codex_session_turn_metrics(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n\
+             {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n\
+             {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+        );
+
+        assert_eq!(metrics.started, 2);
+        assert_eq!(metrics.completed, 1);
+    }
+
+    #[test]
+    fn incomplete_attached_codex_turn_resumes_when_thread_is_idle() {
+        assert!(should_resume_codex_task_after_incomplete_attached_turn(
+            Some(CodexSessionTurnMetrics {
+                started: 3,
+                completed: 3,
+                aborted: 0,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 3,
+                aborted: 0,
+            }),
+            Some(&CodexThreadStatus::Idle),
+        ));
+    }
+
+    #[test]
+    fn completed_attached_codex_turn_does_not_resume() {
+        assert!(!should_resume_codex_task_after_incomplete_attached_turn(
+            Some(CodexSessionTurnMetrics {
+                started: 3,
+                completed: 3,
+                aborted: 0,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 4,
+                aborted: 0,
+            }),
+            Some(&CodexThreadStatus::Idle),
+        ));
+    }
+
+    #[test]
+    fn active_attached_codex_turn_does_not_resume() {
+        assert!(!should_resume_codex_task_after_incomplete_attached_turn(
+            Some(CodexSessionTurnMetrics {
+                started: 3,
+                completed: 3,
+                aborted: 0,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 3,
+                aborted: 0,
+            }),
+            Some(&CodexThreadStatus::Active {
+                active_flags: Vec::new(),
+            }),
+        ));
+    }
+
+    #[test]
+    fn incomplete_attached_codex_turn_resumes_when_thread_status_is_unavailable() {
+        assert!(should_resume_codex_task_after_incomplete_attached_turn(
+            Some(CodexSessionTurnMetrics {
+                started: 3,
+                completed: 1,
+                aborted: 0,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 1,
+                aborted: 0,
+            }),
+            None,
+        ));
+    }
+
+    #[test]
+    fn aborted_attached_codex_turn_resumes_even_if_started_count_did_not_advance() {
+        assert!(should_resume_codex_task_after_incomplete_attached_turn(
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 1,
+                aborted: 0,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 1,
+                aborted: 1,
+            }),
+            Some(&CodexThreadStatus::NotLoaded),
+        ));
     }
 
     #[test]

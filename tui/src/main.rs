@@ -138,6 +138,7 @@ struct TuiState {
     custom_link_action: Option<CustomLinkModalAction>,
     custom_link_original_value: Option<String>,
     pending_delete_target: Option<PendingDeleteTarget>,
+    attached_session: Option<AttachedSession>,
     starting_workspace_key: Option<String>,
     started_wait_since: Option<Instant>,
     previous_machine_cpu_totals: Option<ProcCpuTotals>,
@@ -150,6 +151,22 @@ struct TuiState {
     running_operation: Option<RunningOperation>,
     status: String,
     should_quit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachedSession {
+    workspace_key: String,
+    task_id: Option<String>,
+    session_id: Option<String>,
+    initial_agent_state: Option<AutomationAgentState>,
+    initial_turn_metrics: Option<CodexSessionTurnMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CodexSessionTurnMetrics {
+    started: usize,
+    completed: usize,
+    aborted: usize,
 }
 
 struct RunningOperation {
@@ -342,8 +359,13 @@ fn task_issue_link<'a>(
         .unwrap_or(task.issue_url.as_str())
 }
 
-fn task_pr_link(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> Option<&str> {
-    task_state.and_then(|state| state.pr.first().map(String::as_str))
+fn task_pr_link<'a>(
+    task: &'a WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&'a WorkspaceTaskRuntimeSnapshot>,
+) -> Option<&'a str> {
+    task_state
+        .and_then(|state| state.pr.first().map(String::as_str))
+        .or(task.backing_pr_url.as_deref())
 }
 
 fn github_link_badge(url: &str) -> String {
@@ -361,7 +383,10 @@ fn github_link_badge(url: &str) -> String {
 }
 
 fn task_server_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> &'static str {
-    match task_state.and_then(|state| state.agent_state) {
+    if task_state.is_some_and(|state| state.waiting_on_vm) {
+        return "Waiting on VM";
+    }
+    match task_effective_agent_state(task_state) {
         Some(AutomationAgentState::Working) => "Busy",
         Some(AutomationAgentState::Question) => "Question",
         Some(AutomationAgentState::Review | AutomationAgentState::Idle) => "Idle",
@@ -400,16 +425,38 @@ fn task_description(
     {
         return status.trim().to_string();
     }
-    match task_state.and_then(|state| state.agent_state) {
+    if task_state.is_some_and(|state| state.waiting_on_vm) {
+        return "Queued until VM is free".to_string();
+    }
+    match task_effective_agent_state(task_state) {
         Some(AutomationAgentState::Working) => format!("Working {}", task_issue_reference(task)),
         Some(AutomationAgentState::Question) => format!("Question {}", task_issue_reference(task)),
         Some(AutomationAgentState::Review) => format!("Review {}", task_issue_reference(task)),
-        Some(AutomationAgentState::WaitingOnVm) => {
-            format!("Waiting on VM {}", task_issue_reference(task))
-        }
+        Some(AutomationAgentState::WaitingOnVm) => "Queued until VM is free".to_string(),
         Some(AutomationAgentState::Idle) => format!("Wait close {}", task_issue_reference(task)),
         Some(AutomationAgentState::Stale) => format!("Stalled {}", task_issue_reference(task)),
         None => task_issue_reference(task),
+    }
+}
+
+fn task_effective_agent_state(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> Option<AutomationAgentState> {
+    let task_state = task_state?;
+    match task_state.session_status {
+        Some(RootSessionStatus::Question) => Some(AutomationAgentState::Question),
+        Some(RootSessionStatus::Idle) if task_state.session_id.is_some() => {
+            Some(AutomationAgentState::Review)
+        }
+        Some(RootSessionStatus::Idle) => Some(AutomationAgentState::Idle),
+        Some(RootSessionStatus::Busy) => match task_state.agent_state {
+            Some(AutomationAgentState::WaitingOnVm) => Some(AutomationAgentState::Working),
+            other => other,
+        },
+        None => match task_state.agent_state {
+            Some(AutomationAgentState::WaitingOnVm) if !task_state.waiting_on_vm => None,
+            other => other,
+        },
     }
 }
 
@@ -692,7 +739,7 @@ fn task_links(
         value: task_issue_link(task, task_state).to_string(),
         source: WorkspaceLinkSource::Task,
     }];
-    if let Some(pr) = task_pr_link(task_state) {
+    if let Some(pr) = task_pr_link(task, task_state) {
         links.push(WorkspaceLink {
             kind: WorkspaceLinkKind::Pr,
             value: pr.to_string(),
@@ -852,7 +899,9 @@ fn compare_target_path_for_task(
             .join(format!("{repo_name}-{issue_number}")),
         workspace_path.join(repo_name),
     ];
-    candidates.into_iter().find(|candidate| is_git_checkout(candidate))
+    candidates
+        .into_iter()
+        .find(|candidate| is_git_checkout(candidate))
 }
 
 fn compare_target_path_from_workspace(
@@ -883,7 +932,9 @@ fn compare_target_path_from_workspace(
         candidates.push(workspace_path.join(repo_name));
     }
 
-    candidates.into_iter().find(|candidate| is_git_checkout(candidate))
+    candidates
+        .into_iter()
+        .find(|candidate| is_git_checkout(candidate))
 }
 
 fn is_git_checkout(path: &Path) -> bool {

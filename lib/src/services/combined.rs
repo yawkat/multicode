@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use tokio::process::Command;
@@ -29,13 +29,14 @@ use super::{
     codex_app_server::CodexAppServerClient,
     codex_root_session_service::codex_root_session_service,
     config::{
-        AddedSkillMount, AgentProvider, Config, ExpandedIsolationConfig, expand_shell_path,
-        inherited_env_value, read_config, resolve_agent_command, validate_handler_config,
-        validate_remote_config, validate_tool_config_entries, validate_workspace_key,
+        AddedSkillMount, AgentProvider, CodexAgentConfig, Config, ExpandedIsolationConfig,
+        expand_shell_path, inherited_env_value, read_config, resolve_agent_command,
+        validate_handler_config, validate_remote_config, validate_tool_config_entries,
+        validate_workspace_key,
     },
     multicode_metadata_service, opencode_client_service, persistent_storage,
     resource_usage_service, root_session_service,
-    runtime::WorkspaceRuntime,
+    runtime::{WorkspaceRuntime, automation_task_state_file_source},
     runtime_reconciliation_service::runtime_reconciliation_service,
     transient_storage, usage_aggregation_service,
     workspace_archive::ArchiveWorkspaceEntry,
@@ -380,13 +381,11 @@ impl CombinedService {
         repository: &str,
         issue_url: &str,
     ) -> PathBuf {
-        self.workspace_path_for_key(key)
-            .join("work")
-            .join(format!(
-                "{}-{}",
-                repository_repo_name(repository),
-                issue_url_number(issue_url).unwrap_or("task")
-            ))
+        self.workspace_path_for_key(key).join("work").join(format!(
+            "{}-{}",
+            repository_repo_name(repository),
+            issue_url_number(issue_url).unwrap_or("task")
+        ))
     }
 
     pub async fn ensure_workspace_task_checkout(
@@ -401,7 +400,8 @@ impl CombinedService {
         let task_root = self.workspace_task_checkout_path(&key, &repository, issue_url);
 
         tokio::fs::create_dir_all(self.workspace_path_for_key(&key)).await?;
-        self.ensure_repository_checkout(&repository, &repo_root).await?;
+        self.ensure_repository_checkout(&repository, &repo_root)
+            .await?;
         self.ensure_task_worktree(&repo_root, &task_root).await?;
         unset_repo_local_git_config(&repo_root, "user.name").await?;
         unset_repo_local_git_config(&repo_root, "user.email").await?;
@@ -422,7 +422,8 @@ impl CombinedService {
         let repo_root = self.workspace_repo_root_path(&key, &repository);
         let task_root = self.workspace_task_checkout_path(&key, &repository, issue_url);
 
-        if !path_has_git_entry(&task_root).await? && tokio::fs::metadata(&task_root).await.is_err() {
+        if !path_has_git_entry(&task_root).await? && tokio::fs::metadata(&task_root).await.is_err()
+        {
             return Ok(());
         }
 
@@ -441,9 +442,7 @@ impl CombinedService {
             }
 
             let output = command.output().await?;
-            if !output.status.success()
-                && path_has_git_entry(&task_root).await?
-            {
+            if !output.status.success() && path_has_git_entry(&task_root).await? {
                 return Err(CombinedServiceError::RepositoryPreparation(format!(
                     "failed to remove task worktree '{}': {}",
                     task_root.display(),
@@ -561,6 +560,12 @@ impl CombinedService {
             self.remove_workspace_task_checkout(&key, assigned_repository, &task.issue_url)
                 .await?;
         }
+        remove_path_if_exists(&automation_task_state_file_source(
+            &self.workspace_directory_path,
+            &key,
+            task_id,
+        ))
+        .await?;
 
         workspace.update(|next| {
             let mut changed = false;
@@ -582,22 +587,23 @@ impl CombinedService {
                 .active_task_id
                 .as_deref()
                 .is_some_and(|active_task_id| {
-                    !next.persistent.tasks.iter().any(|entry| entry.id == active_task_id)
+                    !next
+                        .persistent
+                        .tasks
+                        .iter()
+                        .any(|entry| entry.id == active_task_id)
                 })
             {
                 next.active_task_id = next.persistent.tasks.first().map(|entry| entry.id.clone());
                 changed = true;
             }
-            let next_active_issue = next
-                .active_task_id
-                .as_deref()
-                .and_then(|active_task_id| {
-                    next.persistent
-                        .tasks
-                        .iter()
-                        .find(|entry| entry.id == active_task_id)
-                        .map(|entry| entry.issue_url.clone())
-                });
+            let next_active_issue = next.active_task_id.as_deref().and_then(|active_task_id| {
+                next.persistent
+                    .tasks
+                    .iter()
+                    .find(|entry| entry.id == active_task_id)
+                    .map(|entry| entry.issue_url.clone())
+            });
             if next.persistent.automation_issue != next_active_issue {
                 next.persistent.automation_issue = next_active_issue;
                 changed = true;
@@ -819,15 +825,26 @@ impl CombinedService {
             .clone()
             .ok_or_else(|| "workspace has no root session id".to_string())?;
 
+        self.prompt_session(snapshot, &root_session_id, prompt)
+            .await
+    }
+
+    pub async fn prompt_session(
+        &self,
+        snapshot: &crate::WorkspaceSnapshot,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        let session_id = session_id.to_string();
         match self.agent_provider {
             AgentProvider::Opencode => {
                 let opencode_client = snapshot
                     .opencode_client
                     .as_ref()
                     .ok_or_else(|| "workspace has no healthy opencode client".to_string())?;
-                let session_id = root_session_id
+                let session_id = session_id
                     .parse::<opencode::client::types::SessionPromptAsyncSessionId>()
-                    .map_err(|err| format!("invalid root session id '{root_session_id}': {err}"))?;
+                    .map_err(|err| format!("invalid session id '{session_id}': {err}"))?;
                 let prompt_body = opencode::client::types::SessionPromptAsyncBody {
                     agent: None,
                     format: None,
@@ -864,35 +881,317 @@ impl CombinedService {
                     .map(|transient| transient.uri.clone())
                     .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
                 tracing::info!(
-                    root_session_id,
+                    session_id,
                     uri = %uri,
                     prompt_len = prompt.len(),
-                    "dispatching codex root-session prompt"
+                    "dispatching codex session prompt"
                 );
-                let response = CodexAppServerClient::new(uri.clone())
-                    .turn_start(&root_session_id, prompt, &self.config.agent.codex)
-                    .await;
+                let response = Self::prompt_codex_session_with_retry(
+                    &uri,
+                    &session_id,
+                    prompt,
+                    &self.config.agent.codex,
+                )
+                .await;
                 match response {
                     Ok(_) => {
                         tracing::info!(
-                            root_session_id,
+                            session_id,
                             uri = %uri,
-                            "codex root-session prompt dispatched"
+                            "codex session prompt dispatched"
                         );
                         Ok(())
                     }
                     Err(err) => {
                         tracing::warn!(
-                            root_session_id,
+                            session_id,
                             uri = %uri,
                             error = %err,
-                            "codex root-session prompt dispatch failed"
+                            "codex session prompt dispatch failed"
                         );
                         Err(err)
                     }
                 }
             }
         }
+    }
+
+    pub async fn prompt_task_session(
+        &self,
+        workspace_key: &str,
+        snapshot: &crate::WorkspaceSnapshot,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        if self.agent_provider != AgentProvider::Codex {
+            let session_id = snapshot
+                .task_states
+                .get(task_id)
+                .and_then(|task_state| task_state.session_id.as_deref())
+                .ok_or_else(|| format!("task '{task_id}' does not have a resumable session"))?;
+            return self.prompt_session(snapshot, session_id, prompt).await;
+        }
+
+        let workspace = self
+            .manager
+            .get_workspace(workspace_key)
+            .map_err(|err| format!("failed to load workspace '{workspace_key}': {err:?}"))?;
+        let live_snapshot = workspace.subscribe().borrow().clone();
+        let snapshot = &live_snapshot;
+        let task = snapshot
+            .task_persistent_snapshot(task_id)
+            .ok_or_else(|| format!("workspace task '{task_id}' no longer exists"))?;
+        let assigned_repository = snapshot
+            .persistent
+            .assigned_repository
+            .as_deref()
+            .ok_or_else(|| {
+                format!("workspace '{workspace_key}' does not have an assigned repository")
+            })?;
+        let uri = snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.clone())
+            .ok_or_else(|| {
+                format!("workspace '{workspace_key}' does not have an active runtime")
+            })?;
+        self.ensure_workspace_task_checkout(workspace_key, assigned_repository, &task.issue_url)
+            .await
+            .map_err(|err| err.summary())?;
+        let existing_session_id = snapshot
+            .task_states
+            .get(task_id)
+            .and_then(|task_state| task_state.session_id.clone());
+
+        if let Some(session_id) = existing_session_id.as_deref() {
+            match Self::prompt_codex_session_with_retry(
+                &uri,
+                session_id,
+                prompt,
+                &self.config.agent.codex,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if Self::is_codex_thread_materialization_error(&error) => {
+                    tracing::warn!(
+                        workspace_key,
+                        task_id,
+                        session_id,
+                        error = %error,
+                        "replacing stale codex task session after interrupted attach"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.start_fresh_codex_task_session(
+            workspace_key,
+            task_id,
+            prompt,
+            existing_session_id.as_deref(),
+        )
+            .await
+    }
+
+    pub async fn restart_task_session(
+        &self,
+        workspace_key: &str,
+        snapshot: &crate::WorkspaceSnapshot,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        if self.agent_provider != AgentProvider::Codex {
+            return self
+                .prompt_task_session(workspace_key, snapshot, task_id, prompt)
+                .await;
+        }
+
+        tracing::info!(
+            workspace_key,
+            task_id,
+            "starting fresh codex task session"
+        );
+        let previous_session_id = snapshot
+            .task_states
+            .get(task_id)
+            .and_then(|task_state| task_state.session_id.as_deref());
+        self.start_fresh_codex_task_session(workspace_key, task_id, prompt, previous_session_id)
+            .await
+    }
+
+    async fn start_fresh_codex_task_session(
+        &self,
+        workspace_key: &str,
+        task_id: &str,
+        prompt: &str,
+        previous_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let workspace = self
+            .manager
+            .get_workspace(workspace_key)
+            .map_err(|err| format!("failed to load workspace '{workspace_key}': {err:?}"))?;
+        let live_snapshot = workspace.subscribe().borrow().clone();
+        let snapshot = &live_snapshot;
+        let task = snapshot
+            .task_persistent_snapshot(task_id)
+            .ok_or_else(|| format!("workspace task '{task_id}' no longer exists"))?;
+        let assigned_repository = snapshot
+            .persistent
+            .assigned_repository
+            .as_deref()
+            .ok_or_else(|| {
+                format!("workspace '{workspace_key}' does not have an assigned repository")
+            })?;
+        let uri = snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.clone())
+            .ok_or_else(|| {
+                format!("workspace '{workspace_key}' does not have an active runtime")
+            })?;
+        let cwd = self
+            .ensure_workspace_task_checkout(workspace_key, assigned_repository, &task.issue_url)
+            .await
+            .map_err(|err| err.summary())?;
+        let client = CodexAppServerClient::new(uri.clone());
+        let session_id = client
+            .thread_start(cwd.to_string_lossy().as_ref(), &self.config.agent.codex)
+            .await?
+            .thread
+            .id;
+        let prompt =
+            Self::rewrite_codex_task_prompt_session_id(prompt, previous_session_id, &session_id);
+        Self::wait_for_codex_thread_ready(&client, &session_id).await?;
+        workspace.update(|next| {
+            let task_state = next.task_states.entry(task_id.to_string()).or_default();
+            let mut changed = false;
+            if task_state.session_id.as_deref() != Some(session_id.as_str()) {
+                task_state.session_id = Some(session_id.clone());
+                changed = true;
+            }
+            if next.active_task_id.as_deref() == Some(task_id) {
+                if next.automation_session_id.as_deref() != Some(session_id.as_str()) {
+                    next.automation_session_id = Some(session_id.clone());
+                    changed = true;
+                }
+                if next.automation_agent_state != Some(crate::AutomationAgentState::Working) {
+                    next.automation_agent_state = Some(crate::AutomationAgentState::Working);
+                    changed = true;
+                }
+                if next.automation_session_status != Some(super::root_session_service::RootSessionStatus::Busy) {
+                    next.automation_session_status =
+                        Some(super::root_session_service::RootSessionStatus::Busy);
+                    changed = true;
+                }
+            }
+            changed
+        });
+        Self::prompt_codex_session_with_retry(&uri, &session_id, &prompt, &self.config.agent.codex)
+            .await
+    }
+
+    fn rewrite_codex_task_prompt_session_id(
+        prompt: &str,
+        previous_session_id: Option<&str>,
+        session_id: &str,
+    ) -> String {
+        match previous_session_id {
+            Some(previous_session_id)
+                if !previous_session_id.is_empty() && previous_session_id != session_id =>
+            {
+                prompt.replace(previous_session_id, session_id)
+            }
+            _ => prompt.to_string(),
+        }
+    }
+
+    async fn prompt_codex_session_with_retry(
+        uri: &str,
+        session_id: &str,
+        prompt: &str,
+        config: &CodexAgentConfig,
+    ) -> Result<(), String> {
+        let client = CodexAppServerClient::new(uri.to_string());
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..15 {
+            match client.turn_start(session_id, prompt, config).await {
+                Ok(_) => return Ok(()),
+                Err(error) if Self::is_codex_thread_materialization_error(&error) => {
+                    tracing::info!(
+                        session_id,
+                        uri = %uri,
+                        attempt,
+                        error = %error,
+                        "codex session prompt hit transient thread materialization error; waiting for thread"
+                    );
+                    last_error = Some(error);
+                    match Self::wait_for_codex_thread_ready(&client, session_id).await {
+                        Ok(()) => {}
+                        Err(wait_error) => {
+                            tracing::info!(
+                                session_id,
+                                uri = %uri,
+                                attempt,
+                                error = %wait_error,
+                                "codex thread still not ready after wait; retrying turn_start"
+                            );
+                            last_error = Some(wait_error);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            format!("failed to dispatch codex prompt for session '{session_id}'")
+        }))
+    }
+
+    async fn wait_for_codex_thread_ready(
+        client: &CodexAppServerClient,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..25 {
+            match client.thread_read(session_id).await {
+                Ok(response) => {
+                    let ready = response.thread.status.as_ref().is_some_and(|status| {
+                        !matches!(
+                            status,
+                            super::codex_app_server::CodexThreadStatus::NotLoaded
+                        )
+                    });
+                    if ready {
+                        return Ok(());
+                    }
+                    last_error = Some(format!(
+                        "thread '{session_id}' read succeeded but is not ready yet"
+                    ));
+                }
+                Err(error) if Self::is_codex_thread_materialization_error(&error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+
+            if attempt < 24 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            format!("timed out waiting for codex thread '{session_id}' to materialize")
+        }))
+    }
+
+    fn is_codex_thread_materialization_error(error: &str) -> bool {
+        error.contains("thread not found") || error.contains("thread not loaded")
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2128,7 +2427,11 @@ token = { command = "gh auth token" }
             .args(args)
             .status()
             .expect("git command should run");
-        assert!(status.success(), "git command should succeed: git -C {repo_root:?} {}", args.join(" "));
+        assert!(
+            status.success(),
+            "git command should succeed: git -C {repo_root:?} {}",
+            args.join(" ")
+        );
     }
 
     fn init_test_git_repository(repo_root: &Path) {
@@ -2627,10 +2930,8 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .expect("fake opencode should be written");
             make_executable(&fake_opencode);
 
-            let _path_guard = EnvVarGuard::set_value(
-                "PATH",
-                "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
-            );
+            let _path_guard =
+                EnvVarGuard::set_value("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
             let _home_guard = EnvVarGuard::set("HOME", &home);
             let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
 
@@ -3313,7 +3614,9 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 "git worktree should expose a .git file"
             );
             assert!(
-                tokio::fs::metadata(task_root.join("README.md")).await.is_ok(),
+                tokio::fs::metadata(task_root.join("README.md"))
+                    .await
+                    .is_ok(),
                 "worktree should contain repository files"
             );
 
@@ -3327,7 +3630,9 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 "task worktree should be removed"
             );
             assert!(
-                tokio::fs::symlink_metadata(repo_root.join(".git")).await.is_ok(),
+                tokio::fs::symlink_metadata(repo_root.join(".git"))
+                    .await
+                    .is_ok(),
                 "base checkout should remain"
             );
         });
@@ -5098,6 +5403,29 @@ isolated = ["~/.config/opencode"]
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn rewrite_codex_task_prompt_session_id_replaces_stale_task_session_id() {
+        let prompt = "For this task session/thread, write autonomous state updates in the format `<state>:old-session` so multicode can attribute the state to this specific session.\nreview:old-session";
+        let rewritten = CombinedService::rewrite_codex_task_prompt_session_id(
+            prompt,
+            Some("old-session"),
+            "new-session",
+        );
+
+        assert!(rewritten.contains("<state>:new-session"));
+        assert!(rewritten.contains("review:new-session"));
+        assert!(!rewritten.contains("old-session"));
+    }
+
+    #[test]
+    fn rewrite_codex_task_prompt_session_id_leaves_prompt_unchanged_without_prior_session() {
+        let prompt = "create a PR";
+        let rewritten =
+            CombinedService::rewrite_codex_task_prompt_session_id(prompt, None, "new-session");
+
+        assert_eq!(rewritten, prompt);
     }
 
     fn contains_sequence(args: &[String], sequence: &[&str]) -> bool {

@@ -7,7 +7,11 @@ use std::{
 use tokio::time::{MissedTickBehavior, interval};
 
 use super::{
-    root_session_service::RootSessionStatus, runtime::automation_state_file_source,
+    root_session_service::RootSessionStatus,
+    runtime::{
+        automation_state_file_source, automation_task_state_dir_source,
+        automation_task_state_file_source,
+    },
     workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{
@@ -36,12 +40,7 @@ pub async fn automation_state_file_service(
         let workspace_directory_path = workspace_directory_path.clone();
         async move {
             tokio::spawn(async move {
-                watch_workspace(
-                    workspace,
-                    workspace_rx,
-                    automation_state_file_source(&workspace_directory_path, &key),
-                )
-                .await;
+                watch_workspace(workspace, workspace_rx, workspace_directory_path, key).await;
             });
             Ok(())
         }
@@ -52,7 +51,8 @@ pub async fn automation_state_file_service(
 async fn watch_workspace(
     workspace: Workspace,
     mut workspace_rx: tokio::sync::watch::Receiver<WorkspaceSnapshot>,
-    state_file: PathBuf,
+    workspace_directory_path: PathBuf,
+    workspace_key: String,
 ) {
     let mut refresh = interval(STATE_REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -65,7 +65,13 @@ async fn watch_workspace(
             && active_task_id_for_snapshot(&snapshot).is_some();
 
         if should_track {
-            apply_state_file_snapshot(&workspace, read_state_file(&state_file).await);
+            let task_snapshots =
+                read_task_state_snapshots(&workspace_directory_path, &workspace_key, &snapshot)
+                    .await;
+            apply_task_state_snapshots(&workspace, task_snapshots);
+            let updated_snapshot = workspace.subscribe().borrow().clone();
+            mirror_task_state_files(&workspace_directory_path, &workspace_key, &updated_snapshot)
+                .await;
         } else {
             clear_automation_state(&workspace);
         }
@@ -81,12 +87,58 @@ async fn watch_workspace(
     }
 }
 
-fn apply_state_file_snapshot(workspace: &Workspace, next: Option<ParsedAutomationState>) {
+async fn read_task_state_snapshots(
+    workspace_directory_path: &Path,
+    workspace_key: &str,
+    snapshot: &WorkspaceSnapshot,
+) -> Vec<(String, Option<ParsedAutomationState>)> {
+    let mut states = Vec::with_capacity(snapshot.persistent.tasks.len());
+    for task in &snapshot.persistent.tasks {
+        let path =
+            automation_task_state_file_source(workspace_directory_path, workspace_key, &task.id);
+        states.push((task.id.clone(), read_state_file(&path).await));
+    }
+
+    if states.iter().all(|(_, state)| state.is_none()) {
+        let legacy = read_state_file(&automation_state_file_source(
+            workspace_directory_path,
+            workspace_key,
+        ))
+        .await;
+        if legacy.is_some() {
+            states.push(("__legacy__".to_string(), legacy));
+        }
+    }
+
+    states
+}
+
+fn apply_task_state_snapshots(
+    workspace: &Workspace,
+    task_snapshots: Vec<(String, Option<ParsedAutomationState>)>,
+) {
+    for (task_id, next) in task_snapshots {
+        if task_id == "__legacy__" {
+            apply_state_file_snapshot(workspace, None, next);
+        } else {
+            apply_state_file_snapshot(workspace, Some(task_id.as_str()), next);
+        }
+    }
+}
+
+fn apply_state_file_snapshot(
+    workspace: &Workspace,
+    fixed_task_id: Option<&str>,
+    next: Option<ParsedAutomationState>,
+) {
     workspace.update(|snapshot| {
         let resolved_active_task_id = active_task_id_for_snapshot(snapshot);
-        let Some(target_task_id) =
-            state_update_target_task_id(snapshot, resolved_active_task_id.as_deref(), next.as_ref())
-        else {
+        let Some(target_task_id) = state_update_target_task_id(
+            fixed_task_id,
+            snapshot,
+            resolved_active_task_id.as_deref(),
+            next.as_ref(),
+        ) else {
             return if next.is_some() {
                 false
             } else {
@@ -101,9 +153,33 @@ fn apply_state_file_snapshot(workspace: &Workspace, next: Option<ParsedAutomatio
         let next_session_id = next.as_ref().and_then(|state| state.thread_id.clone());
         let next_agent_state = next.as_ref().map(|state| state.state);
         let next_session_status = next.as_ref().map(|state| state.state.root_status());
-        let should_update_bridge_state =
-            resolved_active_task_id.as_deref() == Some(target_task_id.as_str())
-                || resolved_active_task_id.is_none();
+        if let Some(next_session_id) = next_session_id.as_deref()
+            && let Some(existing_task_state) = snapshot.task_states.get(&target_task_id)
+            && existing_task_state.session_id.as_deref().is_some()
+            && existing_task_state.session_id.as_deref() != Some(next_session_id)
+        {
+            return false;
+        }
+        if let (Some(next_agent_state), Some(next_session_id)) =
+            (next_agent_state, next_session_id.as_deref())
+            && let Some(existing_task_state) = snapshot.task_states.get(&target_task_id)
+            && existing_task_state.session_id.as_deref() == Some(next_session_id)
+            && matches!(
+                normalized_task_agent_state(existing_task_state),
+                Some(
+                    AutomationAgentState::Review
+                        | AutomationAgentState::Question
+                        | AutomationAgentState::Idle
+                )
+            )
+            && next_agent_state == AutomationAgentState::Working
+        {
+            return false;
+        }
+        let is_active_target = resolved_active_task_id.as_deref() == Some(target_task_id.as_str());
+        let should_update_bridge_state = resolved_active_task_id.as_deref()
+            == Some(target_task_id.as_str())
+            || resolved_active_task_id.is_none();
 
         let mut changed = false;
         if should_update_bridge_state {
@@ -139,8 +215,9 @@ fn apply_state_file_snapshot(workspace: &Workspace, next: Option<ParsedAutomatio
             task_state.session_status = next_session_status;
             changed = true;
         }
-        if task_state.waiting_on_vm {
-            task_state.waiting_on_vm = false;
+        let should_wait = task_should_wait_on_vm(is_active_target, next_agent_state);
+        if task_state.waiting_on_vm != should_wait {
+            task_state.waiting_on_vm = should_wait;
             changed = true;
         }
         changed
@@ -186,17 +263,34 @@ fn active_task_id_for_snapshot(snapshot: &WorkspaceSnapshot) -> Option<String> {
     snapshot.resolved_active_task_id()
 }
 
+fn task_should_wait_on_vm(is_active: bool, agent_state: Option<AutomationAgentState>) -> bool {
+    !is_active
+        && !matches!(
+            agent_state,
+            Some(
+                AutomationAgentState::Question
+                    | AutomationAgentState::Review
+                    | AutomationAgentState::Idle
+                    | AutomationAgentState::Stale
+            )
+        )
+}
+
 fn state_update_target_task_id(
+    fixed_task_id: Option<&str>,
     snapshot: &WorkspaceSnapshot,
     resolved_active_task_id: Option<&str>,
     next: Option<&ParsedAutomationState>,
 ) -> Option<String> {
+    if let Some(task_id) = fixed_task_id {
+        return Some(task_id.to_string());
+    }
+
     if let Some(thread_id) = next.and_then(|state| state.thread_id.as_deref()) {
         if let Some(task_id) = task_id_for_session_id(snapshot, thread_id) {
             return Some(task_id);
         }
-        if let Some(active_task_id) = resolved_active_task_id
-        {
+        if let Some(active_task_id) = resolved_active_task_id {
             let expected_session_id = expected_session_id_for_active_task(snapshot, active_task_id);
             if expected_session_id.is_none() || expected_session_id == Some(thread_id) {
                 return Some(active_task_id.to_string());
@@ -220,15 +314,77 @@ fn expected_session_id_for_active_task<'a>(
 }
 
 fn task_id_for_session_id(snapshot: &WorkspaceSnapshot, session_id: &str) -> Option<String> {
-    snapshot.task_states.iter().find_map(|(task_id, task_state)| {
-        (task_state.session_id.as_deref() == Some(session_id)).then(|| task_id.clone())
-    })
+    snapshot
+        .task_states
+        .iter()
+        .find_map(|(task_id, task_state)| {
+            (task_state.session_id.as_deref() == Some(session_id)).then(|| task_id.clone())
+        })
 }
 
 async fn read_state_file(path: &Path) -> Option<ParsedAutomationState> {
     tokio::fs::metadata(path).await.ok()?;
     let contents = tokio::fs::read_to_string(path).await.ok()?;
     parse_state_file(&contents)
+}
+
+async fn mirror_task_state_files(
+    workspace_directory_path: &Path,
+    workspace_key: &str,
+    snapshot: &WorkspaceSnapshot,
+) {
+    let task_dir = automation_task_state_dir_source(workspace_directory_path, workspace_key);
+    let _ = tokio::fs::create_dir_all(&task_dir).await;
+
+    for task in &snapshot.persistent.tasks {
+        let Some(task_state) = snapshot.task_states.get(&task.id) else {
+            continue;
+        };
+        let Some(session_id) = task_state.session_id.as_deref() else {
+            continue;
+        };
+        let Some(agent_state) = normalized_task_agent_state(task_state) else {
+            continue;
+        };
+        if agent_state == AutomationAgentState::WaitingOnVm {
+            continue;
+        }
+        let line = format!("{}:{session_id}\n", state_label(agent_state));
+        let path =
+            automation_task_state_file_source(workspace_directory_path, workspace_key, &task.id);
+        let _ = tokio::fs::write(path, line).await;
+    }
+}
+
+fn state_label(state: AutomationAgentState) -> &'static str {
+    match state {
+        AutomationAgentState::Working => "working",
+        AutomationAgentState::WaitingOnVm => "working",
+        AutomationAgentState::Question => "question",
+        AutomationAgentState::Review => "review",
+        AutomationAgentState::Idle => "idle",
+        AutomationAgentState::Stale => "stale",
+    }
+}
+
+fn normalized_task_agent_state(
+    task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+) -> Option<AutomationAgentState> {
+    match task_state.session_status {
+        Some(RootSessionStatus::Question) => Some(AutomationAgentState::Question),
+        Some(RootSessionStatus::Idle) if task_state.session_id.is_some() => {
+            Some(AutomationAgentState::Review)
+        }
+        Some(RootSessionStatus::Idle) => Some(AutomationAgentState::Idle),
+        Some(RootSessionStatus::Busy) => match task_state.agent_state {
+            Some(AutomationAgentState::WaitingOnVm) => Some(AutomationAgentState::Working),
+            other => other,
+        },
+        None => match task_state.agent_state {
+            Some(AutomationAgentState::WaitingOnVm) => None,
+            other => other,
+        },
+    }
 }
 
 fn parse_state_file(contents: &str) -> Option<ParsedAutomationState> {
@@ -301,11 +457,14 @@ mod tests {
     #[test]
     fn active_task_id_falls_back_to_automation_issue_mapping() {
         let mut snapshot = WorkspaceSnapshot::default();
-        snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-            "task-42".to_string(),
-            "https://github.com/example/repo/issues/42".to_string(),
-            WorkspaceTaskSource::Manual,
-        ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-42".to_string(),
+                "https://github.com/example/repo/issues/42".to_string(),
+                WorkspaceTaskSource::Manual,
+            ));
         snapshot.persistent.automation_issue =
             Some("https://github.com/example/repo/issues/42".to_string());
 
@@ -319,11 +478,14 @@ mod tests {
     fn apply_state_file_snapshot_populates_task_state_for_fallback_active_task() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
-            snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-                "task-42".to_string(),
-                "https://github.com/example/repo/issues/42".to_string(),
-                WorkspaceTaskSource::Manual,
-            ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
             snapshot.persistent.automation_issue =
                 Some("https://github.com/example/repo/issues/42".to_string());
             true
@@ -331,6 +493,7 @@ mod tests {
 
         apply_state_file_snapshot(
             &workspace,
+            None,
             Some(ParsedAutomationState {
                 state: AutomationAgentState::Working,
                 thread_id: Some("thread-42".to_string()),
@@ -357,11 +520,14 @@ mod tests {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
             snapshot.active_task_id = Some("task-42".to_string());
-            snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-                "task-42".to_string(),
-                "https://github.com/example/repo/issues/42".to_string(),
-                WorkspaceTaskSource::Manual,
-            ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
             snapshot.task_states.insert(
                 "task-42".to_string(),
                 crate::WorkspaceTaskRuntimeSnapshot {
@@ -377,6 +543,7 @@ mod tests {
 
         apply_state_file_snapshot(
             &workspace,
+            None,
             Some(ParsedAutomationState {
                 state: AutomationAgentState::Review,
                 thread_id: Some("thread-old".to_string()),
@@ -398,15 +565,74 @@ mod tests {
     }
 
     #[test]
+    fn apply_state_file_snapshot_ignores_stale_non_working_state_for_different_session() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.active_task_id = Some("task-42".to_string());
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot.task_states.insert(
+                "task-42".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-new".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            snapshot.automation_session_id = Some("thread-new".to_string());
+            snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+            snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+            true
+        });
+
+        apply_state_file_snapshot(
+            &workspace,
+            Some("task-42"),
+            Some(ParsedAutomationState {
+                state: AutomationAgentState::Review,
+                thread_id: Some("thread-old".to_string()),
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert_eq!(snapshot.automation_session_id.as_deref(), Some("thread-new"));
+        assert_eq!(
+            snapshot.automation_agent_state,
+            Some(AutomationAgentState::Working)
+        );
+        assert_eq!(
+            snapshot.automation_session_status,
+            Some(RootSessionStatus::Busy)
+        );
+        let task_state = snapshot
+            .task_states
+            .get("task-42")
+            .expect("task state should remain");
+        assert_eq!(task_state.session_id.as_deref(), Some("thread-new"));
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Busy));
+    }
+
+    #[test]
     fn apply_state_file_snapshot_preserves_existing_session_when_state_file_missing() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
             snapshot.active_task_id = Some("task-42".to_string());
-            snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-                "task-42".to_string(),
-                "https://github.com/example/repo/issues/42".to_string(),
-                WorkspaceTaskSource::Manual,
-            ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
             snapshot.task_states.insert(
                 "task-42".to_string(),
                 crate::WorkspaceTaskRuntimeSnapshot {
@@ -422,7 +648,7 @@ mod tests {
             true
         });
 
-        apply_state_file_snapshot(&workspace, None);
+        apply_state_file_snapshot(&workspace, None, None);
 
         let snapshot = workspace.subscribe().borrow().clone();
         assert_eq!(snapshot.automation_session_id.as_deref(), Some("thread-42"));
@@ -447,16 +673,22 @@ mod tests {
     fn apply_state_file_snapshot_updates_matching_task_without_reassigning_active_lease() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
-            snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-                "task-42".to_string(),
-                "https://github.com/example/repo/issues/42".to_string(),
-                WorkspaceTaskSource::Manual,
-            ));
-            snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-                "task-30".to_string(),
-                "https://github.com/example/repo/issues/30".to_string(),
-                WorkspaceTaskSource::Manual,
-            ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-30".to_string(),
+                    "https://github.com/example/repo/issues/30".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
             snapshot.active_task_id = Some("task-30".to_string());
             snapshot.persistent.automation_issue =
                 Some("https://github.com/example/repo/issues/30".to_string());
@@ -486,6 +718,7 @@ mod tests {
 
         apply_state_file_snapshot(
             &workspace,
+            None,
             Some(ParsedAutomationState {
                 state: AutomationAgentState::Review,
                 thread_id: Some("thread-42".to_string()),
@@ -506,11 +739,179 @@ mod tests {
         assert_eq!(task_42.session_id.as_deref(), Some("thread-42"));
         assert_eq!(task_42.agent_state, Some(AutomationAgentState::Review));
         assert_eq!(task_42.session_status, Some(RootSessionStatus::Idle));
+        assert!(!task_42.waiting_on_vm);
         let task_30 = snapshot
             .task_states
             .get("task-30")
             .expect("task 30 should remain");
         assert_eq!(task_30.session_id.as_deref(), Some("thread-30"));
         assert_eq!(task_30.agent_state, Some(AutomationAgentState::Working));
+    }
+
+    #[test]
+    fn apply_state_file_snapshot_keeps_non_active_working_task_waiting_on_vm() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-30".to_string(),
+                    "https://github.com/example/repo/issues/30".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot.active_task_id = Some("task-30".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/30".to_string());
+            snapshot.task_states.insert(
+                "task-42".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-42".to_string()),
+                    waiting_on_vm: true,
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        apply_state_file_snapshot(
+            &workspace,
+            None,
+            Some(ParsedAutomationState {
+                state: AutomationAgentState::Working,
+                thread_id: Some("thread-42".to_string()),
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_42 = snapshot
+            .task_states
+            .get("task-42")
+            .expect("task 42 should remain");
+        assert_eq!(task_42.agent_state, Some(AutomationAgentState::Working));
+        assert_eq!(task_42.session_status, Some(RootSessionStatus::Busy));
+        assert!(task_42.waiting_on_vm);
+    }
+
+    #[test]
+    fn apply_state_file_snapshot_targets_explicit_task_file_without_reassigning_active_task() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-30".to_string(),
+                    "https://github.com/example/repo/issues/30".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot.active_task_id = Some("task-30".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/30".to_string());
+            snapshot.task_states.insert(
+                "task-42".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-42".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    waiting_on_vm: true,
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        apply_state_file_snapshot(
+            &workspace,
+            Some("task-42"),
+            Some(ParsedAutomationState {
+                state: AutomationAgentState::Review,
+                thread_id: Some("thread-42".to_string()),
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert_eq!(snapshot.active_task_id.as_deref(), Some("task-30"));
+        let task_42 = snapshot
+            .task_states
+            .get("task-42")
+            .expect("task 42 should remain");
+        assert_eq!(task_42.agent_state, Some(AutomationAgentState::Review));
+        assert_eq!(task_42.session_status, Some(RootSessionStatus::Idle));
+        assert!(!task_42.waiting_on_vm);
+    }
+
+    #[test]
+    fn normalized_task_agent_state_prefers_review_when_idle_session_is_present() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-39".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            normalized_task_agent_state(&task_state),
+            Some(AutomationAgentState::Review)
+        );
+    }
+
+    #[test]
+    fn apply_state_file_snapshot_ignores_stale_working_update_for_review_task_session() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.active_task_id = Some("task-39".to_string());
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-39".to_string(),
+                    "https://github.com/example/repo/issues/39".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot.task_states.insert(
+                "task-39".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-39".to_string()),
+                    session_status: Some(RootSessionStatus::Idle),
+                    agent_state: Some(AutomationAgentState::Review),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        apply_state_file_snapshot(
+            &workspace,
+            Some("task-39"),
+            Some(ParsedAutomationState {
+                state: AutomationAgentState::Working,
+                thread_id: Some("thread-39".to_string()),
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-39")
+            .expect("task 39 should remain");
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Review));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
     }
 }
