@@ -23,6 +23,28 @@ cargo run --bin multicode-tui config.toml
 a single issue report. A workspace gets its own working directory and agent session, so you can work from a blank
 slate.
 
+## Autonomous queueing
+
+When a workspace is assigned to a GitHub repository, *multicode* can scan for issues and queue multiple issue tasks in
+that workspace.
+
+Queueing is controlled in `config.toml` with the `[autonomous]` section:
+
+```toml
+[autonomous]
+max-parallel-issues = 5
+issue-scan-delay-seconds = 900
+```
+
+Notes:
+
+- `max-parallel-issues` controls how many issue tasks a workspace may queue at once.
+- The default `max-parallel-issues` value is `5`.
+- If a workspace already has that many queued tasks, it will not scan in additional issues until you remove, finish,
+  or otherwise clear some of the existing tasks.
+- `issue-scan-delay-seconds` controls how often background issue scans are retried. The default is `900` seconds
+  (15 minutes).
+
 ## Agent configuration
 
 The agent used inside workspaces is configured globally in `config.toml` with the `[agent]` section.
