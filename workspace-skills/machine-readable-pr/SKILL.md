@@ -22,3 +22,7 @@ After creating the PR, assigning yourself, and requesting the Copilot review, im
 If the PR resolves a specific issue, when writing the PR description, end it with `Resolves #1234`, where 1234 is the issue number. 
 
 If you have write permission to the upstream repo, prefer pushing the PR branch there instead of in a fork.
+
+Do not merge pull requests yourself. A PR should be merged by a human, not by the agent.
+
+The only exception is an explicit dependency-upgrade workflow where the user or repository policy already allows automated merging for that upgrade task. Outside that narrow case, stop at review-ready and leave the PR open.

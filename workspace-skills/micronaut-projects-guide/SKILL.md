@@ -33,10 +33,13 @@ You can also use these features to verify patches against a user-provided or out
 
 Unless requested otherwise, target fixes against the default branch, which will be the next minor release.
 
+Do not merge Micronaut pull requests yourself. Leave the PR open for human review and human merge.
+
+The only exception is an explicit dependency-upgrade use case where automated merge is already intended by the workflow or requested by the user.
+
 Tag PRs with the following GitHub tags where appropriate:
 
 - `type: bug`
 - `type: improvement`
 - `type: breaking`
-
 
