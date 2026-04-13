@@ -222,6 +222,17 @@ mod tests {
     }
 
     #[test]
+    fn task_issue_reference_trims_micronaut_prefix_from_repo_name() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-12".to_string(),
+            "https://github.com/micronaut-projects/micronaut-graphql/issues/12".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+
+        assert_eq!(crate::task_row_label(&task), "➡️ graphql#12");
+    }
+
+    #[test]
     fn task_issue_link_defaults_to_persistent_issue_url() {
         let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
             "task-1".to_string(),

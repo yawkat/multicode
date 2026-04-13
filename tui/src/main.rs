@@ -386,6 +386,10 @@ fn task_runtime_snapshot<'a>(
     snapshot.task_states.get(task_id)
 }
 
+fn compact_task_repo_label(repo: &str) -> &str {
+    repo.strip_prefix("micronaut-").unwrap_or(repo)
+}
+
 fn task_issue_reference(task: &WorkspaceTaskPersistentSnapshot) -> String {
     let Some(url) = Url::parse(&task.issue_url).ok() else {
         return task.issue_url.clone();
@@ -395,7 +399,7 @@ fn task_issue_reference(task: &WorkspaceTaskPersistentSnapshot) -> String {
         .map(|segments| segments.collect::<Vec<_>>())
         .unwrap_or_default();
     if segments.len() >= 4 {
-        let repo = segments[1];
+        let repo = compact_task_repo_label(segments[1]);
         let number = segments[3];
         return format!("{repo}#{number}");
     }
