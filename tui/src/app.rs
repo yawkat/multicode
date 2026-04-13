@@ -2692,13 +2692,31 @@ pub(crate) fn snapshot_attach_target_for_selection(
     snapshot: &WorkspaceSnapshot,
     selected_task_id: Option<&str>,
 ) -> io::Result<AttachTarget> {
-    if let Some(task_id) = selected_task_id
-        && let Some(task_state) = task_runtime_snapshot(snapshot, task_id)
-    {
-        if snapshot.persistent.automation_paused && task_state.session_id.is_none() {
+    if let Some(task_id) = selected_task_id {
+        if snapshot.persistent.automation_paused
+            && snapshot.task_persistent_snapshot(task_id).is_some()
+            && snapshot
+                .task_states
+                .get(task_id)
+                .and_then(|task_state| task_state.session_id.as_deref())
+                .is_none()
+        {
+            if let Some(uri) = snapshot.transient.as_ref().map(|transient| transient.uri.as_str()) {
+                let parsed = Url::parse(uri).map_err(|err| {
+                    io::Error::other(format!("workspace attach URI is invalid: {err}"))
+                })?;
+                if matches!(parsed.scheme(), "ws" | "wss") {
+                    return Ok(AttachTarget::Codex {
+                        uri: parsed.to_string(),
+                        thread_id: None,
+                    });
+                }
+            }
             return workspace_attach_target(snapshot);
         }
-        return task_attach_target(snapshot, task_state);
+        if let Some(task_state) = task_runtime_snapshot(snapshot, task_id) {
+            return task_attach_target(snapshot, task_state);
+        }
     }
     workspace_attach_target(snapshot)
 }

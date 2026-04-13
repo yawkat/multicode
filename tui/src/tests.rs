@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_attach_target_for_selection_falls_back_to_workspace_attach_when_paused_task_has_no_session(
+    fn snapshot_attach_target_for_selection_falls_back_to_workspace_attach_when_paused_opencode_task_has_no_session(
     ) {
         let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
         started.root_session_id = Some("ses-root-1".to_string());
@@ -797,6 +797,29 @@ mod tests {
                 username: "opencode".to_string(),
                 password: "secret".to_string(),
                 session_id: Some("ses-root-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_attach_target_for_selection_uses_last_codex_thread_when_paused_task_has_no_session(
+    ) {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        started.persistent.automation_paused = true;
+        assign_active_task(
+            &mut started,
+            "https://github.com/example/repo/issues/42",
+        );
+
+        let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
+            .expect("paused codex task selection should attach via last task thread");
+
+        assert_eq!(
+            target,
+            AttachTarget::Codex {
+                uri: "ws://127.0.0.1:3456/".to_string(),
+                thread_id: None,
             }
         );
     }
