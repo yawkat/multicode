@@ -73,20 +73,22 @@ fn read_codex_session_turn_metrics(
 }
 
 pub(crate) fn last_user_message_from_codex_session_log_contents(contents: &str) -> Option<String> {
-    contents.lines().filter_map(|line| {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        let payload = value.get("payload")?;
-        if payload.get("type").and_then(serde_json::Value::as_str) != Some("user_message") {
-            return None;
-        }
-        payload
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-            .map(ToOwned::to_owned)
-    })
-    .last()
+    contents
+        .lines()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            let payload = value.get("payload")?;
+            if payload.get("type").and_then(serde_json::Value::as_str) != Some("user_message") {
+                return None;
+            }
+            payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .last()
 }
 
 fn first_user_message_from_codex_session_log_contents(contents: &str) -> Option<String> {
@@ -1413,10 +1415,7 @@ impl TuiState {
                         }
                         _ => {
                             service
-                                .prompt_root_session(
-                                    &snapshot_for_resume,
-                                    CODEX_AUTO_RESUME_PROMPT,
-                                )
+                                .prompt_root_session(&snapshot_for_resume, CODEX_AUTO_RESUME_PROMPT)
                                 .await
                         }
                     };

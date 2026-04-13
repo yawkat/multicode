@@ -602,7 +602,10 @@ mod tests {
         );
 
         let snapshot = workspace.subscribe().borrow().clone();
-        assert_eq!(snapshot.automation_session_id.as_deref(), Some("thread-new"));
+        assert_eq!(
+            snapshot.automation_session_id.as_deref(),
+            Some("thread-new")
+        );
         assert_eq!(
             snapshot.automation_agent_state,
             Some(AutomationAgentState::Working)

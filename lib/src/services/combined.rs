@@ -992,7 +992,7 @@ impl CombinedService {
             prompt,
             existing_session_id.as_deref(),
         )
-            .await
+        .await
     }
 
     pub async fn restart_task_session(
@@ -1008,11 +1008,7 @@ impl CombinedService {
                 .await;
         }
 
-        tracing::info!(
-            workspace_key,
-            task_id,
-            "starting fresh codex task session"
-        );
+        tracing::info!(workspace_key, task_id, "starting fresh codex task session");
         let previous_session_id = snapshot
             .task_states
             .get(task_id)
@@ -1080,7 +1076,9 @@ impl CombinedService {
                     next.automation_agent_state = Some(crate::AutomationAgentState::Working);
                     changed = true;
                 }
-                if next.automation_session_status != Some(super::root_session_service::RootSessionStatus::Busy) {
+                if next.automation_session_status
+                    != Some(super::root_session_service::RootSessionStatus::Busy)
+                {
                     next.automation_session_status =
                         Some(super::root_session_service::RootSessionStatus::Busy);
                     changed = true;
