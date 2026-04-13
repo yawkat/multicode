@@ -756,18 +756,17 @@ async fn watch_workspace(
                 "failed to refresh backing pull requests for existing tasks during scan"
             );
         }
-        let available_slots = service
-            .config
-            .autonomous
-            .max_parallel_issues
-            .saturating_sub(snapshot.persistent.tasks.len());
+        let available_slots = available_issue_scan_slots(
+            service.config.autonomous.max_parallel_issues,
+            snapshot.persistent.tasks.len(),
+        );
         match enqueue_next_issues(
             &service,
             &workspace,
             &workspace_key,
             &snapshot,
             &assigned_repository,
-            available_slots.max(1),
+            available_slots,
         )
         .await
         {
@@ -3112,6 +3111,10 @@ fn issue_number_from_url(issue_url: &str) -> Option<u64> {
     segments[3].parse::<u64>().ok()
 }
 
+fn available_issue_scan_slots(max_parallel_issues: usize, task_count: usize) -> usize {
+    max_parallel_issues.saturating_sub(task_count)
+}
+
 fn issue_search_args(assigned_repository: &str, label: &str) -> Vec<String> {
     vec![
         "search".to_string(),
@@ -4385,6 +4388,14 @@ mod tests {
         let args = issue_search_args("example/repo", "type: bug");
         assert!(args.iter().any(|arg| arg == "-linked:pr"));
         assert!(args.windows(2).any(|pair| pair == ["--state", "open"]));
+    }
+
+    #[test]
+    fn available_issue_scan_slots_stops_at_zero_when_queue_is_full() {
+        assert_eq!(available_issue_scan_slots(5, 0), 5);
+        assert_eq!(available_issue_scan_slots(5, 4), 1);
+        assert_eq!(available_issue_scan_slots(5, 5), 0);
+        assert_eq!(available_issue_scan_slots(5, 6), 0);
     }
 
     #[test]
