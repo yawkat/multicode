@@ -21,7 +21,6 @@ populate-git-credentials = true
 [isolation]
 add-skills-from = ["./workspace-skills"]
 writable = [
-    "~/.codex",
     "~/.gradle",
     "~/.m2/repository",
     "~/.config/gh",
@@ -35,7 +34,6 @@ inherit-env = [
     "LANG",
     "TERM",
     "COLORTERM",
-    "GITHUB_MCP_TOKEN",
 ]
 memory-high = "6 GiB"
 memory-max = "8 GiB"

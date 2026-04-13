@@ -391,7 +391,11 @@ pub(crate) async fn attach_in_tmux(
     custom_description: &str,
 ) -> io::Result<()> {
     let original_term = std::env::var("TERM").ok();
-    let mut attach_env = extra_env
+    let mut session_env = extra_env.to_vec();
+    if let Some(term) = original_term.as_deref() {
+        session_env.push(("TERM".to_string(), term.to_string()));
+    }
+    let attach_env = extra_env
         .iter()
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>();
@@ -399,14 +403,20 @@ pub(crate) async fn attach_in_tmux(
         username, password, ..
     } = target
     {
-        attach_env.push(format!("OPENCODE_SERVER_USERNAME={username}"));
-        attach_env.push(format!("OPENCODE_SERVER_PASSWORD={password}"));
+        session_env.push((
+            "OPENCODE_SERVER_USERNAME".to_string(),
+            username.to_string(),
+        ));
+        session_env.push((
+            "OPENCODE_SERVER_PASSWORD".to_string(),
+            password.to_string(),
+        ));
     }
-    let mut attach_command = tmux_session_command(attach_env, original_term.as_deref());
+    let mut attach_command = tmux_session_command(attach_env, None);
     attach_command.extend(attach_cli_args(agent_command, target));
     run_tmux_new_session_command(
         terminal,
-        &[],
+        &session_env,
         attach_command,
         workspace_key,
         custom_description,

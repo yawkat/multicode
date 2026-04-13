@@ -430,6 +430,7 @@ cpu = "300%"
         assert!(run_command.contains("--cpus 3"));
         assert!(run_command.contains("--memory 17179869184"));
         assert!(run_command.contains("codex app-server --listen ws://0.0.0.0:43124"));
+        assert!(!run_command.contains("target=/multicode-agent/codex-home/auth.json"));
 
         let server_env = workspace_directory
             .join(".multicode")
@@ -440,22 +441,35 @@ cpu = "300%"
             fs::read_to_string(&server_env).expect("server env file should be written");
         assert!(env_contents.contains("CODEX_HOME=/multicode-agent/codex-home"));
         assert!(env_contents.contains(&format!("HOME={}", home.display())));
+        let server_env_mode = fs::metadata(&server_env)
+            .expect("server env metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(server_env_mode, 0o600);
 
         let synthetic_codex_home = workspace_directory
             .join(".multicode")
             .join("codex")
             .join("alpha")
             .join("home");
-        assert_eq!(
-            fs::read_to_string(synthetic_codex_home.join("config.toml"))
-                .expect("synthetic codex config should exist"),
-            "model = \"gpt-5-codex\"\n"
+        let synthetic_config = fs::read_to_string(synthetic_codex_home.join("config.toml"))
+            .expect("synthetic codex config should exist");
+        assert!(
+            synthetic_config.contains("# Managed by multicode\n"),
+            "synthetic codex config should include the managed multicode block"
         );
-        assert_eq!(
-            fs::read_to_string(synthetic_codex_home.join("auth.json"))
-                .expect("synthetic codex auth should exist"),
-            r#"{"token":"codex"}"#
+        assert!(
+            synthetic_config.contains("model = \"gpt-5-codex\"\n"),
+            "synthetic codex config should preserve the configured model"
         );
+        assert!(
+            synthetic_config.contains("model_provider = \"openai\"\n"),
+            "synthetic codex config should include the managed provider override"
+        );
+        let persisted_auth = fs::read_to_string(synthetic_codex_home.join("auth.json"))
+            .expect("synthetic codex auth should exist");
+        assert_eq!(persisted_auth, r#"{"token":"codex"}"#);
         assert_eq!(
             fs::read_to_string(synthetic_codex_home.join("AGENTS.md"))
                 .expect("synthetic codex AGENTS should exist"),

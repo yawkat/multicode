@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeMap,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::OnceLock,
 };
 
 use serde::Deserialize;
-use tokio::{process::Command, sync::Mutex};
+use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 use uuid::Uuid;
 
 use super::{
@@ -163,21 +164,36 @@ async fn prepare_synthetic_codex_home(
     source_root: &Path,
     added_skills: &[super::config::AddedSkillMount],
     config: &CodexAgentConfig,
+    materialize_host_auth: bool,
 ) -> Result<(), CombinedServiceError> {
     tokio::fs::create_dir_all(source_root).await?;
-    let host_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        CombinedServiceError::ShellExpand("HOME environment variable not found".to_string())
-    })?;
-    let host_codex_home = host_home.join(".codex");
+    let host_codex_home = host_codex_home_path()?;
     let target_config = source_root.join("config.toml");
+    let target_auth = source_root.join("auth.json");
+    let host_auth = host_codex_auth_path()?;
 
     copy_optional_host_file(&host_codex_home.join("config.toml"), &target_config).await?;
     write_synthetic_codex_config(&target_config, config).await?;
-    copy_optional_host_file(
-        &host_codex_home.join("auth.json"),
-        &source_root.join("auth.json"),
-    )
-    .await?;
+    match tokio::fs::remove_file(&target_auth).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    if materialize_host_auth {
+        if let Some(host_auth) = host_auth.as_ref() {
+            copy_optional_host_file(host_auth, &target_auth).await?;
+        }
+    } else if host_auth.is_some() {
+        let mut auth_placeholder = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&target_auth)
+            .await?;
+        auth_placeholder.flush().await?;
+        tokio::fs::set_permissions(&target_auth, std::fs::Permissions::from_mode(0o600)).await?;
+    }
     copy_optional_host_file(
         &host_codex_home.join("AGENTS.md"),
         &source_root.join("AGENTS.md"),
@@ -208,6 +224,18 @@ async fn prepare_synthetic_codex_home(
     }
 
     Ok(())
+}
+
+fn host_codex_home_path() -> Result<PathBuf, CombinedServiceError> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CombinedServiceError::ShellExpand("HOME environment variable not found".to_string())
+    })?;
+    Ok(host_home.join(".codex"))
+}
+
+fn host_codex_auth_path() -> Result<Option<PathBuf>, CombinedServiceError> {
+    let path = host_codex_home_path()?.join("auth.json");
+    Ok((path.is_absolute() && path.is_file() && std::fs::read(&path).is_ok()).then_some(path))
 }
 
 async fn write_synthetic_codex_config(
@@ -793,6 +821,7 @@ impl LinuxSystemdBwrapRuntime {
                 &source,
                 &self.context.expanded_isolation.added_skills,
                 &self.context.codex,
+                false,
             )
             .await?;
             mount_specs.push(MountSpec::new(
@@ -800,6 +829,13 @@ impl LinuxSystemdBwrapRuntime {
                 Some(source),
                 MountKind::Writable,
             ));
+            if let Some(host_codex_auth) = host_codex_auth_path()? {
+                mount_specs.push(MountSpec::new(
+                    PathBuf::from(SYNTHETIC_CODEX_HOME).join("auth.json"),
+                    Some(host_codex_auth),
+                    MountKind::Readable,
+                ));
+            }
         }
         mount_specs.sort_by(|a, b| {
             a.depth()
@@ -1385,6 +1421,7 @@ impl AppleContainerRuntime {
                 &source,
                 &self.context.expanded_isolation.added_skills,
                 &self.context.codex,
+                true,
             )
             .await?;
             mount_specs.push(MountSpec::new(
@@ -1555,7 +1592,16 @@ impl AppleContainerRuntime {
             content.push_str(value);
             content.push('\n');
         }
-        tokio::fs::write(&path, content).await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
         Ok(path)
     }
 
@@ -2337,6 +2383,16 @@ mod tests {
                 "apple backend should mount a synthetic CODEX_HOME"
             );
             assert!(
+                command.args.iter().all(|arg| {
+                    !(arg.contains("type=bind")
+                        && arg.contains(&format!(
+                            "target={}/auth.json",
+                            SYNTHETIC_CODEX_HOME
+                        )))
+                }),
+                "apple backend should not emit a separate auth.json bind mount"
+            );
+            assert!(
                 command.args.iter().any(|arg| {
                     arg.contains("type=bind")
                         && arg.contains(&format!("target={AUTOMATION_STATE_DIR}"))
@@ -2356,6 +2412,15 @@ mod tests {
                 )),
                 "apple backend should export the automation state file path"
             );
+            let server_env_mode = fs::metadata(&server_env)
+                .expect("server env metadata should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                server_env_mode, 0o600,
+                "apple backend should write env files with 0600 permissions"
+            );
             assert_eq!(
                 fs::read_to_string(
                     workspace_root
@@ -2367,7 +2432,6 @@ mod tests {
                 )
                 .expect("synthetic codex config should exist"),
                 concat!(
-                    "model = \"gpt-5-codex\"\n",
                     "# Managed by multicode\n",
                     "profile = \"default\"\n",
                     "model = \"gpt-5-codex\"\n",
@@ -2375,6 +2439,17 @@ mod tests {
                     "approval_policy = \"never\"\n",
                     "sandbox_mode = \"danger-full-access\"\n",
                 )
+            );
+            let persisted_auth = workspace_root
+                .join(".multicode")
+                .join("codex")
+                .join("alpha")
+                .join("home")
+                .join("auth.json");
+            assert_eq!(
+                fs::read_to_string(&persisted_auth)
+                    .expect("synthetic auth should be readable"),
+                r#"{"token":"codex"}"#
             );
         });
     }

@@ -29,7 +29,6 @@ add-skills-from = ["./workspace-skills"]
 writable = [
     "~/.local/share/opencode/bin",
     "~/.cache/opencode",
-    "~/.codex",
     "~/.bun",
     "~/.cache/bun",
     "~/.gradle",
@@ -62,7 +61,6 @@ inherit-env = [
     "LANG",
     "TERM",
     "COLORTERM",
-    "GITHUB_MCP_TOKEN",
 ]
 memory-high = "12 GiB"
 memory-max = "16 GiB"
@@ -95,11 +93,6 @@ dereference-symlinks = true
 local = "~/.local/share/opencode/auth.json"
 remote = "~/.local/share/opencode/auth.json"
 dereference-symlinks = true
-[[remote.sync-up]]
-local = "~/.codex"
-remote = "~/.codex"
-dereference-symlinks = true
-
 [[remote.sync-bidi]]
 local = "/var/tmp/multicode-remote-workspace"
 remote = "~/dev/agent-work"
