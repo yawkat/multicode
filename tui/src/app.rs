@@ -1211,9 +1211,8 @@ impl TuiState {
             return;
         };
         let previous_snapshot = snapshot.clone();
-        let should_restart = should_restart_codex_task_for_pr_request(
-            task_runtime_snapshot(&snapshot, &task_id),
-        );
+        let should_restart =
+            should_restart_codex_task_for_pr_request(task_runtime_snapshot(&snapshot, &task_id));
         let (progress_tx, progress_rx) =
             watch::channel("Preparing PR approval request...".to_string());
         let (result_tx, result_rx) = oneshot::channel();
@@ -1253,7 +1252,11 @@ impl TuiState {
                 if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
                     workspace.update(|next| {
                         let mut changed = false;
-                        match previous_snapshot.task_states.get(&task_id_for_task).cloned() {
+                        match previous_snapshot
+                            .task_states
+                            .get(&task_id_for_task)
+                            .cloned()
+                        {
                             Some(previous_task_state) => {
                                 if next.task_states.get(&task_id_for_task)
                                     != Some(&previous_task_state)
@@ -1295,7 +1298,9 @@ impl TuiState {
                 return;
             }
 
-            let _ = progress_tx.send("Codex accepted the PR request and is continuing in the background.".to_string());
+            let _ = progress_tx.send(
+                "Codex accepted the PR request and is continuing in the background.".to_string(),
+            );
             let _ = result_tx.send(Ok(()));
         });
 
@@ -2856,7 +2861,11 @@ pub(crate) fn snapshot_attach_target_for_selection(
                 .and_then(|task_state| task_state.session_id.as_deref())
                 .is_none()
         {
-            if let Some(uri) = snapshot.transient.as_ref().map(|transient| transient.uri.as_str()) {
+            if let Some(uri) = snapshot
+                .transient
+                .as_ref()
+                .map(|transient| transient.uri.as_str())
+            {
                 let parsed = Url::parse(uri).map_err(|err| {
                     io::Error::other(format!("workspace attach URI is invalid: {err}"))
                 })?;

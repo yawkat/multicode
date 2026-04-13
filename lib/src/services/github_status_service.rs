@@ -523,19 +523,20 @@ impl GithubStatusService {
                 }
                 Err(error) => {
                     let now = now_epoch_seconds();
-                    let mut next_status = current_status.take().unwrap_or_else(|| {
-                        match entry.reference.kind {
-                            GithubLinkKind::PullRequest => {
-                                CachedLinkStatus::new_pr_error_placeholder(
-                                    entry.reference.clone(),
-                                    now,
-                                )
-                            }
-                            GithubLinkKind::Issue => {
-                                CachedLinkStatus::new_pending(entry.reference.clone(), now)
-                            }
-                        }
-                    });
+                    let mut next_status =
+                        current_status
+                            .take()
+                            .unwrap_or_else(|| match entry.reference.kind {
+                                GithubLinkKind::PullRequest => {
+                                    CachedLinkStatus::new_pr_error_placeholder(
+                                        entry.reference.clone(),
+                                        now,
+                                    )
+                                }
+                                GithubLinkKind::Issue => {
+                                    CachedLinkStatus::new_pending(entry.reference.clone(), now)
+                                }
+                            });
                     next_status.last_error = Some(error.to_string());
                     next_status.refresh_after_epoch_seconds =
                         Some(now + FETCH_ERROR_RETRY_INTERVAL.as_secs() as i64);

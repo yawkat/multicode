@@ -837,9 +837,10 @@ async fn start_assigned_issue_work(
         return Ok(None);
     };
     let existing_task = task_persistent_snapshot_for_issue(snapshot, &issue.url);
-    let backing_pr_url = issue.backing_pr_url().map(ToOwned::to_owned).or_else(|| {
-        existing_task.and_then(|task| task.backing_pr_url.clone())
-    });
+    let backing_pr_url = issue
+        .backing_pr_url()
+        .map(ToOwned::to_owned)
+        .or_else(|| existing_task.and_then(|task| task.backing_pr_url.clone()));
     let dependency_upgrade_backing_pr = issue.backing_pr_url().is_some()
         || existing_task.is_some_and(|task| task.dependency_upgrade_backing_pr);
 
@@ -889,7 +890,9 @@ async fn start_assigned_issue_work(
         assigned_repository,
         &task_id,
         &issue,
-        dependency_upgrade_backing_pr.then_some(backing_pr_url.as_deref()).flatten(),
+        dependency_upgrade_backing_pr
+            .then_some(backing_pr_url.as_deref())
+            .flatten(),
         &task_session_id,
         task_cwd_path(service, workspace_key, assigned_repository, &issue.url),
     )
@@ -1933,6 +1936,14 @@ async fn reconcile_codex_task_runtime_states(
             continue;
         }
         let metadata = codex_task_metadata_from_turns(&response.thread.turns, &task.issue_url);
+        let should_refresh_after_review = should_refresh_task_links_after_codex_review(
+            task_state,
+            next_session_status,
+            next_agent_state,
+        );
+        let refresh_urls = should_refresh_after_review
+            .then(|| task_link_refresh_urls(task, task_state, &metadata))
+            .unwrap_or_default();
         set_task_runtime_state_from_codex(
             workspace,
             &task.id,
@@ -1942,6 +1953,22 @@ async fn reconcile_codex_task_runtime_states(
             Some(metadata),
             usage_total_tokens,
         );
+        if should_refresh_after_review {
+            if let Some(backing_pr_url) = refresh_task_backing_pr_url_after_codex_review(
+                service,
+                workspace,
+                assigned_repository,
+                &task.id,
+                &task.issue_url,
+            )
+            .await
+            {
+                let _ = service
+                    .github_status_service()
+                    .request_refresh(&backing_pr_url);
+            }
+            request_refresh_for_task_links(&service, refresh_urls.iter().map(String::as_str));
+        }
         write_authoritative_task_state_file(
             service.workspace_directory_path(),
             workspace_key,
@@ -2409,6 +2436,109 @@ fn set_task_runtime_state_from_codex(
     });
 }
 
+fn should_refresh_task_links_after_codex_review(
+    task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+    next_session_status: RootSessionStatus,
+    next_agent_state: AutomationAgentState,
+) -> bool {
+    next_agent_state == AutomationAgentState::Review
+        && next_session_status == RootSessionStatus::Idle
+        && (task_state.agent_state != Some(AutomationAgentState::Review)
+            || task_state.session_status != Some(RootSessionStatus::Idle)
+            || task_state.status.as_deref() == Some("Resuming in background"))
+}
+
+fn task_link_refresh_urls(
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+    metadata: &CodexTaskMetadata,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for url in std::iter::once(task.issue_url.as_str())
+        .chain(metadata.prs.iter().map(String::as_str))
+        .chain(task_state.pr.iter().map(String::as_str))
+        .chain(task.backing_pr_url.iter().map(String::as_str))
+    {
+        if seen.insert(url.to_string()) {
+            urls.push(url.to_string());
+        }
+    }
+    urls
+}
+
+async fn refresh_task_backing_pr_url_after_codex_review(
+    service: &CombinedService,
+    workspace: &Workspace,
+    assigned_repository: &str,
+    task_id: &str,
+    issue_url: &str,
+) -> Option<String> {
+    let issue_number = issue_number_from_url(issue_url)?;
+    let token = match resolved_gh_token(service).await {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                issue_url,
+                error = %err,
+                "failed to resolve GitHub token while refreshing task PR after codex review"
+            );
+            return None;
+        }
+    };
+    let open_pull_requests = match list_open_pull_requests(assigned_repository, &token).await {
+        Ok(open_pull_requests) => open_pull_requests,
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                issue_url,
+                assigned_repository,
+                error = %err,
+                "failed to list open pull requests while refreshing task PR after codex review"
+            );
+            return None;
+        }
+    };
+    let issue = SelectedIssue {
+        number: issue_number,
+        title: String::new(),
+        url: issue_url.to_string(),
+        created_at: String::new(),
+        state: Some("OPEN".to_string()),
+        is_pull_request: Some(false),
+        body: None,
+        labels: Vec::new(),
+        dependency_upgrade_pr_url: None,
+    };
+    let backing_pr_url =
+        discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests)?;
+    workspace.update(|snapshot| {
+        let mut changed = false;
+        if let Some(task) = snapshot
+            .persistent
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            && task.backing_pr_url.as_deref() != Some(backing_pr_url.as_str())
+        {
+            task.backing_pr_url = Some(backing_pr_url.clone());
+            changed = true;
+        }
+        if let Some(task_state) = snapshot.task_states.get_mut(task_id)
+            && !task_state
+                .pr
+                .iter()
+                .any(|candidate| candidate == &backing_pr_url)
+        {
+            task_state.pr.insert(0, backing_pr_url.clone());
+            changed = true;
+        }
+        changed
+    });
+    Some(backing_pr_url)
+}
+
 fn codex_task_status_text(
     agent_state: AutomationAgentState,
     metadata: Option<&CodexTaskMetadata>,
@@ -2536,6 +2666,15 @@ fn request_refresh_for_task_issues<'a>(
     }
 }
 
+fn request_refresh_for_task_links<'a>(
+    service: &CombinedService,
+    urls: impl Iterator<Item = &'a str>,
+) {
+    for url in urls {
+        let _ = service.github_status_service().request_refresh(url);
+    }
+}
+
 fn closed_background_task_issue_urls(
     snapshot: &WorkspaceSnapshot,
     active_issue_url: Option<&str>,
@@ -2582,8 +2721,10 @@ async fn close_dependency_upgrade_issue(
     let Some(task) = task_persistent_snapshot_for_issue(snapshot, issue_url) else {
         return Ok(());
     };
-    let Some(backing_pr_url) =
-        task.dependency_upgrade_backing_pr.then_some(task.backing_pr_url.as_deref()).flatten()
+    let Some(backing_pr_url) = task
+        .dependency_upgrade_backing_pr
+        .then_some(task.backing_pr_url.as_deref())
+        .flatten()
     else {
         return Ok(());
     };
@@ -3326,11 +3467,10 @@ fn pull_request_has_closing_issue_reference(
             format!("{keyword} {repo_issue_ref}"),
             format!("{keyword} {issue_url}"),
         ];
-        refs.iter()
-            .any(|candidate| {
-                contains_standalone_reference(&body, candidate)
-                    || contains_standalone_reference(&title, candidate)
-            })
+        refs.iter().any(|candidate| {
+            contains_standalone_reference(&body, candidate)
+                || contains_standalone_reference(&title, candidate)
+        })
     })
 }
 
@@ -4682,7 +4822,10 @@ mod tests {
         set_paused_automation_state(&workspace, "repo");
         let paused_twice = workspace.subscribe().borrow().clone();
 
-        assert_eq!(paused_once.automation_status, paused_twice.automation_status);
+        assert_eq!(
+            paused_once.automation_status,
+            paused_twice.automation_status
+        );
         assert_eq!(
             paused_once.automation_session_id,
             paused_twice.automation_session_id
@@ -5660,6 +5803,72 @@ mod tests {
             .get("task-33")
             .expect("task state should exist");
         assert_eq!(task_state.status.as_deref(), Some("PR created #56"));
+    }
+
+    #[test]
+    fn should_refresh_task_links_after_codex_review_detects_resumed_background_completion() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Working),
+            session_status: Some(RootSessionStatus::Busy),
+            status: Some("Resuming in background".to_string()),
+            ..Default::default()
+        };
+
+        assert!(should_refresh_task_links_after_codex_review(
+            &task_state,
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review
+        ));
+    }
+
+    #[test]
+    fn should_refresh_task_links_after_codex_review_ignores_stable_review_state() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            status: Some("PR created #56".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!should_refresh_task_links_after_codex_review(
+            &task_state,
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review
+        ));
+    }
+
+    #[test]
+    fn task_link_refresh_urls_collects_issue_and_prs_without_duplicates() {
+        let task = WorkspaceTaskPersistentSnapshot::new(
+            "task-33".to_string(),
+            "https://github.com/example/repo/issues/33".to_string(),
+            WorkspaceTaskSource::Scan,
+        )
+        .with_backing_pr_url(Some("https://github.com/example/repo/pull/56".to_string()));
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            pr: vec![
+                "https://github.com/example/repo/pull/56".to_string(),
+                "https://github.com/example/repo/pull/57".to_string(),
+            ],
+            ..Default::default()
+        };
+        let metadata = CodexTaskMetadata {
+            prs: vec![
+                "https://github.com/example/repo/pull/57".to_string(),
+                "https://github.com/example/repo/pull/58".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            task_link_refresh_urls(&task, &task_state, &metadata),
+            vec![
+                "https://github.com/example/repo/issues/33".to_string(),
+                "https://github.com/example/repo/pull/57".to_string(),
+                "https://github.com/example/repo/pull/58".to_string(),
+                "https://github.com/example/repo/pull/56".to_string(),
+            ]
+        );
     }
 
     #[test]

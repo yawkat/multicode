@@ -464,7 +464,11 @@ pub(crate) async fn run_tmux_new_session_command(
 
     let mut create_process = Command::new("tmux");
     create_process.env("TERM", "xterm-256color");
-    create_process.arg("new-session").arg("-d").arg("-s").arg(&session_name);
+    create_process
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(&session_name);
     if let Some(cwd) = cwd {
         create_process.arg("-c").arg(cwd);
     }

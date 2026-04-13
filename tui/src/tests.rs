@@ -11,12 +11,10 @@ mod tests {
     use crate::app::{
         compact_github_tooltip_target, count_codex_session_turn_metrics,
         last_user_message_from_codex_session_log_contents, restored_selected_row,
-        should_restart_codex_task_for_pr_request,
-        snapshot_attach_cwd_for_selection,
-        snapshot_attach_target_for_selection,
         should_auto_resume_autonomous_codex_after_attach,
-        should_auto_resume_task_codex_after_attach,
-        should_resume_codex_task_after_incomplete_attached_turn, starting_modal_failure_status,
+        should_auto_resume_task_codex_after_attach, should_restart_codex_task_for_pr_request,
+        should_resume_codex_task_after_incomplete_attached_turn, snapshot_attach_cwd_for_selection,
+        snapshot_attach_target_for_selection, starting_modal_failure_status,
     };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
@@ -789,15 +787,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_attach_target_for_selection_falls_back_to_workspace_attach_when_paused_opencode_task_has_no_session(
-    ) {
+    fn snapshot_attach_target_for_selection_falls_back_to_workspace_attach_when_paused_opencode_task_has_no_session()
+     {
         let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
         started.root_session_id = Some("ses-root-1".to_string());
         started.persistent.automation_paused = true;
-        assign_active_task(
-            &mut started,
-            "https://github.com/example/repo/issues/42",
-        );
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
 
         let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
             .expect("paused task selection should fall back to workspace attach");
@@ -814,15 +809,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_attach_target_for_selection_uses_last_codex_thread_when_paused_task_has_no_session(
-    ) {
+    fn snapshot_attach_target_for_selection_uses_last_codex_thread_when_paused_task_has_no_session()
+    {
         let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
         started.root_session_id = Some("thread-root".to_string());
         started.persistent.automation_paused = true;
-        assign_active_task(
-            &mut started,
-            "https://github.com/example/repo/issues/42",
-        );
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
 
         let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
             .expect("paused codex task selection should attach via last task thread");
@@ -840,10 +832,7 @@ mod tests {
     fn snapshot_attach_target_for_selection_prefers_task_attach_when_task_session_exists() {
         let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
         started.root_session_id = Some("ses-root-1".to_string());
-        assign_active_task(
-            &mut started,
-            "https://github.com/example/repo/issues/42",
-        );
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
         started.task_states.insert(
             "task-42".to_string(),
             multicode_lib::WorkspaceTaskRuntimeSnapshot {
