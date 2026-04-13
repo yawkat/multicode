@@ -1348,6 +1348,10 @@ impl AppleContainerRuntime {
         let implicit_gitconfig_mount = self
             .build_implicit_gitconfig_mount(key, host_gitconfig)
             .await?;
+        let aggregated_skill_mount = self.build_aggregated_skill_mount(key).await?;
+        let aggregated_skill_target = aggregated_skill_mount
+            .as_ref()
+            .map(|mount| mount.target.clone());
         let mut mount_specs = Vec::new();
         mount_specs.extend(
             self.context
@@ -1356,6 +1360,7 @@ impl AppleContainerRuntime {
                 .iter()
                 .cloned()
                 .filter(|path| !self.is_implicitly_handled_gitconfig(path, host_gitconfig))
+                .filter(|path| aggregated_skill_target.as_ref() != Some(path))
                 .map(|path| MountSpec::new(path, None, MountKind::Readable)),
         );
         mount_specs.extend(
@@ -1390,7 +1395,7 @@ impl AppleContainerRuntime {
                 .cloned()
                 .map(|path| MountSpec::new(path, None, MountKind::Tmpfs)),
         );
-        if let Some(skill_mount) = self.build_aggregated_skill_mount(key).await? {
+        if let Some(skill_mount) = aggregated_skill_mount {
             mount_specs.push(skill_mount);
         } else {
             mount_specs.extend(
@@ -1547,25 +1552,47 @@ impl AppleContainerRuntime {
             return Ok(None);
         }
 
+        let overlay_target = self
+            .readable_parent_for_path(&target_root)
+            .unwrap_or_else(|| target_root.clone());
         let aggregate_root = self.apple_runtime_root(key).join("skills");
         clear_directory_contents(&aggregate_root).await?;
 
-        if tokio::fs::metadata(&target_root).await.is_ok() {
-            copy_directory_tree(&target_root, &aggregate_root).await?;
+        if tokio::fs::metadata(&overlay_target).await.is_ok() {
+            copy_directory_tree(&overlay_target, &aggregate_root).await?;
         }
 
         for skill in added_skills {
-            let Some(skill_name) = skill.target.file_name() else {
-                continue;
-            };
-            copy_directory_tree(&skill.source, &aggregate_root.join(skill_name)).await?;
+            let relative = skill
+                .target
+                .strip_prefix(&overlay_target)
+                .or_else(|_| skill.target.strip_prefix(&target_root))
+                .map_err(|_| CombinedServiceError::InvalidRuntimeConfig {
+                    field: "isolation.add-skills-from".to_string(),
+                    message: format!(
+                        "skill target '{}' is outside overlay target '{}'",
+                        skill.target.display(),
+                        overlay_target.display()
+                    ),
+                })?;
+            copy_directory_tree(&skill.source, &aggregate_root.join(relative)).await?;
         }
 
         Ok(Some(MountSpec::new(
-            target_root,
+            overlay_target,
             Some(aggregate_root),
             MountKind::Readable,
         )))
+    }
+
+    fn readable_parent_for_path(&self, path: &Path) -> Option<PathBuf> {
+        self.context
+            .expanded_isolation
+            .readable
+            .iter()
+            .filter(|candidate| path.starts_with(candidate.as_path()))
+            .max_by_key(|candidate| candidate.components().count())
+            .cloned()
     }
 
     async fn write_env_file(
@@ -2385,10 +2412,7 @@ mod tests {
             assert!(
                 command.args.iter().all(|arg| {
                     !(arg.contains("type=bind")
-                        && arg.contains(&format!(
-                            "target={}/auth.json",
-                            SYNTHETIC_CODEX_HOME
-                        )))
+                        && arg.contains(&format!("target={}/auth.json", SYNTHETIC_CODEX_HOME)))
                 }),
                 "apple backend should not emit a separate auth.json bind mount"
             );
@@ -2447,8 +2471,7 @@ mod tests {
                 .join("home")
                 .join("auth.json");
             assert_eq!(
-                fs::read_to_string(&persisted_auth)
-                    .expect("synthetic auth should be readable"),
+                fs::read_to_string(&persisted_auth).expect("synthetic auth should be readable"),
                 r#"{"token":"codex"}"#
             );
         });
@@ -3018,7 +3041,18 @@ mod tests {
                 .join("apple-container")
                 .join("alpha")
                 .join("skills");
+            let host_opencode_target = host_home.join(".config/opencode");
             let aggregated_mount = format!(
+                "type=bind,source={},target={},readonly",
+                aggregated_source.to_string_lossy(),
+                host_opencode_target.to_string_lossy()
+            );
+            let raw_host_mount = format!(
+                "type=bind,source={},target={},readonly",
+                host_opencode_target.to_string_lossy(),
+                host_opencode_target.to_string_lossy()
+            );
+            let nested_skills_mount = format!(
                 "type=bind,source={},target={},readonly",
                 aggregated_source.to_string_lossy(),
                 host_skills_target.to_string_lossy()
@@ -3026,15 +3060,23 @@ mod tests {
 
             assert!(
                 command.args.iter().any(|arg| arg == &aggregated_mount),
-                "apple backend should expose a merged skills directory"
+                "apple backend should expose one merged readable mount"
+            );
+            assert!(
+                command.args.iter().all(|arg| arg != &raw_host_mount),
+                "apple backend should replace the raw readable parent mount with the merged overlay"
+            );
+            assert!(
+                command.args.iter().all(|arg| arg != &nested_skills_mount),
+                "apple backend should not emit a nested skills bind mount under the readable parent"
             );
             assert_eq!(
-                fs::read_to_string(aggregated_source.join("host-skill/SKILL.md"))
+                fs::read_to_string(aggregated_source.join("skills/host-skill/SKILL.md"))
                     .expect("host skill should be preserved"),
                 "# host"
             );
             assert_eq!(
-                fs::read_to_string(aggregated_source.join("workspace-skill/SKILL.md"))
+                fs::read_to_string(aggregated_source.join("skills/workspace-skill/SKILL.md"))
                     .expect("workspace skill should be included"),
                 "# workspace"
             );
@@ -3117,7 +3159,7 @@ mod tests {
                 "apple backend should update the aggregated skills directory in place so existing mounts stay valid"
             );
             assert_eq!(
-                fs::read_to_string(aggregate_root.join("machine-readable-pr/SKILL.md"))
+                fs::read_to_string(aggregate_root.join("skills/machine-readable-pr/SKILL.md"))
                     .expect("aggregated skill should remain present"),
                 "# pr"
             );

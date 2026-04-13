@@ -5345,7 +5345,10 @@ mod tests {
 
     #[test]
     fn work_started_comment_body_is_first_person() {
-        assert_eq!(work_started_comment_body(), "I started working on this issue");
+        assert_eq!(
+            work_started_comment_body(),
+            "I started working on this issue"
+        );
     }
 
     #[test]

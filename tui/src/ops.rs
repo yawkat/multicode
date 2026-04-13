@@ -403,14 +403,8 @@ pub(crate) async fn attach_in_tmux(
         username, password, ..
     } = target
     {
-        session_env.push((
-            "OPENCODE_SERVER_USERNAME".to_string(),
-            username.to_string(),
-        ));
-        session_env.push((
-            "OPENCODE_SERVER_PASSWORD".to_string(),
-            password.to_string(),
-        ));
+        session_env.push(("OPENCODE_SERVER_USERNAME".to_string(), username.to_string()));
+        session_env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
     }
     let mut attach_command = tmux_session_command(attach_env, None);
     attach_command.extend(attach_cli_args(agent_command, target));
