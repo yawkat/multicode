@@ -12,7 +12,9 @@ mod tests {
         compact_github_tooltip_target, count_codex_session_turn_metrics,
         last_user_message_from_codex_session_log_contents, restored_selected_row,
         should_auto_resume_autonomous_codex_after_attach,
-        should_auto_resume_task_codex_after_attach, should_restart_codex_task_for_pr_request,
+        should_auto_resume_task_codex_after_attach,
+        should_queue_task_codex_resume_until_vm_available,
+        should_restart_codex_task_for_pr_request,
         should_resume_codex_task_after_incomplete_attached_turn, snapshot_attach_cwd_for_selection,
         snapshot_attach_target_for_selection, starting_modal_failure_status,
     };
@@ -545,6 +547,84 @@ mod tests {
             Some(&stale_state),
             Some("thread-4"),
             Some(AutomationAgentState::Working)
+        ));
+    }
+
+    #[test]
+    fn detached_task_resume_queues_when_another_task_owns_vm() {
+        let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-1".to_string());
+        snapshot.root_session_status = Some(RootSessionStatus::Busy);
+        snapshot.task_states.insert(
+            "task-1".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-1".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-2".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+
+        assert!(should_queue_task_codex_resume_until_vm_available(
+            &snapshot, "task-2"
+        ));
+    }
+
+    #[test]
+    fn detached_task_resume_does_not_queue_when_active_task_can_yield_vm() {
+        let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-1".to_string());
+        snapshot.root_session_status = Some(RootSessionStatus::Idle);
+        snapshot.task_states.insert(
+            "task-1".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-1".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-2".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+
+        assert!(!should_queue_task_codex_resume_until_vm_available(
+            &snapshot, "task-2"
+        ));
+    }
+
+    #[test]
+    fn detached_task_resume_does_not_queue_when_it_already_owns_vm() {
+        let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-2".to_string());
+        snapshot.root_session_status = Some(RootSessionStatus::Busy);
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-2".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+
+        assert!(!should_queue_task_codex_resume_until_vm_available(
+            &snapshot, "task-2"
         ));
     }
 

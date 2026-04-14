@@ -300,6 +300,47 @@ pub(crate) fn should_auto_resume_task_codex_after_attach(
     }
 }
 
+fn task_can_yield_vm_for_attach(task_state: &WorkspaceTaskRuntimeSnapshot) -> bool {
+    matches!(
+        task_effective_agent_state(Some(task_state)),
+        Some(
+            AutomationAgentState::Question
+                | AutomationAgentState::Review
+                | AutomationAgentState::Idle
+                | AutomationAgentState::Stale
+        )
+    )
+}
+
+pub(crate) fn should_queue_task_codex_resume_until_vm_available(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+) -> bool {
+    let Some(active_task_id) = snapshot
+        .active_task_id
+        .clone()
+        .or_else(|| snapshot.resolved_active_task_id())
+    else {
+        return matches!(
+            snapshot.root_session_status,
+            Some(RootSessionStatus::Busy | RootSessionStatus::Question)
+        );
+    };
+    if active_task_id == task_id {
+        return false;
+    }
+    let Some(active_task_state) = snapshot.task_states.get(&active_task_id) else {
+        return matches!(
+            snapshot.root_session_status,
+            Some(RootSessionStatus::Busy | RootSessionStatus::Question)
+        );
+    };
+    if active_task_state.waiting_on_vm {
+        return false;
+    }
+    !task_can_yield_vm_for_attach(active_task_state)
+}
+
 pub(crate) fn restored_selected_row(
     entries: &[TableEntry],
     previous_selected_entry: Option<&TableEntry>,
@@ -1472,6 +1513,138 @@ impl TuiState {
         });
     }
 
+    fn mark_task_waiting_on_vm_after_attach(&mut self, workspace_key: &str, task_id: &str) {
+        let Ok(workspace) = self.service.manager.get_workspace(workspace_key) else {
+            return;
+        };
+        workspace.update(|snapshot| {
+            let task_state = snapshot.task_states.entry(task_id.to_string()).or_default();
+            let mut changed = false;
+            if task_state.agent_state != Some(AutomationAgentState::Working) {
+                task_state.agent_state = Some(AutomationAgentState::Working);
+                changed = true;
+            }
+            if task_state.session_status != Some(RootSessionStatus::Busy) {
+                task_state.session_status = Some(RootSessionStatus::Busy);
+                changed = true;
+            }
+            let task_status = Some("Queued until VM is free".to_string());
+            if task_state.status != task_status {
+                task_state.status = task_status;
+                changed = true;
+            }
+            if !task_state.waiting_on_vm {
+                task_state.waiting_on_vm = true;
+                changed = true;
+            }
+            changed
+        });
+    }
+
+    fn queue_task_codex_resume_until_vm_available(
+        &self,
+        workspace_key: String,
+        task_id: String,
+        attached_session: AttachedSession,
+        resume_prompt: Option<String>,
+    ) {
+        let service = self.service.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                    return;
+                };
+                let snapshot = workspace.subscribe().borrow().clone();
+                let task_state = task_runtime_snapshot(&snapshot, &task_id);
+                let should_resume = should_auto_resume_task_codex_after_attach(
+                    task_state,
+                    attached_session.session_id.as_deref(),
+                    attached_session.initial_agent_state,
+                ) || resume_prompt.is_some();
+                if !should_resume {
+                    return;
+                }
+                if should_queue_task_codex_resume_until_vm_available(&snapshot, &task_id) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+
+                workspace.update(|snapshot| {
+                    let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                    let mut changed = false;
+                    if task_state.agent_state != Some(AutomationAgentState::Working) {
+                        task_state.agent_state = Some(AutomationAgentState::Working);
+                        changed = true;
+                    }
+                    if task_state.session_status != Some(RootSessionStatus::Busy) {
+                        task_state.session_status = Some(RootSessionStatus::Busy);
+                        changed = true;
+                    }
+                    if task_state.waiting_on_vm {
+                        task_state.waiting_on_vm = false;
+                        changed = true;
+                    }
+                    let task_status = Some("Resuming in background".to_string());
+                    if task_state.status != task_status {
+                        task_state.status = task_status;
+                        changed = true;
+                    }
+                    if snapshot.active_task_id.as_deref() != Some(task_id.as_str()) {
+                        snapshot.active_task_id = Some(task_id.clone());
+                        changed = true;
+                    }
+                    if snapshot.automation_agent_state != Some(AutomationAgentState::Working) {
+                        snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+                        changed = true;
+                    }
+                    if snapshot.automation_session_status != Some(RootSessionStatus::Busy) {
+                        snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+                        changed = true;
+                    }
+                    let automation_status = Some(format!("Resuming {task_id} in background"));
+                    if snapshot.automation_status != automation_status {
+                        snapshot.automation_status = automation_status;
+                        changed = true;
+                    }
+                    changed
+                });
+
+                let resume_result = if let Some(resume_prompt) = resume_prompt.clone() {
+                    service
+                        .restart_task_session(&workspace_key, &snapshot, &task_id, &resume_prompt)
+                        .await
+                } else if let Some(session_id) = attached_session.session_id.clone() {
+                    let resume_prompt = read_last_codex_session_user_message(
+                        service.workspace_directory_path().to_path_buf(),
+                        workspace_key.clone(),
+                        session_id,
+                    )
+                    .await
+                    .unwrap_or_else(|| CODEX_AUTO_RESUME_PROMPT.to_string());
+                    service
+                        .prompt_task_session(&workspace_key, &snapshot, &task_id, &resume_prompt)
+                        .await
+                } else {
+                    service
+                        .prompt_task_session(
+                            &workspace_key,
+                            &snapshot,
+                            &task_id,
+                            CODEX_AUTO_RESUME_PROMPT,
+                        )
+                        .await
+                };
+                tracing::info!(
+                    workspace_key = %workspace_key,
+                    task_id = %task_id,
+                    resume_result = ?resume_result,
+                    "finished deferred codex auto-resume attempt after attach"
+                );
+                return;
+            }
+        });
+    }
+
     async fn maybe_resume_autonomous_codex_after_attach(&mut self, key: &str) -> bool {
         if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
             tracing::info!(
@@ -1564,6 +1737,22 @@ impl TuiState {
                 }) = attached_session.as_ref()
                     && workspace_key == key
                 {
+                    if should_queue_task_codex_resume_until_vm_available(&snapshot, task_id) {
+                        self.mark_task_waiting_on_vm_after_attach(key, task_id);
+                        self.queue_task_codex_resume_until_vm_available(
+                            key.to_string(),
+                            task_id.clone(),
+                            attached_session
+                                .clone()
+                                .expect("attached task session should exist"),
+                            interrupted_resume_prompt.clone(),
+                        );
+                        self.status = format!(
+                            "Detached from workspace '{key}'; task {task_id} is queued until the VM is free"
+                        );
+                        self.attached_session = None;
+                        return true;
+                    }
                     self.mark_task_resuming_in_background(key, task_id);
                     self.sync_from_manager();
                 }
