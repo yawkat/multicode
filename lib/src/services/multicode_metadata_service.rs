@@ -281,11 +281,17 @@ fn should_refresh_from_event(
     session_id: &str,
 ) -> bool {
     match &event.payload {
-        opencode::client::types::Event::MessageUpdated(message_updated) => {
+        opencode::client::types::GlobalEventPayload::EventMessageUpdated(message_updated) => {
             message_session_id(&message_updated.properties.info) == Some(session_id)
         }
-        opencode::client::types::Event::MessageRemoved(message_removed) => {
+        opencode::client::types::GlobalEventPayload::SyncEventMessageUpdated(message_updated) => {
+            message_session_id(&message_updated.data.info) == Some(session_id)
+        }
+        opencode::client::types::GlobalEventPayload::EventMessageRemoved(message_removed) => {
             message_removed.properties.session_id.as_str() == session_id
+        }
+        opencode::client::types::GlobalEventPayload::SyncEventMessageRemoved(message_removed) => {
+            message_removed.data.session_id.as_str() == session_id
         }
         _ => false,
     }
@@ -633,7 +639,8 @@ mod tests {
             "payload": {
                 "type": "message.updated",
                 "properties": {
-                    "info": assistant_message_json(message_id, session_id, text)
+                    "info": assistant_message_json(message_id, session_id, text),
+                    "sessionID": session_id
                 }
             }
         }))

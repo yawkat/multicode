@@ -747,7 +747,7 @@ fn description_cell_text(snapshot: &WorkspaceSnapshot, user_description: &str) -
 }
 
 fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
-    let mut links = Vec::new();
+    let mut links = workspace_primary_issue_pr_links(snapshot);
 
     links.extend(
         snapshot
@@ -778,6 +778,19 @@ fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
     links.extend(
         snapshot
             .persistent
+            .agent_provided
+            .issue
+            .iter()
+            .cloned()
+            .map(|value| WorkspaceLink {
+                kind: WorkspaceLinkKind::Issue,
+                value,
+                source: WorkspaceLinkSource::AgentProvided,
+            }),
+    );
+    links.extend(
+        snapshot
+            .persistent
             .custom_links
             .pr
             .iter()
@@ -788,6 +801,47 @@ fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
                 source: WorkspaceLinkSource::Custom,
             }),
     );
+    links.extend(
+        snapshot
+            .persistent
+            .agent_provided
+            .pr
+            .iter()
+            .cloned()
+            .map(|value| WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value,
+                source: WorkspaceLinkSource::AgentProvided,
+            }),
+    );
+
+    links
+}
+
+fn workspace_primary_issue_pr_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
+    let mut links: Vec<_> = active_task_issue_url(snapshot)
+        .iter()
+        .cloned()
+        .map(|value| WorkspaceLink {
+            kind: WorkspaceLinkKind::Issue,
+            value,
+            source: WorkspaceLinkSource::Automation,
+        })
+        .collect();
+
+    if let Some(active_task_id) = snapshot
+        .active_task_id
+        .clone()
+        .or_else(|| snapshot.resolved_active_task_id())
+        && let Some(task) = snapshot.task_persistent_snapshot(&active_task_id)
+        && let Some(pr) = task_pr_link(task, task_runtime_snapshot(snapshot, &active_task_id))
+    {
+        links.push(WorkspaceLink {
+            kind: WorkspaceLinkKind::Pr,
+            value: pr.to_string(),
+            source: WorkspaceLinkSource::Task,
+        });
+    }
 
     links
 }
@@ -1072,15 +1126,7 @@ fn visible_workspace_links(
     }
 
     for kind in [WorkspaceLinkKind::Issue, WorkspaceLinkKind::Pr] {
-        let next_link = workspace_issue_pr_links(snapshot)
-            .into_iter()
-            .find(|link| link.kind == kind)
-            .filter(|link| {
-                matches!(
-                    validations.get(link),
-                    Some(WorkspaceLinkValidationResult::Valid(_))
-                )
-            });
+        let next_link = first_validated_workspace_link_by_kind(snapshot, validations, kind);
         if let Some(link) = next_link {
             visible.push(link);
         } else if snapshot.persistent.tasks.is_empty() {

@@ -798,7 +798,8 @@ fn validate_github_token(
 }
 
 async fn load_github_token_from_command(command: &str) -> Result<String, GithubStatusServiceError> {
-    let output = Command::new("sh").args(["-c", command]).output().await?;
+    let shell = if cfg!(unix) { "/bin/sh" } else { "sh" };
+    let output = Command::new(shell).args(["-c", command]).output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let message = if stderr.is_empty() {

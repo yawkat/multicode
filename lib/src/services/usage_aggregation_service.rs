@@ -252,7 +252,7 @@ fn apply_usage_event(
     usage_by_message: &mut HashMap<String, MessageUsage>,
 ) -> bool {
     match &event.payload {
-        opencode::client::types::Event::MessageUpdated(message_updated) => {
+        opencode::client::types::GlobalEventPayload::EventMessageUpdated(message_updated) => {
             let Some((message_id, updated_session_id, usage)) =
                 usage_update_from_message(&message_updated.properties.info)
             else {
@@ -269,12 +269,37 @@ fn apply_usage_event(
                 None => usage_by_message.remove(&message_id).is_some(),
             }
         }
-        opencode::client::types::Event::MessageRemoved(message_removed) => {
+        opencode::client::types::GlobalEventPayload::SyncEventMessageUpdated(message_updated) => {
+            let Some((message_id, updated_session_id, usage)) =
+                usage_update_from_message(&message_updated.data.info)
+            else {
+                return false;
+            };
+            if updated_session_id != session_id {
+                return false;
+            }
+            match usage {
+                Some(usage) => match usage_by_message.insert(message_id, usage) {
+                    Some(previous) => previous != usage,
+                    None => true,
+                },
+                None => usage_by_message.remove(&message_id).is_some(),
+            }
+        }
+        opencode::client::types::GlobalEventPayload::EventMessageRemoved(message_removed) => {
             if message_removed.properties.session_id.as_str() != session_id {
                 return false;
             }
             usage_by_message
                 .remove(message_removed.properties.message_id.as_str())
+                .is_some()
+        }
+        opencode::client::types::GlobalEventPayload::SyncEventMessageRemoved(message_removed) => {
+            if message_removed.data.session_id.as_str() != session_id {
+                return false;
+            }
+            usage_by_message
+                .remove(message_removed.data.message_id.as_str())
                 .is_some()
         }
         _ => false,
@@ -429,6 +454,7 @@ mod tests {
             "payload": {
                 "type": "message.updated",
                 "properties": {
+                    "sessionID": session_id,
                     "info": assistant_message_json(
                         message_id,
                         session_id,

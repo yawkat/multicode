@@ -1869,10 +1869,10 @@ fn repository_clone_url(repository: &str) -> String {
 
 fn git_program() -> String {
     for candidate in [
-        "git",
         "/usr/bin/git",
         "/opt/homebrew/bin/git",
         "/usr/local/bin/git",
+        "git",
     ] {
         let path = Path::new(candidate);
         let available = if path.components().count() > 1 {
@@ -4204,37 +4204,35 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
             let workspace = root.path().join("workspace");
             let repo = workspace.join("repo");
             fs::create_dir_all(&repo).expect("repo dir should exist");
+            let git = git_program();
 
-            let init = Command::new(git_program())
+            let init = std::process::Command::new(&git)
                 .arg("-C")
                 .arg(&repo)
                 .args(["init"])
                 .stdin(Stdio::null())
                 .output()
-                .await
                 .expect("git init should run");
             assert!(init.status.success(), "git init should succeed");
 
-            let set_name = Command::new(git_program())
+            let set_name = std::process::Command::new(&git)
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "user.name", "Local Name"])
                 .stdin(Stdio::null())
                 .output()
-                .await
                 .expect("git config user.name should run");
             assert!(
                 set_name.status.success(),
                 "git config user.name should succeed"
             );
 
-            let set_email = Command::new(git_program())
+            let set_email = std::process::Command::new(&git)
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "user.email", "local@example.com"])
                 .stdin(Stdio::null())
                 .output()
-                .await
                 .expect("git config user.email should run");
             assert!(
                 set_email.status.success(),
@@ -4245,33 +4243,30 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .await
                 .expect("workspace git identity cleanup should succeed");
 
-            let get_name = Command::new(git_program())
+            let get_name = std::process::Command::new(&git)
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "--get", "user.name"])
                 .stdin(Stdio::null())
                 .output()
-                .await
                 .expect("git config get user.name should run");
             assert_eq!(get_name.status.code(), Some(1));
 
-            let get_email = Command::new(git_program())
+            let get_email = std::process::Command::new(&git)
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "--get", "user.email"])
                 .stdin(Stdio::null())
                 .output()
-                .await
                 .expect("git config get user.email should run");
             assert_eq!(get_email.status.code(), Some(1));
 
-            let remote = Command::new(git_program())
+            let remote = std::process::Command::new(&git)
                 .arg("-C")
                 .arg(&repo)
                 .args(["config", "--local", "core.repositoryformatversion"])
                 .stdin(Stdio::null())
                 .output()
-                .await
                 .expect("git config core.repositoryformatversion should run");
             assert!(remote.status.success(), "repo config should remain intact");
         });

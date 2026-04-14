@@ -1540,8 +1540,21 @@ fn should_start_assigned_issue_work(
     match snapshot.task_states.get(&active_task_id) {
         None => true,
         Some(task_state) => {
-            task_state.session_id.is_none()
-                || task_state.agent_state == Some(AutomationAgentState::Stale)
+            if task_state.session_id.is_none() {
+                return true;
+            }
+            if task_state.agent_state != Some(AutomationAgentState::Stale) {
+                return false;
+            }
+
+            !snapshot
+                .persistent
+                .tasks
+                .iter()
+                .find(|task| task.id == active_task_id)
+                .is_some_and(|task| {
+                    task.backing_pr_url.is_some() && !task.dependency_upgrade_backing_pr
+                })
         }
     }
 }
@@ -1795,6 +1808,7 @@ async fn reconcile_codex_task_runtime_states(
         let Some(task_session_id) = task_state.session_id.clone() else {
             continue;
         };
+        let preserve_review = task.backing_pr_url.is_some() && !task.dependency_upgrade_backing_pr;
         let task_cwd = task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url);
 
         let response = match client.thread_read_with_turns(&task_session_id, true).await {
@@ -1833,7 +1847,8 @@ async fn reconcile_codex_task_runtime_states(
                     continue;
                 }
                 if error.contains("thread not loaded") {
-                    let (session_status, agent_state) = unloaded_codex_task_runtime(task_state);
+                    let (session_status, agent_state) =
+                        unloaded_codex_task_runtime(task_state, preserve_review);
                     set_task_runtime_state_from_codex(
                         workspace,
                         &task.id,
@@ -1897,7 +1912,7 @@ async fn reconcile_codex_task_runtime_states(
             status,
             super::codex_app_server::CodexThreadStatus::NotLoaded
         ) {
-            unloaded_codex_task_runtime(task_state)
+            unloaded_codex_task_runtime(task_state, preserve_review)
         } else {
             codex_runtime_state_for_task(status, task_state)
         };
@@ -2336,6 +2351,7 @@ async fn recover_latest_codex_task_session_id(
 
 fn unloaded_codex_task_runtime(
     task_state: &crate::WorkspaceTaskRuntimeSnapshot,
+    preserve_review: bool,
 ) -> (RootSessionStatus, AutomationAgentState) {
     match task_state.agent_state {
         Some(AutomationAgentState::Question) => {
@@ -2345,6 +2361,7 @@ fn unloaded_codex_task_runtime(
         Some(AutomationAgentState::Review | AutomationAgentState::Idle) => {
             (RootSessionStatus::Idle, AutomationAgentState::Review)
         }
+        _ if preserve_review => (RootSessionStatus::Idle, AutomationAgentState::Review),
         _ => (RootSessionStatus::Idle, AutomationAgentState::Stale),
     }
 }
@@ -5334,14 +5351,9 @@ mod tests {
         sync_task_runtime_state(&workspace, &snapshot);
 
         let next = workspace.subscribe().borrow().clone();
-        assert_eq!(
-            next.automation_agent_state,
-            Some(AutomationAgentState::Review)
-        );
-        assert_eq!(
-            next.automation_session_status,
-            Some(RootSessionStatus::Idle)
-        );
+        assert!(next.active_task_id.is_none());
+        assert_eq!(next.automation_agent_state, None);
+        assert_eq!(next.automation_session_status, None);
     }
 
     #[test]
@@ -5738,11 +5750,11 @@ mod tests {
 
         assert_eq!(
             codex_task_thread_status_to_agent_state(&status, Some(AutomationAgentState::Review)),
-            AutomationAgentState::Review
+            AutomationAgentState::Working
         );
         assert_eq!(
             codex_task_thread_status_to_agent_state(&status, Some(AutomationAgentState::Question)),
-            AutomationAgentState::Question
+            AutomationAgentState::Working
         );
     }
 
@@ -6045,7 +6057,7 @@ mod tests {
         };
 
         assert_eq!(
-            unloaded_codex_task_runtime(&task_state),
+            unloaded_codex_task_runtime(&task_state, false),
             (RootSessionStatus::Question, AutomationAgentState::Question)
         );
     }
@@ -6058,7 +6070,7 @@ mod tests {
         };
 
         assert_eq!(
-            unloaded_codex_task_runtime(&task_state),
+            unloaded_codex_task_runtime(&task_state, false),
             (RootSessionStatus::Idle, AutomationAgentState::Stale)
         );
     }
@@ -6206,7 +6218,7 @@ mod tests {
         };
 
         let runtime = if matches!(CodexThreadStatus::NotLoaded, CodexThreadStatus::NotLoaded) {
-            unloaded_codex_task_runtime(&task_state)
+            unloaded_codex_task_runtime(&task_state, false)
         } else {
             unreachable!()
         };
@@ -6244,6 +6256,26 @@ mod tests {
         assert_eq!(
             normalized_task_agent_state(&task_state),
             Some(AutomationAgentState::Review)
+        );
+    }
+
+    #[test]
+    fn unloaded_codex_status_preserves_review_for_pr_backed_working_task() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Working),
+            session_status: Some(RootSessionStatus::Busy),
+            ..Default::default()
+        };
+
+        let runtime = if matches!(CodexThreadStatus::NotLoaded, CodexThreadStatus::NotLoaded) {
+            unloaded_codex_task_runtime(&task_state, true)
+        } else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            runtime,
+            (RootSessionStatus::Idle, AutomationAgentState::Review)
         );
     }
 
@@ -6309,6 +6341,63 @@ mod tests {
                 "https://github.com/example/repo/issues/6".to_string(),
                 WorkspaceTaskSource::Scan,
             ));
+        snapshot.active_task_id = Some("task-6".to_string());
+        snapshot.task_states.insert(
+            "task-6".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-task-6".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Stale),
+                ..Default::default()
+            },
+        );
+
+        assert!(should_start_assigned_issue_work(
+            &snapshot,
+            RootSessionStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn should_not_start_assigned_issue_work_when_stale_task_has_backing_pr() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(
+            WorkspaceTaskPersistentSnapshot::new(
+                "task-6".to_string(),
+                "https://github.com/example/repo/issues/6".to_string(),
+                WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/66".to_string())),
+        );
+        snapshot.active_task_id = Some("task-6".to_string());
+        snapshot.task_states.insert(
+            "task-6".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-task-6".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Stale),
+                ..Default::default()
+            },
+        );
+
+        assert!(!should_start_assigned_issue_work(
+            &snapshot,
+            RootSessionStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn should_start_assigned_issue_work_when_stale_task_has_dependency_upgrade_pr() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(
+            WorkspaceTaskPersistentSnapshot::new(
+                "task-6".to_string(),
+                "https://github.com/example/repo/issues/6".to_string(),
+                WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/66".to_string()))
+            .with_dependency_upgrade_backing_pr(true),
+        );
         snapshot.active_task_id = Some("task-6".to_string());
         snapshot.task_states.insert(
             "task-6".to_string(),

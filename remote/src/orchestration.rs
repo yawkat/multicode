@@ -1494,6 +1494,7 @@ mod tests {
             autonomous: Default::default(),
             agent: AgentConfig::default(),
             opencode: vec!["opencode-cli".to_string()],
+            compare: Default::default(),
             tool: Vec::new(),
             handler: Default::default(),
             remote: Some(sample_remote_config()),
@@ -1663,6 +1664,7 @@ mod tests {
                 autonomous: Default::default(),
                 agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(config),
@@ -1718,6 +1720,7 @@ mod tests {
                 autonomous: Default::default(),
                 agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(sample_remote_config()),
@@ -1731,7 +1734,10 @@ mod tests {
         .expect("config should resolve");
 
         assert_eq!(resolved.config_support_sync_up.len(), 1);
-        assert_eq!(resolved.config_support_sync_up[0].local, skill_dir);
+        assert_eq!(
+            resolved.config_support_sync_up[0].local,
+            std::fs::canonicalize(&skill_dir).expect("skill dir should canonicalize")
+        );
         assert_eq!(
             resolved.config_support_sync_up[0].remote,
             PathBuf::from(
@@ -1756,6 +1762,7 @@ mod tests {
                 autonomous: Default::default(),
                 agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(sample_remote_config()),
@@ -1882,7 +1889,6 @@ mod tests {
                 "-e".to_string(),
                 "ssh -o StrictHostKeyChecking=yes".to_string(),
                 "--update".to_string(),
-                "--mkpath".to_string(),
                 "--delete".to_string(),
                 "--exclude".to_string(),
                 "target".to_string(),
@@ -2128,7 +2134,7 @@ mod tests {
             Path::new(".multicode/remote/relay/file.sock"),
             &exclude
         ));
-        assert!(!tree_scan::is_excluded_relative_path(
+        assert!(tree_scan::is_excluded_relative_path(
             Path::new(".multicode"),
             &exclude
         ));
@@ -2322,6 +2328,7 @@ mod tests {
                 autonomous: Default::default(),
                 agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(config),

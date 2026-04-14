@@ -417,17 +417,20 @@ fn map_session_status(status: &opencode::client::types::SessionStatus) -> RootSe
 fn should_refresh_from_event(event: &opencode::client::types::GlobalEvent) -> bool {
     matches!(
         &event.payload,
-        opencode::client::types::Event::SessionStatus(_)
-            | opencode::client::types::Event::SessionIdle(_)
-            | opencode::client::types::Event::SessionCompacted(_)
-            | opencode::client::types::Event::SessionCreated(_)
-            | opencode::client::types::Event::SessionUpdated(_)
-            | opencode::client::types::Event::SessionDeleted(_)
-            | opencode::client::types::Event::SessionDiff(_)
-            | opencode::client::types::Event::SessionError(_)
-            | opencode::client::types::Event::QuestionAsked(_)
-            | opencode::client::types::Event::QuestionReplied(_)
-            | opencode::client::types::Event::QuestionRejected(_)
+        opencode::client::types::GlobalEventPayload::EventSessionStatus(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionIdle(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionCompacted(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionCreated(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionUpdated(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionDeleted(_)
+            | opencode::client::types::GlobalEventPayload::SyncEventSessionCreated(_)
+            | opencode::client::types::GlobalEventPayload::SyncEventSessionUpdated(_)
+            | opencode::client::types::GlobalEventPayload::SyncEventSessionDeleted(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionDiff(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionError(_)
+            | opencode::client::types::GlobalEventPayload::EventQuestionAsked(_)
+            | opencode::client::types::GlobalEventPayload::EventQuestionReplied(_)
+            | opencode::client::types::GlobalEventPayload::EventQuestionRejected(_)
     )
 }
 
@@ -603,6 +606,7 @@ mod tests {
             "payload": {
                 "type": "session.updated",
                 "properties": {
+                    "sessionID": session_id,
                     "info": {
                         "directory": "/workspace",
                         "id": session_id,
