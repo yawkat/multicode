@@ -4,7 +4,10 @@ use std::{
     time::Duration,
 };
 
-use diesel::{Connection, QueryableByName, RunQueryDsl, sql_query, sqlite::SqliteConnection};
+use diesel::{
+    Connection, QueryableByName, RunQueryDsl, connection::SimpleConnection, sql_query,
+    sqlite::SqliteConnection,
+};
 use serde::Deserialize;
 use tokio::{
     process::Command,
@@ -13,6 +16,7 @@ use tokio::{
     time::{Instant, sleep, sleep_until},
 };
 use url::Url;
+use uuid::Uuid;
 
 use super::{
     CombinedService, GithubStatus,
@@ -2055,6 +2059,94 @@ fn latest_codex_sessions_dir(codex_home: &Path) -> PathBuf {
     codex_home.join("sessions")
 }
 
+#[derive(Debug)]
+struct DisposableDirectory {
+    path: PathBuf,
+}
+
+impl DisposableDirectory {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for DisposableDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Debug)]
+struct CodexStateDbSnapshot {
+    _directory: DisposableDirectory,
+    database_path: PathBuf,
+}
+
+fn copy_codex_state_db_sidecar(
+    state_db_path: &Path,
+    suffix: &str,
+    snapshot_db_path: &Path,
+) -> Result<(), String> {
+    let source = state_db_path.with_extension(format!(
+        "{}{suffix}",
+        state_db_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+    ));
+    if !source.exists() {
+        return Ok(());
+    }
+    let target = snapshot_db_path.with_extension(format!(
+        "{}{suffix}",
+        snapshot_db_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+    ));
+    std::fs::copy(&source, &target).map_err(|error| {
+        format!(
+            "failed to copy Codex state database sidecar '{}' to '{}': {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn snapshot_codex_state_db(state_db_path: &Path) -> Result<CodexStateDbSnapshot, String> {
+    let Some(file_name) = state_db_path.file_name() else {
+        return Err(format!(
+            "Codex state database path '{}' has no file name",
+            state_db_path.display()
+        ));
+    };
+    let snapshot_dir =
+        std::env::temp_dir().join(format!("multicode-codex-state-db-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&snapshot_dir).map_err(|error| {
+        format!(
+            "failed to create Codex state database snapshot dir '{}': {error}",
+            snapshot_dir.display()
+        )
+    })?;
+    let snapshot_dir = DisposableDirectory::new(snapshot_dir);
+    let snapshot_db_path = snapshot_dir.path.join(file_name);
+    std::fs::copy(state_db_path, &snapshot_db_path).map_err(|error| {
+        format!(
+            "failed to copy Codex state database '{}' to '{}': {error}",
+            state_db_path.display(),
+            snapshot_db_path.display()
+        )
+    })?;
+    copy_codex_state_db_sidecar(state_db_path, "-wal", &snapshot_db_path)?;
+    copy_codex_state_db_sidecar(state_db_path, "-shm", &snapshot_db_path)?;
+
+    Ok(CodexStateDbSnapshot {
+        _directory: snapshot_dir,
+        database_path: snapshot_db_path,
+    })
+}
+
 fn recover_latest_codex_thread_candidate_for_cwd(
     codex_home: &Path,
     cwd: &str,
@@ -2103,9 +2195,13 @@ fn recover_codex_thread_candidates_from_state_db(
     let Some(state_db_path) = latest_codex_state_db_path(codex_home) else {
         return Ok(HashMap::new());
     };
-    let database_url = state_db_path.to_string_lossy().into_owned();
+    let snapshot = snapshot_codex_state_db(&state_db_path)?;
+    let database_url = snapshot.database_path.to_string_lossy().into_owned();
     let mut connection =
         SqliteConnection::establish(&database_url).map_err(|error| error.to_string())?;
+    connection
+        .batch_execute("PRAGMA query_only = 1; PRAGMA mmap_size = 0;")
+        .map_err(|error| error.to_string())?;
     let rows = sql_query(
         "SELECT id, cwd, updated_at, has_user_event \
          FROM threads \
@@ -4254,6 +4350,64 @@ mod tests {
         assert_eq!(
             recovered.get(cwd).map(|candidate| candidate.id.as_str()),
             Some("019d85ce")
+        );
+
+        let _ = fs::remove_dir_all(&codex_home);
+    }
+
+    #[test]
+    fn recover_codex_thread_candidates_from_state_db_reads_wal_snapshot() {
+        let codex_home = unique_test_dir("codex-state-recovery");
+        fs::create_dir_all(&codex_home).expect("codex home should be created");
+        let state_db_path = codex_home.join("state_2026-04-14.sqlite");
+        let mut connection = SqliteConnection::establish(state_db_path.to_string_lossy().as_ref())
+            .expect("state database should be created");
+        connection
+            .batch_execute(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE threads (
+                     id TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     updated_at BIGINT NOT NULL,
+                     created_at BIGINT NOT NULL,
+                     archived INTEGER NOT NULL DEFAULT 0,
+                     has_user_event INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .expect("threads table should be created");
+        connection
+            .batch_execute(
+                "INSERT INTO threads (
+                     id,
+                     cwd,
+                     updated_at,
+                     created_at,
+                     archived,
+                     has_user_event
+                 ) VALUES (
+                     'thread-322',
+                     '/tmp/multicode-codex-workspaces/json-schema/work/micronaut-json-schema-322',
+                     1713183212,
+                     1713183200,
+                     0,
+                     1
+                 );",
+            )
+            .expect("thread row should be inserted");
+        drop(connection);
+
+        let cwd = "/tmp/multicode-codex-workspaces/json-schema/work/micronaut-json-schema-322"
+            .to_string();
+        let recovered =
+            recover_codex_thread_candidates_from_state_db(&codex_home, std::slice::from_ref(&cwd))
+                .expect("WAL-backed state database should be recoverable");
+
+        assert_eq!(
+            recovered
+                .get(cwd.as_str())
+                .map(|candidate| candidate.id.as_str()),
+            Some("thread-322")
         );
 
         let _ = fs::remove_dir_all(&codex_home);
