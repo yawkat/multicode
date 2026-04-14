@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::{ExitStatus, Output, Stdio},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -1478,13 +1478,14 @@ impl CombinedService {
         }
         let _ = prune.status().await;
 
+        let base_ref = self.resolve_task_worktree_base(repo_root).await?;
         let mut command = Command::new(git_program());
         command
             .arg("-C")
             .arg(repo_root)
             .args(["worktree", "add", "--detach"])
             .arg(task_root)
-            .arg("HEAD")
+            .arg(&base_ref)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -1501,6 +1502,109 @@ impl CombinedService {
                 String::from_utf8_lossy(&output.stderr).trim()
             )))
         }
+    }
+
+    async fn resolve_task_worktree_base(
+        &self,
+        repo_root: &Path,
+    ) -> Result<String, CombinedServiceError> {
+        if !self.git_remote_exists(repo_root, "origin").await? {
+            return Ok("HEAD".to_string());
+        }
+
+        self.run_git_for_task_base(
+            repo_root,
+            ["fetch", "--prune", "origin"],
+            "refresh repository state from origin",
+        )
+        .await?;
+        let _ = self
+            .run_git_for_task_base(
+                repo_root,
+                ["remote", "set-head", "origin", "--auto"],
+                "refresh origin default branch",
+            )
+            .await;
+
+        if let Some(default_branch_ref) = self
+            .git_stdout(
+                repo_root,
+                ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            )
+            .await?
+        {
+            return Ok(default_branch_ref);
+        }
+
+        Err(CombinedServiceError::RepositoryPreparation(format!(
+            "failed to determine default branch tip for '{}'; origin/HEAD is unavailable",
+            repo_root.display()
+        )))
+    }
+
+    async fn git_remote_exists(
+        &self,
+        repo_root: &Path,
+        remote: &str,
+    ) -> Result<bool, CombinedServiceError> {
+        let output = self
+            .run_git_output(repo_root, ["remote", "get-url", remote])
+            .await?;
+        Ok(output.status.success())
+    }
+
+    async fn git_stdout<const N: usize>(
+        &self,
+        repo_root: &Path,
+        args: [&str; N],
+    ) -> Result<Option<String>, CombinedServiceError> {
+        let output = self.run_git_output(repo_root, args).await?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(stdout))
+        }
+    }
+
+    async fn run_git_for_task_base<const N: usize>(
+        &self,
+        repo_root: &Path,
+        args: [&str; N],
+        description: &str,
+    ) -> Result<(), CombinedServiceError> {
+        let output = self.run_git_output(repo_root, args).await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(CombinedServiceError::RepositoryPreparation(format!(
+                "failed to {description} for '{}': {}",
+                repo_root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    async fn run_git_output<const N: usize>(
+        &self,
+        repo_root: &Path,
+        args: [&str; N],
+    ) -> Result<Output, CombinedServiceError> {
+        let mut command = Command::new(git_program());
+        command
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in self.sandbox_env_pairs(Vec::new()).await? {
+            command.env(name, value);
+        }
+        Ok(command.output().await?)
     }
 
     async fn compress_directory_to_archive(
@@ -2585,6 +2689,21 @@ token = { command = "gh auth token" }
         fs::write(repo_root.join("README.md"), "hello\n").expect("repo file should be written");
         run_git(repo_root, &["add", "README.md"]);
         run_git(repo_root, &["commit", "-m", "initial"]);
+    }
+
+    fn git_stdout(repo_root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new(git_program())
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git command should succeed: git -C {repo_root:?} {}",
+            args.join(" ")
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]
@@ -3926,6 +4045,126 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                     .await
                     .is_ok(),
                 "base checkout should remain"
+            );
+        });
+    }
+
+    #[test]
+    fn task_worktree_uses_origin_default_branch_tip_instead_of_local_repo_head() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            let remote_root = root.path().join("remote.git");
+            let source_root = root.path().join("source");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            run_git(
+                root.path(),
+                &[
+                    "init",
+                    "--bare",
+                    remote_root.to_str().expect("remote path should be utf-8"),
+                ],
+            );
+            init_test_git_repository(&source_root);
+            run_git(
+                &source_root,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    remote_root.to_str().expect("remote path should be utf-8"),
+                ],
+            );
+            run_git(&source_root, &["push", "-u", "origin", "main"]);
+
+            let repo_root = service.workspace_repo_root_path("alpha", "example/repo");
+            run_git(
+                root.path(),
+                &[
+                    "clone",
+                    remote_root.to_str().expect("remote path should be utf-8"),
+                    repo_root.to_str().expect("repo root should be utf-8"),
+                ],
+            );
+
+            run_git(&repo_root, &["checkout", "-b", "topic"]);
+            fs::write(repo_root.join("topic.txt"), "topic\n")
+                .expect("topic file should be written");
+            run_git(&repo_root, &["add", "topic.txt"]);
+            run_git(&repo_root, &["commit", "-m", "topic"]);
+            let topic_head = git_stdout(&repo_root, &["rev-parse", "HEAD"]);
+
+            fs::write(source_root.join("README.md"), "upstream\n")
+                .expect("source readme should be updated");
+            run_git(&source_root, &["add", "README.md"]);
+            run_git(&source_root, &["commit", "-m", "upstream"]);
+            run_git(&source_root, &["push", "origin", "main"]);
+            let remote_main_head = git_stdout(&source_root, &["rev-parse", "HEAD"]);
+
+            let issue_url = "https://github.com/example/repo/issues/43";
+            let task_root = service
+                .ensure_workspace_task_checkout("alpha", "example/repo", issue_url)
+                .await
+                .expect("task checkout should be prepared");
+
+            let task_head = git_stdout(&task_root, &["rev-parse", "HEAD"]);
+            let task_branch = git_stdout(
+                &repo_root,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            );
+
+            assert_eq!(
+                task_branch, "refs/remotes/origin/main",
+                "test remote should advertise main as the default branch"
+            );
+            assert_eq!(
+                task_head, remote_main_head,
+                "task worktree should start from the latest origin default branch tip"
+            );
+            assert_ne!(
+                task_head, topic_head,
+                "task worktree should not inherit the local repo_root branch head"
             );
         });
     }
