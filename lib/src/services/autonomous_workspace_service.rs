@@ -117,6 +117,7 @@ async fn watch_workspace(
     let mut previous_queue_next_request_nonce: u64 = 0;
     let mut blocked_start_scan_request_nonce: Option<u64> = None;
     let mut previous_active_issue_url: Option<String> = None;
+    let mut startup_scan_pending = !service.config.autonomous.scan_on_startup;
 
     loop {
         let mut snapshot = workspace_rx.borrow().clone();
@@ -126,6 +127,9 @@ async fn watch_workspace(
         let queue_next_requested = snapshot.automation_queue_next_request_nonce
             != previous_queue_next_request_nonce;
         previous_queue_next_request_nonce = snapshot.automation_queue_next_request_nonce;
+        if scan_requested || queue_next_requested || !snapshot.persistent.tasks.is_empty() {
+            startup_scan_pending = false;
+        }
 
         if assigned_repository.is_some() || !snapshot.persistent.tasks.is_empty() {
             tracing::warn!(
@@ -728,6 +732,24 @@ async fn watch_workspace(
                 Some(current_deadline),
             )
             .await
+            {
+                break;
+            }
+            continue;
+        }
+
+        if should_defer_startup_issue_scan(
+            startup_scan_pending,
+            &snapshot,
+            scan_requested,
+            queue_next_requested,
+        ) {
+            set_automation_status(
+                &workspace,
+                Some(format!("Startup issue scan disabled for {repository_label}")),
+            );
+            previous_root_status = snapshot.root_session_status;
+            if !wait_for_workspace_change_until(&mut workspace_rx, &mut issue_status_rx, None).await
             {
                 break;
             }
@@ -2480,6 +2502,45 @@ fn set_task_runtime_state_from_codex(
     workspace.update(|snapshot| {
         let mut changed = false;
         let is_active = snapshot.active_task_id.as_deref() == Some(task_id);
+        let task_issue_url = snapshot
+            .persistent
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.issue_url.clone());
+        let expected_repository = snapshot
+            .persistent
+            .assigned_repository
+            .clone()
+            .or_else(|| {
+                task_issue_url
+                    .as_deref()
+                    .and_then(github_repository_from_issue_or_pr_url)
+            });
+        let metadata = metadata.map(|metadata| {
+            let assigned_repository = expected_repository.as_deref();
+            CodexTaskMetadata {
+                repositories: metadata.repositories,
+                issues: metadata
+                    .issues
+                    .into_iter()
+                    .filter(|issue_url| {
+                        assigned_repository.is_none_or(|repository| {
+                            github_issue_or_pr_url_matches_repository(issue_url, repository)
+                        })
+                    })
+                    .collect(),
+                prs: metadata
+                    .prs
+                    .into_iter()
+                    .filter(|pr_url| {
+                        assigned_repository.is_none_or(|repository| {
+                            github_issue_or_pr_url_matches_repository(pr_url, repository)
+                        })
+                    })
+                    .collect(),
+            }
+        });
         let next_status_text =
             codex_task_status_text(agent_state, metadata.as_ref(), task_id, snapshot);
         if is_active {
@@ -3385,8 +3446,43 @@ fn issue_number_from_url(issue_url: &str) -> Option<u64> {
     segments[3].parse::<u64>().ok()
 }
 
+fn github_repository_from_issue_or_pr_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.host_str()? != "github.com" {
+        return None;
+    }
+    let segments = parsed.path_segments()?.collect::<Vec<_>>();
+    let [owner, repo, kind, _number, ..] = segments.as_slice() else {
+        return None;
+    };
+    if !matches!(*kind, "issues" | "issue" | "pull") {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn github_issue_or_pr_url_matches_repository(url: &str, assigned_repository: &str) -> bool {
+    github_repository_from_issue_or_pr_url(url)
+        .as_deref()
+        .is_some_and(|repository| repository == assigned_repository)
+}
+
 fn available_issue_scan_slots(max_parallel_issues: usize, task_count: usize) -> usize {
     max_parallel_issues.saturating_sub(task_count)
+}
+
+fn should_defer_startup_issue_scan(
+    startup_scan_pending: bool,
+    snapshot: &WorkspaceSnapshot,
+    scan_requested: bool,
+    queue_next_requested: bool,
+) -> bool {
+    startup_scan_pending
+        && snapshot.persistent.tasks.is_empty()
+        && snapshot.active_task_id.is_none()
+        && snapshot.persistent.assigned_repository.is_some()
+        && !scan_requested
+        && !queue_next_requested
 }
 
 fn issue_search_args(assigned_repository: &str, label: &str) -> Vec<String> {
@@ -4630,6 +4726,25 @@ mod tests {
             discovered.as_deref(),
             Some("https://github.com/example/repo/pull/22")
         );
+    }
+
+    #[test]
+    fn startup_issue_scan_can_be_deferred_until_manual_request() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.assigned_repository = Some("example/repo".to_string());
+
+        assert!(should_defer_startup_issue_scan(true, &snapshot, false, false));
+        assert!(!should_defer_startup_issue_scan(true, &snapshot, true, false));
+        assert!(!should_defer_startup_issue_scan(true, &snapshot, false, true));
+
+        snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
+            "task-1".to_string(),
+            "https://github.com/example/repo/issues/1".to_string(),
+            WorkspaceTaskSource::Manual,
+        ));
+        assert!(!should_defer_startup_issue_scan(
+            true, &snapshot, false, false
+        ));
     }
 
     #[test]
@@ -5899,6 +6014,7 @@ mod tests {
     fn set_task_runtime_state_from_codex_sets_pr_created_status_for_review_tasks() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
+            snapshot.persistent.assigned_repository = Some("example/repo".to_string());
             snapshot
                 .persistent
                 .tasks
@@ -5937,6 +6053,67 @@ mod tests {
             .get("task-33")
             .expect("task state should exist");
         assert_eq!(task_state.status.as_deref(), Some("PR created #56"));
+    }
+
+    #[test]
+    fn set_task_runtime_state_from_codex_filters_foreign_metadata_prs() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.persistent.assigned_repository = Some("micronaut-projects/micronaut-redis".to_string());
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-733".to_string(),
+                    "https://github.com/micronaut-projects/micronaut-redis/issues/733".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-733",
+            "task-session-733",
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review,
+            Some(CodexTaskMetadata {
+                issues: vec![
+                    "https://github.com/micronaut-projects/micronaut-redis/issues/733".to_string(),
+                    "https://github.com/example/repo/issues/733".to_string(),
+                ],
+                prs: vec![
+                    "https://github.com/example/repo/pull/338".to_string(),
+                    "https://github.com/micronaut-projects/micronaut-redis/pull/733".to_string(),
+                ],
+                ..Default::default()
+            }),
+            None,
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-733")
+            .expect("task state should exist");
+        assert_eq!(
+            task_state.issue,
+            vec!["https://github.com/micronaut-projects/micronaut-redis/issues/733".to_string()]
+        );
+        assert_eq!(
+            task_state.pr,
+            vec!["https://github.com/micronaut-projects/micronaut-redis/pull/733".to_string()]
+        );
+        let task = snapshot
+            .persistent
+            .tasks
+            .iter()
+            .find(|task| task.id == "task-733")
+            .expect("task should exist");
+        assert_eq!(
+            task.backing_pr_url.as_deref(),
+            Some("https://github.com/micronaut-projects/micronaut-redis/pull/733")
+        );
     }
 
     #[test]

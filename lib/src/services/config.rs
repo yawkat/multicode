@@ -46,6 +46,8 @@ pub struct AutonomousConfig {
     pub issue_scan_delay_seconds: u64,
     #[serde(default = "default_max_parallel_issues", alias = "max-parallel-issues")]
     pub max_parallel_issues: usize,
+    #[serde(default = "default_scan_on_startup", alias = "scan-on-startup")]
+    pub scan_on_startup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -143,6 +145,7 @@ impl Default for AutonomousConfig {
         Self {
             issue_scan_delay_seconds: default_issue_scan_delay_seconds(),
             max_parallel_issues: default_max_parallel_issues(),
+            scan_on_startup: default_scan_on_startup(),
         }
     }
 }
@@ -255,6 +258,10 @@ fn default_issue_scan_delay_seconds() -> u64 {
 
 fn default_max_parallel_issues() -> usize {
     5
+}
+
+fn default_scan_on_startup() -> bool {
+    true
 }
 
 fn default_handler_review() -> String {

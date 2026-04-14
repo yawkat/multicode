@@ -556,6 +556,11 @@ impl TuiState {
 
     pub(crate) fn sync_from_manager(&mut self) {
         let previous_selected_entry = self.selected_entry();
+        let previous_selected_workspace_key = self.selected_workspace_key().map(str::to_string);
+        let previous_selected_automation_status = previous_selected_workspace_key
+            .as_ref()
+            .and_then(|key| self.snapshots.get(key))
+            .and_then(|snapshot| snapshot.automation_status.clone());
 
         let workspace_keys = self.workspace_keys_rx.borrow().clone();
 
@@ -590,6 +595,18 @@ impl TuiState {
             previous_selected_entry.as_ref(),
             self.selected_row,
         );
+
+        if let Some(key) = self.selected_workspace_key()
+            && previous_selected_workspace_key.as_deref() == Some(key)
+            && let Some(current_status) = self
+                .snapshots
+                .get(key)
+                .and_then(|snapshot| snapshot.automation_status.as_deref())
+            && current_status.starts_with("Scan failed")
+            && previous_selected_automation_status.as_deref() != Some(current_status)
+        {
+            self.status = current_status.to_string();
+        }
 
         self.normalize_selected_link_index();
 

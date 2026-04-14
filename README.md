@@ -72,6 +72,7 @@ Queueing is controlled in `config.toml` with the `[autonomous]` section:
 [autonomous]
 max-parallel-issues = 5
 issue-scan-delay-seconds = 900
+scan-on-startup = true
 ```
 
 Notes:
@@ -82,6 +83,10 @@ Notes:
   or otherwise clear some of the existing tasks.
 - `issue-scan-delay-seconds` controls how often background issue scans are retried. The default is `900` seconds
   (15 minutes).
+- `scan-on-startup` controls whether an assigned workspace immediately begins autonomous issue scanning when it starts
+  with an empty queue. The default is `true`.
+- Set `scan-on-startup = false` if you want to start a workspace without it auto-populating issues. In that mode you
+  can still queue work manually with `i` or use `n` to queue the next available issue on demand.
 
 ## Agent configuration
 

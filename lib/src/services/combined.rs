@@ -2551,6 +2551,23 @@ command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
     }
 
     #[test]
+    fn config_parses_autonomous_scan_on_startup_flag() {
+        let config: Config = toml::from_str(
+            r#"
+workspace-directory = "/tmp/workspaces"
+
+[autonomous]
+scan-on-startup = false
+
+[isolation]
+"#,
+        )
+        .expect("config should parse");
+
+        assert!(!config.autonomous.scan_on_startup);
+    }
+
+    #[test]
     fn config_parses_codex_autonomy_settings() {
         let config: Config = toml::from_str(
             r#"

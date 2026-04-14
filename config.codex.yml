@@ -22,6 +22,9 @@ codex-image = "multicode-codex-java25:latest"
 token = {env = "GITHUB_MCP_TOKEN"}
 populate-git-credentials = true
 
+[autonomous]
+scan-on-startup = false
+
 [isolation]
 add-skills-from = ["./workspace-skills"]
 writable = [
