@@ -1486,6 +1486,7 @@ fn help_line(
                         }
                         if selected_workspace_can_assign_issue {
                             push_hotkey(&mut spans, "i", " issue  ");
+                            push_hotkey(&mut spans, "n", " queue next  ");
                         }
                         if selected_workspace_can_diff {
                             push_hotkey(&mut spans, "c", " compare  ");

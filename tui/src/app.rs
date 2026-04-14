@@ -257,6 +257,10 @@ pub(crate) fn should_request_autonomous_issue_scan(
         && has_available_task_slot(snapshot, max_parallel_issues)
 }
 
+pub(crate) fn workspace_can_queue_next_issue(snapshot: &WorkspaceSnapshot) -> bool {
+    workspace_is_usable(snapshot) && snapshot.persistent.assigned_repository.is_some()
+}
+
 pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
     snapshot: &WorkspaceSnapshot,
 ) -> bool {
@@ -1122,6 +1126,29 @@ impl TuiState {
                         "No refreshable GitHub status links available for workspace '{workspace_key}'"
                     );
                 }
+            }
+        }
+    }
+
+    fn request_selected_workspace_queue_next_issue(&mut self) {
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key) else {
+            return;
+        };
+        if !workspace_can_queue_next_issue(snapshot) {
+            return;
+        }
+
+        match self.service.request_workspace_queue_next(&workspace_key) {
+            Ok(()) => {
+                self.status = format!("Requested next issue for workspace '{workspace_key}'");
+            }
+            Err(err) => {
+                self.status = format!(
+                    "Failed to request next issue for workspace '{workspace_key}': {err:?}"
+                );
             }
         }
     }
@@ -2698,6 +2725,15 @@ impl TuiState {
                     self.issue_input.clear();
                     self.mode = UiMode::EditIssue;
                 }
+            }
+            KeyCode::Char('n') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_some() {
+                    return;
+                }
+                self.request_selected_workspace_queue_next_issue();
             }
             KeyCode::Char('s') => {
                 if link_selected {

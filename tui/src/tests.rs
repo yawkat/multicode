@@ -127,6 +127,7 @@ mod tests {
             automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
+            automation_queue_next_request_nonce: 0,
             active_task_id: None,
             task_states: Default::default(),
             usage_total_tokens: None,
@@ -157,6 +158,7 @@ mod tests {
             automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
+            automation_queue_next_request_nonce: 0,
             active_task_id: None,
             task_states: Default::default(),
             usage_total_tokens: None,
@@ -2279,6 +2281,7 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("i issue"));
+        assert!(text.contains("n queue next"));
     }
 
     #[test]
@@ -2309,6 +2312,7 @@ mod tests {
             .collect::<String>();
 
         assert!(!text.contains("i issue"));
+        assert!(!text.contains("n queue next"));
     }
 
     #[test]

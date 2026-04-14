@@ -342,6 +342,23 @@ impl CombinedService {
         Ok(())
     }
 
+    pub fn request_workspace_queue_next(&self, key: &str) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        workspace.update(|snapshot| {
+            if let Some(repository) = snapshot.persistent.assigned_repository.as_deref() {
+                snapshot.automation_status =
+                    Some(format!("Queue next requested for {repository}"));
+            }
+            snapshot.persistent.automation_paused = false;
+            snapshot.automation_queue_next_request_nonce = snapshot
+                .automation_queue_next_request_nonce
+                .saturating_add(1);
+            true
+        });
+        Ok(())
+    }
+
     pub fn resume_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
         self.request_workspace_issue_scan(key)
     }
@@ -3589,6 +3606,84 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
 
             assert!(!snapshot.persistent.automation_paused);
             assert_eq!(snapshot.automation_scan_request_nonce, 2);
+        });
+    }
+
+    #[test]
+    fn request_workspace_queue_next_clears_manual_pause_and_increments_queue_nonce() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .update(|snapshot| {
+                    snapshot.persistent.automation_paused = true;
+                    true
+                });
+
+            service
+                .request_workspace_queue_next("alpha")
+                .expect("queue-next request should succeed");
+
+            let snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+
+            assert!(!snapshot.persistent.automation_paused);
+            assert_eq!(snapshot.automation_scan_request_nonce, 1);
+            assert_eq!(snapshot.automation_queue_next_request_nonce, 1);
+            assert_eq!(
+                snapshot.automation_status.as_deref(),
+                Some("Queue next requested for example/repo")
+            );
         });
     }
 

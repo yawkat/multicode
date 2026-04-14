@@ -114,6 +114,7 @@ async fn watch_workspace(
         HashMap::new();
     let mut previous_root_status: Option<RootSessionStatus> = None;
     let mut previous_scan_request_nonce: u64 = 0;
+    let mut previous_queue_next_request_nonce: u64 = 0;
     let mut blocked_start_scan_request_nonce: Option<u64> = None;
     let mut previous_active_issue_url: Option<String> = None;
 
@@ -122,6 +123,9 @@ async fn watch_workspace(
         let assigned_repository = snapshot.persistent.assigned_repository.clone();
         let scan_requested = snapshot.automation_scan_request_nonce != previous_scan_request_nonce;
         previous_scan_request_nonce = snapshot.automation_scan_request_nonce;
+        let queue_next_requested = snapshot.automation_queue_next_request_nonce
+            != previous_queue_next_request_nonce;
+        previous_queue_next_request_nonce = snapshot.automation_queue_next_request_nonce;
 
         if assigned_repository.is_some() || !snapshot.persistent.tasks.is_empty() {
             tracing::warn!(
@@ -135,6 +139,7 @@ async fn watch_workspace(
                 root_session_id = snapshot.root_session_id.as_deref(),
                 root_status = ?snapshot.root_session_status,
                 scan_requested,
+                queue_next_requested,
                 paused = snapshot.persistent.automation_paused,
                 "autonomous workspace iteration"
             );
@@ -305,13 +310,14 @@ async fn watch_workspace(
                 root_session_id = snapshot.root_session_id.as_deref(),
                 root_status = ?snapshot.root_session_status,
                 scan_requested,
+                queue_next_requested,
                 "autonomous workspace loop snapshot"
             );
         }
-        if scan_requested {
+        if scan_requested || queue_next_requested {
             blocked_start_scan_request_nonce = None;
         }
-        if scan_requested
+        if (scan_requested || queue_next_requested)
             && active_task_id_for_snapshot(&snapshot).is_none()
             && matches!(
                 snapshot
@@ -453,7 +459,7 @@ async fn watch_workspace(
                     .collect::<Vec<_>>(),
                 "autonomous workspace scheduling decision"
             );
-            if scan_requested {
+            if scan_requested || queue_next_requested {
                 match resolved_gh_token(&service).await {
                     Ok(token) => {
                         if let Err(err) = refresh_existing_task_backing_pr_urls(
@@ -479,11 +485,15 @@ async fn watch_workspace(
                         );
                     }
                 }
-                let available_slots = service
-                    .config
-                    .autonomous
-                    .max_parallel_issues
-                    .saturating_sub(snapshot.persistent.tasks.len());
+                let available_slots = if queue_next_requested {
+                    1
+                } else {
+                    service
+                        .config
+                        .autonomous
+                        .max_parallel_issues
+                        .saturating_sub(snapshot.persistent.tasks.len())
+                };
                 if available_slots > 0 {
                     match enqueue_next_issues(
                         &service,
@@ -761,7 +771,11 @@ async fn watch_workspace(
             );
         }
         let available_slots = available_issue_scan_slots(
-            service.config.autonomous.max_parallel_issues,
+            if queue_next_requested {
+                snapshot.persistent.tasks.len() + 1
+            } else {
+                service.config.autonomous.max_parallel_issues
+            },
             snapshot.persistent.tasks.len(),
         );
         match enqueue_next_issues(
