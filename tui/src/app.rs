@@ -1652,6 +1652,25 @@ impl TuiState {
         });
     }
 
+    fn persist_task_resume_prompt(&self, workspace_key: &str, task_id: &str, resume_prompt: &str) {
+        let Ok(workspace) = self.service.manager.get_workspace(workspace_key) else {
+            return;
+        };
+        let resume_prompt = resume_prompt.trim().to_string();
+        if resume_prompt.is_empty() {
+            return;
+        }
+        workspace.update(|snapshot| {
+            let task_state = snapshot.task_states.entry(task_id.to_string()).or_default();
+            if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                false
+            } else {
+                task_state.resume_prompt = Some(resume_prompt.clone());
+                true
+            }
+        });
+    }
+
     fn queue_task_codex_resume_until_vm_available(
         &self,
         workspace_key: String,
@@ -1721,6 +1740,20 @@ impl TuiState {
                 });
 
                 let resume_result = if let Some(resume_prompt) = resume_prompt.clone() {
+                    if !resume_prompt.trim().is_empty() {
+                        let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                            return;
+                        };
+                        workspace.update(|snapshot| {
+                            let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                            if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                                false
+                            } else {
+                                task_state.resume_prompt = Some(resume_prompt.clone());
+                                true
+                            }
+                        });
+                    }
                     service
                         .restart_task_session(&workspace_key, &snapshot, &task_id, &resume_prompt)
                         .await
@@ -1732,6 +1765,20 @@ impl TuiState {
                     )
                     .await
                     .unwrap_or_else(|| CODEX_AUTO_RESUME_PROMPT.to_string());
+                    if !resume_prompt.trim().is_empty() {
+                        let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                            return;
+                        };
+                        workspace.update(|snapshot| {
+                            let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                            if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                                false
+                            } else {
+                                task_state.resume_prompt = Some(resume_prompt.clone());
+                                true
+                            }
+                        });
+                    }
                     service
                         .prompt_task_session(&workspace_key, &snapshot, &task_id, &resume_prompt)
                         .await
@@ -1849,6 +1896,9 @@ impl TuiState {
                     && workspace_key == key
                 {
                     if should_queue_task_codex_resume_until_vm_available(&snapshot, task_id) {
+                        if let Some(resume_prompt) = interrupted_resume_prompt.as_deref() {
+                            self.persist_task_resume_prompt(key, task_id, resume_prompt);
+                        }
                         self.mark_task_waiting_on_vm_after_attach(key, task_id);
                         self.queue_task_codex_resume_until_vm_available(
                             key.to_string(),
@@ -1880,6 +1930,20 @@ impl TuiState {
                             ..
                         }) if attached_workspace_key == &workspace_key => {
                             if let Some(resume_prompt) = interrupted_resume_prompt.clone() {
+                                if !resume_prompt.trim().is_empty() {
+                                    let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                                        return;
+                                    };
+                                    workspace.update(|snapshot| {
+                                        let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                                        if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                                            false
+                                        } else {
+                                            task_state.resume_prompt = Some(resume_prompt.clone());
+                                            true
+                                        }
+                                    });
+                                }
                                 service
                                     .restart_task_session(
                                         &workspace_key,
@@ -1896,6 +1960,20 @@ impl TuiState {
                                 )
                                 .await
                                 .unwrap_or_else(|| CODEX_AUTO_RESUME_PROMPT.to_string());
+                                if !resume_prompt.trim().is_empty() {
+                                    let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                                        return;
+                                    };
+                                    workspace.update(|snapshot| {
+                                        let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                                        if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                                            false
+                                        } else {
+                                            task_state.resume_prompt = Some(resume_prompt.clone());
+                                            true
+                                        }
+                                    });
+                                }
                                 service
                                     .prompt_task_session(
                                         &workspace_key,

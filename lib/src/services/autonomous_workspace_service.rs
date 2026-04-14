@@ -3115,7 +3115,9 @@ async fn prompt_task_session(
         workspace_key,
         task_id,
     );
-    let prompt = build_issue_prompt(
+    let prompt = resolved_autonomous_task_prompt(
+        snapshot,
+        task_id,
         assigned_repository,
         issue,
         backing_pr_url,
@@ -3193,6 +3195,32 @@ async fn prompt_task_session(
             }))
         }
     }
+}
+
+fn resolved_autonomous_task_prompt(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    backing_pr_url: Option<&str>,
+    task_session_id: &str,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+) -> String {
+    snapshot
+        .task_states
+        .get(task_id)
+        .and_then(|task_state| task_state.resume_prompt.clone())
+        .unwrap_or_else(|| {
+            build_issue_prompt(
+                assigned_repository,
+                issue,
+                backing_pr_url,
+                task_session_id,
+                cwd,
+                task_state_path,
+            )
+        })
 }
 
 async fn wait_for_codex_task_thread_ready(
@@ -6710,6 +6738,38 @@ mod tests {
         assert!(prompt.contains("stage the full task checkout with `git add -A`"));
         assert!(!prompt.contains("backed by Renovate pull request"));
         assert!(!prompt.contains("merge it without waiting for human review"));
+    }
+
+    #[test]
+    fn resolved_autonomous_task_prompt_prefers_saved_resume_prompt() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.task_states.insert(
+            "task-361".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                resume_prompt: Some("Apply the extra Redis fix from the attached session.".to_string()),
+                ..Default::default()
+            },
+        );
+        let issue = test_issue(
+            361,
+            "Redis issue",
+            "https://github.com/example/repo/issues/361",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+
+        let prompt = resolved_autonomous_task_prompt(
+            &snapshot,
+            "task-361",
+            "example/repo",
+            &issue,
+            None,
+            "thread-task-361",
+            std::path::Path::new("/tmp/work/example-repo-361"),
+            std::path::Path::new("/tmp/state/task-361.state"),
+        );
+
+        assert_eq!(prompt, "Apply the extra Redis fix from the attached session.");
     }
 
     #[test]

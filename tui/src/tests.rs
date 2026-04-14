@@ -81,6 +81,7 @@ mod tests {
     }
 
     fn create_fake_git_repo(path: &std::path::Path) {
+        fs::create_dir_all(path).expect("repo root should be created");
         let git_dir = path.join(".git");
         fs::create_dir_all(&git_dir).expect("git dir should be created");
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD should be created");
@@ -90,6 +91,7 @@ mod tests {
     }
 
     fn create_fake_git_worktree(path: &std::path::Path, common_dir: &std::path::Path) {
+        fs::create_dir_all(path).expect("worktree root should be created");
         let git_dir = common_dir
             .join("worktrees")
             .join(path.file_name().expect("worktree should have name"));
@@ -1466,11 +1468,9 @@ mod tests {
             "https://github.com/micronaut-projects/micronaut-serialization/issues/921".to_string(),
         );
         let workspace = TestDir::new();
-        let repo_root = workspace.path().join("micronaut-serialization");
-        create_fake_git_repo(&repo_root);
         let repo_path = workspace.path().join("work/micronaut-serialization-921");
         fs::create_dir_all(&repo_path).expect("issue worktree repo should be created");
-        create_fake_git_worktree(&repo_path, &repo_root.join(".git"));
+        create_fake_git_repo(&repo_path);
 
         assert_eq!(
             compare_target_path(&started, &HashMap::new(), workspace.path()),
