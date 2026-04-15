@@ -1,4 +1,4 @@
-workspace-directory = "~/dev/agent-work"
+workspace-directory = "~/dev/multicode-workspaces"
 opencode = ["opencode-cli", "opencode"]
 # todo: find a solution that isn't bound to TUI lifecycle
 

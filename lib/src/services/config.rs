@@ -14,6 +14,7 @@ use crate::RuntimeBackend;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
+    #[serde(default = "default_workspace_directory")]
     pub workspace_directory: String,
     pub isolation: IsolationConfig,
     #[serde(default)]
@@ -242,6 +243,10 @@ impl Default for HandlerConfig {
 
 fn default_opencode_commands() -> Vec<String> {
     vec!["opencode-cli".to_string(), "opencode".to_string()]
+}
+
+fn default_workspace_directory() -> String {
+    "~/dev/multicode-workspaces".to_string()
 }
 
 fn default_codex_commands() -> Vec<String> {
@@ -817,6 +822,14 @@ mod tests {
             expand_shell_path("$XDG_RUNTIME_DIR/opencode").expect("runtime dir should expand");
 
         assert_eq!(path, runtime_dir.join("opencode"));
+    }
+
+    #[test]
+    fn config_defaults_workspace_directory_when_omitted() {
+        let config: Config =
+            toml::from_str("[isolation]\n").expect("config without workspace-directory should parse");
+
+        assert_eq!(config.workspace_directory, "~/dev/multicode-workspaces");
     }
 
     #[cfg(target_os = "macos")]

@@ -1,4 +1,4 @@
-workspace-directory = "/tmp/multicode-codex-workspaces"
+workspace-directory = "~/dev/multicode-workspaces"
 opencode = ["opencode-cli", "opencode"]
 
 [agent]

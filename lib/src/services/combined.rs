@@ -2452,7 +2452,7 @@ mod tests {
 
     fn default_config() -> Config {
         Config {
-            workspace_directory: "/tmp/workspaces".to_string(),
+            workspace_directory: "~/dev/multicode-workspaces".to_string(),
             isolation: Default::default(),
             runtime: Default::default(),
             autonomous: Default::default(),
@@ -2940,21 +2940,31 @@ populate-git-credentials = true
     }
 
     #[test]
-    fn combined_service_requires_workspace_directory_in_config() {
+    fn combined_service_uses_default_workspace_directory_when_omitted() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
+            let home = root.path().join("home");
+            fs::create_dir_all(home.join("dev/multicode-workspaces"))
+                .expect("default workspace directory should exist");
+            let _home_guard = EnvVarGuard::set("HOME", &home);
             let config_path = root.path().join("config.toml");
             fs::write(&config_path, "[isolation]\n").expect("config should be written");
 
-            let err = CombinedService::from_config_path(&config_path)
+            let service = CombinedService::from_config_path(&config_path)
                 .await
-                .expect_err("config without workspace_directory should fail");
-            assert!(matches!(err, CombinedServiceError::ParseToml(_)));
+                .expect("config without workspace_directory should use default");
+            assert_eq!(
+                service.config.workspace_directory,
+                "~/dev/multicode-workspaces"
+            );
         });
     }
 

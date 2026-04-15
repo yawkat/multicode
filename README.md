@@ -61,6 +61,9 @@ Notes:
 a single issue report. A workspace gets its own working directory and agent session, so you can work from a blank
 slate.
 
+The workspace root is configurable with `workspace-directory`. If you omit it, multicode defaults
+to `~/dev/multicode-workspaces`.
+
 ## Autonomous queueing
 
 When a workspace is assigned to a GitHub repository, *multicode* can scan for issues and queue multiple issue tasks in
