@@ -31,6 +31,15 @@ When a fix needs validation across multiple Gradle projects:
 
 You can also use these features to verify patches against a user-provided or out-of-tree reproducer.
 
+## Documentation
+
+When writing documentation:
+
+- Prefer the `snippet:` macro instead of inline code blocks so snippets can be generated for all supported languages.
+- Unless the project only supports a narrower set, create snippets for Java, Kotlin, and Groovy.
+- Resolve documentation snippets from the project's `doc-examples` subdirectory.
+- Structure `doc-examples` in the same style used by `micronaut-graphql`'s `docs-examples` reference project on the `5.0.x` branch.
+
 ## PR creation
 
 Unless requested otherwise, target fixes against the default branch, which will be the next minor release.
