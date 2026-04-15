@@ -4317,6 +4317,11 @@ fn extract_dependency_upgrade_pr_marker(body: &str) -> Option<&str> {
 }
 
 fn dependency_upgrade_versions_from_text(text: &str) -> Option<(u64, u64)> {
+    dependency_upgrade_versions_from_from_to_text(text)
+        .or_else(|| dependency_upgrade_versions_from_arrow_text(text))
+}
+
+fn dependency_upgrade_versions_from_from_to_text(text: &str) -> Option<(u64, u64)> {
     let lower = text.to_ascii_lowercase();
     let from_index = lower.find(" from ")?;
     let to_index = lower[from_index + 6..].find(" to ")? + from_index + 6;
@@ -4325,9 +4330,24 @@ fn dependency_upgrade_versions_from_text(text: &str) -> Option<(u64, u64)> {
     Some((from_version, to_version))
 }
 
+fn dependency_upgrade_versions_from_arrow_text(text: &str) -> Option<(u64, u64)> {
+    for line in text.lines() {
+        let Some((left, right)) = line
+            .split_once('→')
+            .or_else(|| line.split_once("->"))
+            .or_else(|| line.split_once("=>"))
+        else {
+            continue;
+        };
+        let from_version = extract_trailing_version(left)?;
+        let to_version = extract_leading_version(right)?;
+        return Some((from_version, to_version));
+    }
+    None
+}
+
 fn extract_leading_version(text: &str) -> Option<u64> {
-    let token = text
-        .split_whitespace()
+    let token = version_token_candidates(text)
         .find(|candidate| candidate.chars().any(|ch| ch.is_ascii_digit()))?;
     let token = token
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '-')
@@ -4337,6 +4357,24 @@ fn extract_leading_version(text: &str) -> Option<u64> {
         .next()
         .filter(|segment| !segment.is_empty())?;
     major.parse::<u64>().ok()
+}
+
+fn extract_trailing_version(text: &str) -> Option<u64> {
+    let token = version_token_candidates(text)
+        .filter(|candidate| candidate.chars().any(|ch| ch.is_ascii_digit()))
+        .last()?;
+    let token = token
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '-')
+        .trim_start_matches(['v', 'V']);
+    let major = token
+        .split(['.', '-'])
+        .next()
+        .filter(|segment| !segment.is_empty())?;
+    major.parse::<u64>().ok()
+}
+
+fn version_token_candidates(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
 }
 
 #[cfg(test)]
@@ -6918,5 +6956,51 @@ mod tests {
             extract_dependency_upgrade_pr_marker(&body),
             Some("https://github.com/example/repo/pull/91")
         );
+    }
+
+    #[test]
+    fn dependency_upgrade_versions_from_arrow_text_parses_renovate_table_rows() {
+        let body = "This PR contains the following updates:\n\n| Package | Change |\n|---|---|\n| io.micronaut.security:micronaut-security-bom | `4.16.1` → `4.17.1` |\n";
+
+        assert_eq!(dependency_upgrade_versions_from_text(body), Some((4, 4)));
+    }
+
+    #[test]
+    fn dependency_upgrade_versions_from_arrow_text_detects_major_renovate_rows() {
+        let body = "This PR contains the following updates:\n\n| Package | Type | Change |\n|---|---|---|\n| softprops/action-gh-release | action | `v2.5.0` → `v3.0.0` |\n";
+
+        assert_eq!(dependency_upgrade_versions_from_text(body), Some((2, 3)));
+    }
+
+    #[test]
+    fn dependency_upgrade_non_major_detection_accepts_renovate_body_without_minor_label() {
+        let body = "This PR contains the following updates:\n\n| Package | Change |\n|---|---|\n| io.micronaut.security:micronaut-security-bom | `4.16.1` → `4.17.1` |\n";
+        let pr = test_pull_request(
+            682,
+            "fix(deps): update dependency io.micronaut.security:micronaut-security-bom to v4.17.1",
+            "https://github.com/example/repo/pull/682",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            Some(body),
+        );
+
+        assert!(pr.is_non_major_dependency_upgrade());
+    }
+
+    #[test]
+    fn dependency_upgrade_non_major_detection_rejects_renovate_major_body_without_major_label() {
+        let body = "This PR contains the following updates:\n\n| Package | Type | Change |\n|---|---|---|\n| softprops/action-gh-release | action | `v2.5.0` → `v3.0.0` |\n";
+        let pr = test_pull_request(
+            696,
+            "chore(deps): update softprops/action-gh-release action to v3",
+            "https://github.com/example/repo/pull/696",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            Some(body),
+        );
+
+        assert!(!pr.is_non_major_dependency_upgrade());
     }
 }
