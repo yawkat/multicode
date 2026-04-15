@@ -347,8 +347,7 @@ impl CombinedService {
         let workspace = self.manager.get_workspace(&key)?;
         workspace.update(|snapshot| {
             if let Some(repository) = snapshot.persistent.assigned_repository.as_deref() {
-                snapshot.automation_status =
-                    Some(format!("Queue next requested for {repository}"));
+                snapshot.automation_status = Some(format!("Queue next requested for {repository}"));
             }
             snapshot.persistent.automation_paused = false;
             snapshot.automation_queue_next_request_nonce = snapshot
@@ -1865,7 +1864,18 @@ fn github_git_credentials_env_vars(
 
 async fn path_has_git_entry(path: &Path) -> Result<bool, CombinedServiceError> {
     match tokio::fs::symlink_metadata(path.join(".git")).await {
-        Ok(_) => Ok(true),
+        Ok(_) => {
+            let output = Command::new(git_program())
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--git-dir"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .await?;
+            Ok(output.status.success())
+        }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err.into()),
     }
@@ -1962,7 +1972,9 @@ fn find_git_repo_roots(workspace_path: &Path) -> Result<Vec<PathBuf>, std::io::E
             let path = entry.path();
             let file_type = entry.file_type()?;
             if entry.file_name() == ".git" {
-                repo_roots.insert(directory.clone());
+                if git_repository_is_valid(&directory)? {
+                    repo_roots.insert(directory.clone());
+                }
                 continue;
             }
             if file_type.is_dir() {
@@ -1972,6 +1984,18 @@ fn find_git_repo_roots(workspace_path: &Path) -> Result<Vec<PathBuf>, std::io::E
     }
 
     Ok(repo_roots.into_iter().collect())
+}
+
+fn git_repository_is_valid(path: &Path) -> Result<bool, std::io::Error> {
+    let output = std::process::Command::new(git_program())
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    Ok(output.status.success())
 }
 
 async fn unset_repo_local_git_config(
@@ -4391,6 +4415,27 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .output()
                 .expect("git config core.repositoryformatversion should run");
             assert!(remote.status.success(), "repo config should remain intact");
+        });
+    }
+
+    #[test]
+    fn strip_workspace_git_identity_overrides_ignores_dangling_worktree_git_files() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace = root.path().join("workspace");
+            let broken_worktree = workspace.join("work").join("micronaut-sql-1508");
+            fs::create_dir_all(&broken_worktree).expect("broken worktree dir should exist");
+            fs::write(broken_worktree.join(".git"), "gitdir: /missing/admin/dir\n")
+                .expect("dangling worktree git file should be written");
+
+            strip_workspace_git_identity_overrides(&workspace)
+                .await
+                .expect("dangling worktree git files should be ignored");
         });
     }
 

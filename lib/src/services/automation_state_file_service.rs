@@ -226,10 +226,6 @@ fn apply_state_file_snapshot(
 
 fn state_snapshot_session_id(next: Option<&ParsedAutomationState>) -> Option<String> {
     match next {
-        Some(ParsedAutomationState {
-            state: AutomationAgentState::Stale,
-            ..
-        }) => None,
         Some(state) => state.thread_id.clone(),
         None => None,
     }
@@ -466,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_state_snapshot_does_not_promote_thread_id_to_resumable_session() {
+    fn stale_state_snapshot_preserves_thread_id_for_recovery_and_attach() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
             snapshot.active_task_id = Some("task-42".to_string());
@@ -495,11 +491,17 @@ mod tests {
             .task_states
             .get("task-42")
             .expect("task state should be present");
-        assert_eq!(task_state.session_id, None);
+        assert_eq!(task_state.session_id.as_deref(), Some("thread-stale"));
         assert_eq!(task_state.agent_state, Some(AutomationAgentState::Stale));
         assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
-        assert_eq!(snapshot.automation_session_id, None);
-        assert_eq!(snapshot.automation_agent_state, Some(AutomationAgentState::Stale));
+        assert_eq!(
+            snapshot.automation_session_id.as_deref(),
+            Some("thread-stale")
+        );
+        assert_eq!(
+            snapshot.automation_agent_state,
+            Some(AutomationAgentState::Stale)
+        );
         assert_eq!(
             snapshot.automation_session_status,
             Some(RootSessionStatus::Idle)

@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Mutex, OnceLock},
+    time::{Duration, SystemTime},
 };
 
 use diesel::{
@@ -124,8 +125,8 @@ async fn watch_workspace(
         let assigned_repository = snapshot.persistent.assigned_repository.clone();
         let scan_requested = snapshot.automation_scan_request_nonce != previous_scan_request_nonce;
         previous_scan_request_nonce = snapshot.automation_scan_request_nonce;
-        let queue_next_requested = snapshot.automation_queue_next_request_nonce
-            != previous_queue_next_request_nonce;
+        let queue_next_requested =
+            snapshot.automation_queue_next_request_nonce != previous_queue_next_request_nonce;
         previous_queue_next_request_nonce = snapshot.automation_queue_next_request_nonce;
         if scan_requested || queue_next_requested || !snapshot.persistent.tasks.is_empty() {
             startup_scan_pending = false;
@@ -746,7 +747,9 @@ async fn watch_workspace(
         ) {
             set_automation_status(
                 &workspace,
-                Some(format!("Startup issue scan disabled for {repository_label}")),
+                Some(format!(
+                    "Startup issue scan disabled for {repository_label}"
+                )),
             );
             previous_root_status = snapshot.root_session_status;
             if !wait_for_workspace_change_until(&mut workspace_rx, &mut issue_status_rx, None).await
@@ -2118,8 +2121,35 @@ impl Drop for DisposableDirectory {
 
 #[derive(Debug)]
 struct CodexStateDbSnapshot {
+    database_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct CachedCodexStateDbSnapshot {
+    fingerprint: CodexStateDbFingerprint,
     _directory: DisposableDirectory,
     database_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexStateDbFingerprint {
+    database: CodexStateDbFileState,
+    wal: Option<CodexStateDbFileState>,
+    shm: Option<CodexStateDbFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexStateDbFileState {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+static CODEX_STATE_DB_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, CachedCodexStateDbSnapshot>>,
+> = OnceLock::new();
+
+fn codex_state_db_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, CachedCodexStateDbSnapshot>> {
+    CODEX_STATE_DB_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn copy_codex_state_db_sidecar(
@@ -2154,7 +2184,57 @@ fn copy_codex_state_db_sidecar(
     Ok(())
 }
 
+fn codex_state_db_sidecar_path(state_db_path: &Path, suffix: &str) -> PathBuf {
+    state_db_path.with_extension(format!(
+        "{}{suffix}",
+        state_db_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+    ))
+}
+
+fn codex_state_db_file_state(path: &Path) -> Result<Option<CodexStateDbFileState>, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(CodexStateDbFileState {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to read metadata for '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+fn codex_state_db_fingerprint(state_db_path: &Path) -> Result<CodexStateDbFingerprint, String> {
+    let database = codex_state_db_file_state(state_db_path)?.ok_or_else(|| {
+        format!(
+            "Codex state database '{}' does not exist",
+            state_db_path.display()
+        )
+    })?;
+    let wal = codex_state_db_file_state(&codex_state_db_sidecar_path(state_db_path, "-wal"))?;
+    let shm = codex_state_db_file_state(&codex_state_db_sidecar_path(state_db_path, "-shm"))?;
+    Ok(CodexStateDbFingerprint { database, wal, shm })
+}
+
 fn snapshot_codex_state_db(state_db_path: &Path) -> Result<CodexStateDbSnapshot, String> {
+    let fingerprint = codex_state_db_fingerprint(state_db_path)?;
+    let cache = codex_state_db_snapshot_cache();
+    let database_key = state_db_path.to_path_buf();
+    if let Some(database_path) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&database_key)
+        .and_then(|snapshot| {
+            (snapshot.fingerprint == fingerprint).then(|| snapshot.database_path.clone())
+        })
+    {
+        return Ok(CodexStateDbSnapshot { database_path });
+    }
+
     let Some(file_name) = state_db_path.file_name() else {
         return Err(format!(
             "Codex state database path '{}' has no file name",
@@ -2181,10 +2261,20 @@ fn snapshot_codex_state_db(state_db_path: &Path) -> Result<CodexStateDbSnapshot,
     copy_codex_state_db_sidecar(state_db_path, "-wal", &snapshot_db_path)?;
     copy_codex_state_db_sidecar(state_db_path, "-shm", &snapshot_db_path)?;
 
-    Ok(CodexStateDbSnapshot {
-        _directory: snapshot_dir,
-        database_path: snapshot_db_path,
-    })
+    let database_path = snapshot_db_path.clone();
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            database_key,
+            CachedCodexStateDbSnapshot {
+                fingerprint,
+                _directory: snapshot_dir,
+                database_path: snapshot_db_path,
+            },
+        );
+
+    Ok(CodexStateDbSnapshot { database_path })
 }
 
 fn recover_latest_codex_thread_candidate_for_cwd(
@@ -2508,15 +2598,11 @@ fn set_task_runtime_state_from_codex(
             .iter()
             .find(|task| task.id == task_id)
             .map(|task| task.issue_url.clone());
-        let expected_repository = snapshot
-            .persistent
-            .assigned_repository
-            .clone()
-            .or_else(|| {
-                task_issue_url
-                    .as_deref()
-                    .and_then(github_repository_from_issue_or_pr_url)
-            });
+        let expected_repository = snapshot.persistent.assigned_repository.clone().or_else(|| {
+            task_issue_url
+                .as_deref()
+                .and_then(github_repository_from_issue_or_pr_url)
+        });
         let metadata = metadata.map(|metadata| {
             let assigned_repository = expected_repository.as_deref();
             CodexTaskMetadata {
@@ -4560,6 +4646,125 @@ mod tests {
         let _ = fs::remove_dir_all(&codex_home);
     }
 
+    #[test]
+    fn snapshot_codex_state_db_reuses_cached_copy_when_source_is_unchanged() {
+        let codex_home = unique_test_dir("codex-state-snapshot-reuse");
+        fs::create_dir_all(&codex_home).expect("codex home should be created");
+        let state_db_path = codex_home.join("state_2026-04-15.sqlite");
+        let mut connection = SqliteConnection::establish(state_db_path.to_string_lossy().as_ref())
+            .expect("state database should be created");
+        connection
+            .batch_execute(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE threads (
+                     id TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     updated_at BIGINT NOT NULL,
+                     created_at BIGINT NOT NULL,
+                     archived INTEGER NOT NULL DEFAULT 0,
+                     has_user_event INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO threads (
+                     id,
+                     cwd,
+                     updated_at,
+                     created_at,
+                     archived,
+                     has_user_event
+                 ) VALUES (
+                     'thread-1',
+                     '/tmp/workspace-1',
+                     1713183212,
+                     1713183200,
+                     0,
+                     1
+                 );",
+            )
+            .expect("state database should be populated");
+        drop(connection);
+
+        let first_snapshot =
+            snapshot_codex_state_db(&state_db_path).expect("first snapshot should succeed");
+        let second_snapshot =
+            snapshot_codex_state_db(&state_db_path).expect("second snapshot should succeed");
+
+        assert_eq!(first_snapshot.database_path, second_snapshot.database_path);
+
+        let _ = fs::remove_dir_all(&codex_home);
+    }
+
+    #[test]
+    fn snapshot_codex_state_db_refreshes_cached_copy_when_source_changes() {
+        let codex_home = unique_test_dir("codex-state-snapshot-refresh");
+        fs::create_dir_all(&codex_home).expect("codex home should be created");
+        let state_db_path = codex_home.join("state_2026-04-15.sqlite");
+        let mut connection = SqliteConnection::establish(state_db_path.to_string_lossy().as_ref())
+            .expect("state database should be created");
+        connection
+            .batch_execute(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE threads (
+                     id TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     updated_at BIGINT NOT NULL,
+                     created_at BIGINT NOT NULL,
+                     archived INTEGER NOT NULL DEFAULT 0,
+                     has_user_event INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO threads (
+                     id,
+                     cwd,
+                     updated_at,
+                     created_at,
+                     archived,
+                     has_user_event
+                 ) VALUES (
+                     'thread-1',
+                     '/tmp/workspace-1',
+                     1713183212,
+                     1713183200,
+                     0,
+                     1
+                 );",
+            )
+            .expect("state database should be populated");
+        drop(connection);
+
+        let first_snapshot =
+            snapshot_codex_state_db(&state_db_path).expect("first snapshot should succeed");
+
+        let mut connection = SqliteConnection::establish(state_db_path.to_string_lossy().as_ref())
+            .expect("state database should reopen");
+        connection
+            .batch_execute(
+                "INSERT INTO threads (
+                     id,
+                     cwd,
+                     updated_at,
+                     created_at,
+                     archived,
+                     has_user_event
+                 ) VALUES (
+                     'thread-2',
+                     '/tmp/workspace-2',
+                     1713183213,
+                     1713183201,
+                     0,
+                     1
+                 );",
+            )
+            .expect("second thread row should be inserted");
+        drop(connection);
+
+        let second_snapshot =
+            snapshot_codex_state_db(&state_db_path).expect("second snapshot should succeed");
+
+        assert_ne!(first_snapshot.database_path, second_snapshot.database_path);
+
+        let _ = fs::remove_dir_all(&codex_home);
+    }
+
     fn test_issue(
         number: u64,
         title: &str,
@@ -4799,15 +5004,24 @@ mod tests {
         let mut snapshot = WorkspaceSnapshot::default();
         snapshot.persistent.assigned_repository = Some("example/repo".to_string());
 
-        assert!(should_defer_startup_issue_scan(true, &snapshot, false, false));
-        assert!(!should_defer_startup_issue_scan(true, &snapshot, true, false));
-        assert!(!should_defer_startup_issue_scan(true, &snapshot, false, true));
-
-        snapshot.persistent.tasks.push(WorkspaceTaskPersistentSnapshot::new(
-            "task-1".to_string(),
-            "https://github.com/example/repo/issues/1".to_string(),
-            WorkspaceTaskSource::Manual,
+        assert!(should_defer_startup_issue_scan(
+            true, &snapshot, false, false
         ));
+        assert!(!should_defer_startup_issue_scan(
+            true, &snapshot, true, false
+        ));
+        assert!(!should_defer_startup_issue_scan(
+            true, &snapshot, false, true
+        ));
+
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-1".to_string(),
+                "https://github.com/example/repo/issues/1".to_string(),
+                WorkspaceTaskSource::Manual,
+            ));
         assert!(!should_defer_startup_issue_scan(
             true, &snapshot, false, false
         ));
@@ -6125,7 +6339,8 @@ mod tests {
     fn set_task_runtime_state_from_codex_filters_foreign_metadata_prs() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
-            snapshot.persistent.assigned_repository = Some("micronaut-projects/micronaut-redis".to_string());
+            snapshot.persistent.assigned_repository =
+                Some("micronaut-projects/micronaut-redis".to_string());
             snapshot
                 .persistent
                 .tasks
@@ -6784,7 +6999,9 @@ mod tests {
         snapshot.task_states.insert(
             "task-361".to_string(),
             crate::WorkspaceTaskRuntimeSnapshot {
-                resume_prompt: Some("Apply the extra Redis fix from the attached session.".to_string()),
+                resume_prompt: Some(
+                    "Apply the extra Redis fix from the attached session.".to_string(),
+                ),
                 ..Default::default()
             },
         );
@@ -6807,7 +7024,10 @@ mod tests {
             std::path::Path::new("/tmp/state/task-361.state"),
         );
 
-        assert_eq!(prompt, "Apply the extra Redis fix from the attached session.");
+        assert_eq!(
+            prompt,
+            "Apply the extra Redis fix from the attached session."
+        );
     }
 
     #[test]

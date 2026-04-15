@@ -222,7 +222,9 @@ struct RunningOperation {
 enum RunningOperationCompletionAction {
     #[default]
     None,
-    WaitForWorkspaceStart { attach_when_ready: bool },
+    WaitForWorkspaceStart {
+        attach_when_ready: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,7 +1088,10 @@ fn compare_target_path_for_task(
         }
     }
 
-    push_unique_candidate(&mut candidates, workspace_path.join("work").join(&worktree_name));
+    push_unique_candidate(
+        &mut candidates,
+        workspace_path.join("work").join(&worktree_name),
+    );
 
     if let Some(task_state) = task_state {
         for repository in &task_state.repository {

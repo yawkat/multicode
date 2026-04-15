@@ -1322,7 +1322,8 @@ impl TuiState {
                 .filter(|tool| tool_is_usable(tool, snapshot))
                 .filter_map(|tool| {
                     let ch = tool_key_char(tool)?;
-                    seen.insert(ch).then_some((ch.to_string(), tool.name.clone()))
+                    seen.insert(ch)
+                        .then_some((ch.to_string(), tool.name.clone()))
                 })
                 .collect();
         }
@@ -1335,7 +1336,8 @@ impl TuiState {
             .filter(|tool| tool_is_usable(tool, snapshot))
             .filter_map(|tool| {
                 let ch = tool_key_char(tool)?;
-                seen.insert(ch).then_some((ch.to_string(), tool.name.clone()))
+                seen.insert(ch)
+                    .then_some((ch.to_string(), tool.name.clone()))
             })
             .collect()
     }
@@ -1845,7 +1847,8 @@ impl TuiState {
                             return;
                         };
                         workspace.update(|snapshot| {
-                            let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                            let task_state =
+                                snapshot.task_states.entry(task_id.clone()).or_default();
                             if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
                                 false
                             } else {
@@ -1870,7 +1873,8 @@ impl TuiState {
                             return;
                         };
                         workspace.update(|snapshot| {
-                            let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+                            let task_state =
+                                snapshot.task_states.entry(task_id.clone()).or_default();
                             if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
                                 false
                             } else {
@@ -2031,12 +2035,19 @@ impl TuiState {
                         }) if attached_workspace_key == &workspace_key => {
                             if let Some(resume_prompt) = interrupted_resume_prompt.clone() {
                                 if !resume_prompt.trim().is_empty() {
-                                    let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                                    let Ok(workspace) =
+                                        service.manager.get_workspace(&workspace_key)
+                                    else {
                                         return;
                                     };
                                     workspace.update(|snapshot| {
-                                        let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
-                                        if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                                        let task_state = snapshot
+                                            .task_states
+                                            .entry(task_id.clone())
+                                            .or_default();
+                                        if task_state.resume_prompt.as_deref()
+                                            == Some(resume_prompt.as_str())
+                                        {
                                             false
                                         } else {
                                             task_state.resume_prompt = Some(resume_prompt.clone());
@@ -2061,12 +2072,19 @@ impl TuiState {
                                 .await
                                 .unwrap_or_else(|| CODEX_AUTO_RESUME_PROMPT.to_string());
                                 if !resume_prompt.trim().is_empty() {
-                                    let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
+                                    let Ok(workspace) =
+                                        service.manager.get_workspace(&workspace_key)
+                                    else {
                                         return;
                                     };
                                     workspace.update(|snapshot| {
-                                        let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
-                                        if task_state.resume_prompt.as_deref() == Some(resume_prompt.as_str()) {
+                                        let task_state = snapshot
+                                            .task_states
+                                            .entry(task_id.clone())
+                                            .or_default();
+                                        if task_state.resume_prompt.as_deref()
+                                            == Some(resume_prompt.as_str())
+                                        {
                                             false
                                         } else {
                                             task_state.resume_prompt = Some(resume_prompt.clone());
@@ -2166,38 +2184,36 @@ impl TuiState {
             && let Some(running_tool) = self.running_operation.take()
         {
             match result {
-                Ok(()) => {
-                    match running_tool.completion_action {
-                        RunningOperationCompletionAction::None => {
-                            self.mode = UiMode::Normal;
-                            self.status = running_tool.success_status.unwrap_or_else(|| {
-                                format!(
-                                    "{} completed for workspace '{}'",
-                                    running_tool.operation_name, running_tool.workspace_key
-                                )
-                            });
-                        }
-                        RunningOperationCompletionAction::WaitForWorkspaceStart {
-                            attach_when_ready,
-                        } => {
-                            self.mode = UiMode::StartingModal;
-                            self.starting_workspace_key = Some(running_tool.workspace_key.clone());
-                            self.starting_attach_when_ready = attach_when_ready;
-                            self.started_wait_since = None;
-                            self.status = if attach_when_ready {
-                                format!(
-                                    "Starting workspace '{}' before attaching",
-                                    running_tool.workspace_key
-                                )
-                            } else {
-                                format!(
-                                    "Waiting for workspace '{}' to become ready",
-                                    running_tool.workspace_key
-                                )
-                            };
-                        }
+                Ok(()) => match running_tool.completion_action {
+                    RunningOperationCompletionAction::None => {
+                        self.mode = UiMode::Normal;
+                        self.status = running_tool.success_status.unwrap_or_else(|| {
+                            format!(
+                                "{} completed for workspace '{}'",
+                                running_tool.operation_name, running_tool.workspace_key
+                            )
+                        });
                     }
-                }
+                    RunningOperationCompletionAction::WaitForWorkspaceStart {
+                        attach_when_ready,
+                    } => {
+                        self.mode = UiMode::StartingModal;
+                        self.starting_workspace_key = Some(running_tool.workspace_key.clone());
+                        self.starting_attach_when_ready = attach_when_ready;
+                        self.started_wait_since = None;
+                        self.status = if attach_when_ready {
+                            format!(
+                                "Starting workspace '{}' before attaching",
+                                running_tool.workspace_key
+                            )
+                        } else {
+                            format!(
+                                "Waiting for workspace '{}' to become ready",
+                                running_tool.workspace_key
+                            )
+                        };
+                    }
+                },
                 Err(err) => {
                     self.mode = UiMode::Normal;
                     self.status = format!(
@@ -2455,13 +2471,13 @@ impl TuiState {
                         .spawn()
                     {
                         Ok(_) => {
-                            self.status = format!(
-                                "Opened workspace '{key}' in {compare_tool_name}"
-                            );
+                            self.status =
+                                format!("Opened workspace '{key}' in {compare_tool_name}");
                         }
                         Err(err) => {
-                            self.status =
-                                format!("Failed to open workspace '{key}' in {compare_tool_name}: {err}");
+                            self.status = format!(
+                                "Failed to open workspace '{key}' in {compare_tool_name}: {err}"
+                            );
                         }
                     }
                 }
@@ -2894,7 +2910,8 @@ impl TuiState {
                 if self.selected_task_id().is_none() {
                     return;
                 }
-                self.open_selected_workspace_diff_in_terminal(terminal).await;
+                self.open_selected_workspace_diff_in_terminal(terminal)
+                    .await;
             }
             KeyCode::Char('e') => {
                 if link_selected {
@@ -3503,8 +3520,8 @@ fn codex_attach_uri(snapshot: &WorkspaceSnapshot) -> io::Result<Option<String>> 
     else {
         return Ok(None);
     };
-    let parsed =
-        Url::parse(uri).map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
+    let parsed = Url::parse(uri)
+        .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
     Ok(matches!(parsed.scheme(), "ws" | "wss").then(|| parsed.to_string()))
 }
 

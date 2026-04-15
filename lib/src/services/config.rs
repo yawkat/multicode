@@ -826,8 +826,8 @@ mod tests {
 
     #[test]
     fn config_defaults_workspace_directory_when_omitted() {
-        let config: Config =
-            toml::from_str("[isolation]\n").expect("config without workspace-directory should parse");
+        let config: Config = toml::from_str("[isolation]\n")
+            .expect("config without workspace-directory should parse");
 
         assert_eq!(config.workspace_directory, "~/dev/multicode-workspaces");
     }

@@ -12,9 +12,8 @@ mod tests {
     use super::*;
     use crate::app::{
         compact_github_tooltip_target, count_codex_session_turn_metrics,
-        last_user_message_from_codex_session_log_contents, restored_selected_row,
-        repository_diff_shell_command,
-        shell_command_in_repo,
+        last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
+        restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach,
         should_queue_task_codex_resume_until_vm_available,
@@ -90,8 +89,11 @@ mod tests {
         let git_dir = path.join(".git");
         fs::create_dir_all(&git_dir).expect("git dir should be created");
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD should be created");
-        fs::write(git_dir.join("config"), "[core]\n\trepositoryformatversion = 0\n")
-            .expect("config should be created");
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .expect("config should be created");
         fs::create_dir_all(git_dir.join("objects")).expect("objects dir should be created");
     }
 
@@ -101,8 +103,11 @@ mod tests {
             .join("worktrees")
             .join(path.file_name().expect("worktree should have name"));
         fs::create_dir_all(&git_dir).expect("worktree git dir should be created");
-        fs::write(path.join(".git"), format!("gitdir: {}\n", git_dir.display()))
-            .expect("worktree .git file should be created");
+        fs::write(
+            path.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("worktree .git file should be created");
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
             .expect("worktree HEAD should be created");
         fs::write(git_dir.join("commondir"), "../..\n")
@@ -1541,7 +1546,10 @@ mod tests {
         started.task_states.insert(
             "task-42".to_string(),
             WorkspaceTaskRuntimeSnapshot {
-                repository: vec![repo_root.display().to_string(), worktree.display().to_string()],
+                repository: vec![
+                    repo_root.display().to_string(),
+                    worktree.display().to_string(),
+                ],
                 ..Default::default()
             },
         );
@@ -1550,7 +1558,12 @@ mod tests {
             .task_persistent_snapshot("task-42")
             .expect("task should exist");
         assert_eq!(
-            compare_target_path_for_task(&started, task, started.task_states.get("task-42"), workspace.path()),
+            compare_target_path_for_task(
+                &started,
+                task,
+                started.task_states.get("task-42"),
+                workspace.path()
+            ),
             Some(worktree)
         );
     }
@@ -1571,13 +1584,21 @@ mod tests {
         fs::create_dir_all(&worktree).expect("task worktree should be created");
         fs::write(
             worktree.join(".git"),
-            format!("gitdir: {}\n", repo_root.join(".git/worktrees/micronaut-redis-726").display()),
+            format!(
+                "gitdir: {}\n",
+                repo_root
+                    .join(".git/worktrees/micronaut-redis-726")
+                    .display()
+            ),
         )
         .expect("broken worktree git file should be created");
         started.task_states.insert(
             "task-42".to_string(),
             WorkspaceTaskRuntimeSnapshot {
-                repository: vec![worktree.display().to_string(), repo_root.display().to_string()],
+                repository: vec![
+                    worktree.display().to_string(),
+                    repo_root.display().to_string(),
+                ],
                 ..Default::default()
             },
         );
@@ -1586,7 +1607,12 @@ mod tests {
             .task_persistent_snapshot("task-42")
             .expect("task should exist");
         assert_eq!(
-            compare_target_path_for_task(&started, task, started.task_states.get("task-42"), workspace.path()),
+            compare_target_path_for_task(
+                &started,
+                task,
+                started.task_states.get("task-42"),
+                workspace.path()
+            ),
             Some(repo_root)
         );
     }
