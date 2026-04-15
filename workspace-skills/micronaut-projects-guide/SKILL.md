@@ -17,7 +17,9 @@ Note that for projects using the Micronaut build systems, gradle modules have a 
 Rules for creating new tests:
 
 - Prefer junit over spock, unless there is already a spock test that can easily be altered to test this issue
+- If the test runs with native image avoid using Mockito since it creates issue with Native Image
 - Where available, prefer writing a TCK test over a test for a specific module, even if the TCK fails for another module
+- When Docker / Testcontainers is used for testing and the Docker environment is not available write a unit test that doesn't require docker as well as the docker-based test then rely on dowstream CI checks for Docker-based testing results
 
 ## Multi-project development
 
