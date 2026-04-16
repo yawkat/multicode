@@ -650,6 +650,16 @@ impl CombinedService {
                 .await;
         }
 
+        if ignore_future_scans && let Some(assigned_repository) = assigned_repository.as_deref() {
+            super::autonomous_workspace_service::clear_issue_claim_for_ignore(
+                self,
+                assigned_repository,
+                &task.issue_url,
+            )
+            .await
+            .map_err(CombinedServiceError::InvalidToolExecution)?;
+        }
+
         if let Some(assigned_repository) = assigned_repository.as_deref() {
             self.remove_workspace_task_checkout(&key, assigned_repository, &task.issue_url)
                 .await?;
@@ -4102,15 +4112,24 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .expect("fake opencode should be written");
             make_executable(&fake_opencode);
 
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"view\" ]; then\n  printf '%s\\n' '{\"number\":42,\"title\":\"Investigate redis issue\",\"url\":\"https://github.com/example/repo/issues/42\",\"createdAt\":\"2026-04-09T10:00:00Z\",\"state\":\"OPEN\",\"body\":null,\"labels\":[]}'\n  exit 0\nfi\nexit 0\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+
             let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
             let _home_guard = EnvVarGuard::set("HOME", &home);
             let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
 
             let config_path = root.path().join("config.toml");
             fs::write(
                 &config_path,
                 format!(
-                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[github]\ntoken = {{ command = \"printf test-token\" }}\n\n[isolation]\n",
                     workspace_directory.display()
                 ),
             )
@@ -4153,6 +4172,101 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 snapshot.persistent.ignored_issue_urls,
                 vec!["https://github.com/example/repo/issues/42".to_string()]
             );
+        });
+    }
+
+    #[test]
+    fn remove_and_ignore_workspace_task_clears_issue_assignment_and_in_progress_label() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let gh_log = root.path().join("gh.log");
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf -- '---\\n' >> '{}'\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"view\" ]; then\n  printf '%s\\n' '{{\"number\":42,\"title\":\"Investigate redis issue\",\"url\":\"https://github.com/example/repo/issues/42\",\"createdAt\":\"2026-04-09T10:00:00Z\",\"state\":\"OPEN\",\"body\":null,\"labels\":[{{\"name\":\"status: in-progress\"}}],\"assignees\":[{{\"login\":\"graemerocher\"}}]}}'\n  exit 0\nfi\nexit 0\n",
+                    gh_log.display(),
+                    gh_log.display()
+                ),
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[github]\ntoken = {{ command = \"printf test-token\" }}\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+            service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("issue assignment should succeed");
+
+            let workspace = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist");
+            let task_id = workspace
+                .subscribe()
+                .borrow()
+                .persistent
+                .tasks
+                .first()
+                .expect("task should exist")
+                .id
+                .clone();
+
+            service
+                .remove_workspace_task("alpha", &task_id, true)
+                .await
+                .expect("task removal with ignore should succeed");
+
+            let gh_calls = fs::read_to_string(&gh_log).expect("gh log should exist");
+            assert!(gh_calls.contains("issue\nview\nhttps://github.com/example/repo/issues/42"));
+            assert!(gh_calls.contains(
+                "issue\nedit\nhttps://github.com/example/repo/issues/42\n--repo\nexample/repo\n--remove-label\nstatus: in-progress"
+            ));
+            assert!(gh_calls.contains(
+                "issue\nedit\nhttps://github.com/example/repo/issues/42\n--repo\nexample/repo\n--remove-assignee\n@me"
+            ));
         });
     }
 

@@ -4092,6 +4092,25 @@ async fn assign_issue_to_me(
     }
 }
 
+pub(crate) async fn clear_issue_claim_for_ignore(
+    service: &CombinedService,
+    assigned_repository: &str,
+    issue_url: &str,
+) -> Result<(), String> {
+    let token = resolved_gh_token(service).await?;
+    let Some(issue) = fetch_issue(assigned_repository, issue_url, &token).await? else {
+        return Ok(());
+    };
+
+    for label in IN_PROGRESS_LABEL_ALIASES {
+        if issue.has_label(label) {
+            remove_issue_label(assigned_repository, &issue.url, label, &token).await?;
+        }
+    }
+
+    remove_issue_assignee(assigned_repository, &issue.url, "@me", &token).await
+}
+
 async fn add_issue_label(
     assigned_repository: &str,
     issue: &SelectedIssue,
@@ -4120,6 +4139,70 @@ async fn add_issue_label(
         Err(format!(
             "gh issue edit failed for {}: {}",
             issue.url,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+async fn remove_issue_label(
+    assigned_repository: &str,
+    issue_url: &str,
+    label: &str,
+    token: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "edit",
+            issue_url,
+            "--repo",
+            assigned_repository,
+            "--remove-label",
+            label,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh issue edit for {issue_url}: {err}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gh issue edit failed for {issue_url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+async fn remove_issue_assignee(
+    assigned_repository: &str,
+    issue_url: &str,
+    assignee: &str,
+    token: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "edit",
+            issue_url,
+            "--repo",
+            assigned_repository,
+            "--remove-assignee",
+            assignee,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh issue edit for {issue_url}: {err}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gh issue edit failed for {issue_url}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
