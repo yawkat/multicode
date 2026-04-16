@@ -2513,6 +2513,73 @@ mod tests {
     }
 
     #[test]
+    fn help_line_shows_open_github_for_selected_issue_on_task_row() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            2,
+            Some(0),
+            false,
+            false,
+            Some(WorkspaceLinkKind::Issue),
+            false,
+            false,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Enter open link"));
+        assert!(text.contains("o open GitHub"));
+        assert!(text.contains("Esc row focus"));
+        assert!(!text.contains("x remove issue"));
+    }
+
+    #[test]
+    fn help_line_hides_open_github_for_selected_review_on_task_row() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            2,
+            Some(0),
+            false,
+            false,
+            Some(WorkspaceLinkKind::Review),
+            false,
+            false,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Enter open link"));
+        assert!(!text.contains("o open GitHub"));
+        assert!(text.contains("Esc row focus"));
+    }
+
+    #[test]
     fn help_line_shows_compare_hotkey_only_when_enabled() {
         let started = snapshot(true, Some("http://example"));
         let enabled_line = help_line(

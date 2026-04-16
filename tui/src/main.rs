@@ -1420,6 +1420,23 @@ fn help_line(
                 }
                 Some(snapshot) => {
                     if selected_task_row {
+                        if selected_link_index.is_some() {
+                            push_hotkey(&mut spans, "↑/↓", " select target  ");
+                            push_hotkey(&mut spans, "Enter", " open link  ");
+                            if matches!(
+                                selected_link_kind,
+                                Some(WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr)
+                            ) {
+                                push_hotkey(&mut spans, "o", " open GitHub  ");
+                            }
+                            push_hotkey(&mut spans, "Esc", " row focus  ");
+                            push_hotkey(&mut spans, "q", " quit");
+                            if !status.is_empty() {
+                                spans.push(Span::raw(" | "));
+                                spans.push(Span::raw(status.to_string()));
+                            }
+                            return Line::from(spans);
+                        }
                         if workspace_is_usable(snapshot)
                             && workspace_state(snapshot) == WorkspaceUiState::Started
                         {
