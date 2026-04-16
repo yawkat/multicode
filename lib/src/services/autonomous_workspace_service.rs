@@ -48,6 +48,7 @@ const RENOVATE_LOGINS: [&str; 2] = ["renovate[bot]", "app/renovate"];
 const DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX: &str = "Dependency upgrade follow-up for PR #";
 const DEPENDENCY_UPGRADE_PR_MARKER_PREFIX: &str = "<!-- multicode:dependency-upgrade-pr=";
 const IN_PROGRESS_LABEL: &str = "status: in progress";
+const IN_PROGRESS_LABEL_ALIASES: [&str; 2] = [IN_PROGRESS_LABEL, "status: in-progress"];
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -3403,8 +3404,9 @@ fn build_issue_prompt(
         format!(
             "7. This task is backed by Renovate pull request {backing_pr_url}. Confirm it is still a non-major dependency upgrade.\n\
 8. If CI for {backing_pr_url} is already passing, rebase the branch if needed, merge it without waiting for human review, and close GitHub issue {issue_url}.\n\
-9. If CI is not passing, investigate the failure and only stop for human input if you cannot safely get the dependency upgrade merged.\n\
-10. If you merge the PR, summarize the merge result and make sure the issue is closed before stopping.",
+9. Do not leave placeholder comments, placeholder reviews, or dummy approvals on {backing_pr_url}; only comment or review when it is strictly required to complete the merge.\n\
+10. If CI is not passing, investigate the failure and only stop for human input if you cannot safely get the dependency upgrade merged.\n\
+11. If you merge the PR, summarize the merge result and make sure the issue is closed before stopping.",
             issue_url = issue.url
         )
     } else {
@@ -3452,7 +3454,7 @@ async fn find_next_issue(
     for label in ISSUE_PRIORITY_LABELS {
         let issues = list_issues_for_label(assigned_repository, label, token).await?;
         for issue in issues {
-            if issue.has_label(IN_PROGRESS_LABEL)
+            if issue.is_in_progress()
                 || excluded_issue_urls.contains(&issue.url)
                 || !seen.insert(issue.url.clone())
             {
@@ -3637,7 +3639,7 @@ async fn find_next_dependency_upgrade_issue(
         else {
             continue;
         };
-        if issue.has_label(IN_PROGRESS_LABEL) || excluded_issue_urls.contains(&issue.url) {
+        if issue.is_in_progress() || excluded_issue_urls.contains(&issue.url) {
             continue;
         }
         issue.dependency_upgrade_pr_url = Some(pr.url.clone());
@@ -4036,7 +4038,7 @@ fn dependency_upgrade_issue_title(pr: &SelectedPullRequest) -> String {
 fn dependency_upgrade_issue_body(pr: &SelectedPullRequest) -> String {
     format!(
         "Track dependency-upgrade automation for Renovate pull request {pr_url}.\n\n\
-This issue was created automatically by multicode so the autonomous queue can process the PR.\n\
+This issue was created automatically by multicode to prrocess the PR.\n\
 If the update is still a non-major version bump and CI is passing, rebase and merge the PR without waiting for human review, then close this issue.\n\n\
 {marker}{pr_url} -->",
         pr_url = pr.url,
@@ -4279,6 +4281,12 @@ impl SelectedIssue {
         self.labels
             .iter()
             .any(|candidate| candidate.name.eq_ignore_ascii_case(label))
+    }
+
+    fn is_in_progress(&self) -> bool {
+        IN_PROGRESS_LABEL_ALIASES
+            .iter()
+            .any(|label| self.has_label(label))
     }
 
     fn has_priority_boost_label(&self) -> bool {
@@ -4882,12 +4890,32 @@ mod tests {
 
         let selected = issues
             .into_iter()
-            .filter(|issue| !issue.has_label(IN_PROGRESS_LABEL))
+            .filter(|issue| !issue.is_in_progress())
             .filter(|issue| !excluded.contains(&issue.url))
             .next()
             .expect("one issue should remain");
 
         assert_eq!(selected.number, 9);
+    }
+
+    #[test]
+    fn selected_issue_treats_hyphenated_in_progress_label_as_in_progress() {
+        let issue = test_issue(
+            10,
+            "busy elsewhere",
+            "https://github.com/example/repo/issue/10",
+            "2026-04-09T12:00:00Z",
+            vec![
+                SelectedIssueLabel {
+                    name: "type: bug".to_string(),
+                },
+                SelectedIssueLabel {
+                    name: "status: in-progress".to_string(),
+                },
+            ],
+        );
+
+        assert!(issue.is_in_progress());
     }
 
     #[test]
@@ -7062,7 +7090,31 @@ mod tests {
         );
         assert!(prompt.contains("merge it without waiting for human review"));
         assert!(prompt.contains("close GitHub issue https://github.com/example/repo/issues/981"));
+        assert!(prompt.contains(
+            "Do not leave placeholder comments, placeholder reviews, or dummy approvals"
+        ));
         assert!(!prompt.contains("explicitly approves publishing"));
+    }
+
+    #[test]
+    fn dependency_upgrade_issue_body_uses_updated_queue_text() {
+        let body = dependency_upgrade_issue_body(&test_pull_request(
+            91,
+            "Update dependency io.micronaut:micronaut-core from 4.4.1 to 4.4.2",
+            "https://github.com/example/repo/pull/91",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            None,
+        ));
+
+        assert!(
+            body.contains("This issue was created automatically by multicode to prrocess the PR.")
+        );
+        assert!(body.contains(
+            "If the update is still a non-major version bump and CI is passing, rebase and merge the PR without waiting for human review, then close this issue."
+        ));
+        assert!(!body.contains("so the autonomous queue can process the PR"));
     }
 
     #[test]
