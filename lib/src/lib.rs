@@ -291,25 +291,22 @@ impl WorkspaceSnapshot {
     }
 
     pub fn resolved_active_task_id(&self) -> Option<String> {
-        if self
-            .active_task_id
+        self.active_task_id
             .as_deref()
-            .is_some_and(|task_id| task_holds_vm_lease(self, task_id))
-        {
-            return self.active_task_id.clone();
-        }
-
-        self.persistent
-            .automation_issue
-            .as_deref()
-            .and_then(|issue_url| {
+            .filter(|task_id| self.task_persistent_snapshot(task_id).is_some())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
                 self.persistent
-                    .tasks
-                    .iter()
-                    .find(|task| task.issue_url == issue_url)
-                    .map(|task| task.id.clone())
+                    .automation_issue
+                    .as_deref()
+                    .and_then(|issue_url| {
+                        self.persistent
+                            .tasks
+                            .iter()
+                            .find(|task| task.issue_url == issue_url)
+                            .map(|task| task.id.clone())
+                    })
             })
-            .filter(|task_id| task_holds_vm_lease(self, task_id))
     }
 
     pub fn resolved_active_issue_url(&self) -> Option<String> {
@@ -321,27 +318,70 @@ impl WorkspaceSnapshot {
     }
 }
 
-fn task_holds_vm_lease(snapshot: &WorkspaceSnapshot, task_id: &str) -> bool {
-    let Some(_task) = snapshot.task_persistent_snapshot(task_id) else {
-        return false;
-    };
-    let Some(task_state) = snapshot.task_states.get(task_id) else {
-        return true;
-    };
-    let Some(session_id) = task_state.session_id.as_deref() else {
-        return true;
-    };
-    let _ = session_id;
-    !matches!(
-        task_state.session_status,
-        Some(RootSessionStatus::Question | RootSessionStatus::Idle)
-    ) && !matches!(
-        task_state.agent_state,
-        Some(
-            AutomationAgentState::Question
-                | AutomationAgentState::Review
-                | AutomationAgentState::Idle
-                | AutomationAgentState::Stale
-        )
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_active_task_id_preserves_explicit_review_task_selection() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-7".to_string(),
+                "https://github.com/example/repo/issues/7".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-7".to_string());
+        snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/7".to_string());
+        snapshot.task_states.insert(
+            "task-7".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-7".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            snapshot.resolved_active_task_id().as_deref(),
+            Some("task-7")
+        );
+        assert_eq!(
+            snapshot.resolved_active_issue_url().as_deref(),
+            Some("https://github.com/example/repo/issues/7")
+        );
+    }
+
+    #[test]
+    fn resolved_active_task_id_falls_back_to_claimed_issue_when_active_task_id_missing() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-13".to_string(),
+                "https://github.com/example/repo/issues/13".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/13".to_string());
+        snapshot.task_states.insert(
+            "task-13".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-13".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            snapshot.resolved_active_task_id().as_deref(),
+            Some("task-13")
+        );
+    }
 }

@@ -237,17 +237,18 @@ fn clear_automation_state(workspace: &Workspace) {
 
 fn clear_automation_state_snapshot(snapshot: &mut WorkspaceSnapshot) -> bool {
     let mut changed = false;
-    if let Some(active_task_id) = active_task_id_for_snapshot(snapshot)
-        && let Some(task_state) = snapshot.task_states.get_mut(&active_task_id)
-    {
-        if task_state.session_id.take().is_some() {
-            changed = true;
-        }
-        if task_state.agent_state.take().is_some() {
-            changed = true;
-        }
-        if task_state.session_status.take().is_some() {
-            changed = true;
+    let active_task_id = active_task_id_for_snapshot(snapshot);
+    for (task_id, task_state) in &mut snapshot.task_states {
+        if active_task_id.as_deref() == Some(task_id.as_str()) {
+            if task_state.session_id.take().is_some() {
+                changed = true;
+            }
+            if task_state.agent_state.take().is_some() {
+                changed = true;
+            }
+            if task_state.session_status.take().is_some() {
+                changed = true;
+            }
         }
         if task_state.waiting_on_vm {
             task_state.waiting_on_vm = false;
@@ -912,6 +913,82 @@ mod tests {
         assert_eq!(task_42.agent_state, Some(AutomationAgentState::Review));
         assert_eq!(task_42.session_status, Some(RootSessionStatus::Idle));
         assert!(!task_42.waiting_on_vm);
+    }
+
+    #[test]
+    fn clear_automation_state_snapshot_clears_waiting_flags_for_all_tasks() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-30".to_string(),
+                "https://github.com/example/repo/issues/30".to_string(),
+                WorkspaceTaskSource::Manual,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-42".to_string(),
+                "https://github.com/example/repo/issues/42".to_string(),
+                WorkspaceTaskSource::Manual,
+            ));
+        snapshot.active_task_id = Some("task-30".to_string());
+        snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/30".to_string());
+        snapshot.task_states.insert(
+            "task-30".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-30".to_string()),
+                agent_state: Some(AutomationAgentState::Working),
+                session_status: Some(RootSessionStatus::Busy),
+                waiting_on_vm: true,
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-42".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-42".to_string()),
+                agent_state: Some(AutomationAgentState::Working),
+                session_status: Some(RootSessionStatus::Busy),
+                waiting_on_vm: true,
+                ..Default::default()
+            },
+        );
+        snapshot.automation_session_id = Some("thread-30".to_string());
+        snapshot.automation_agent_state = Some(AutomationAgentState::Working);
+        snapshot.automation_session_status = Some(RootSessionStatus::Busy);
+
+        assert!(clear_automation_state_snapshot(&mut snapshot));
+
+        let active_task = snapshot
+            .task_states
+            .get("task-30")
+            .expect("active task should remain");
+        assert!(active_task.session_id.is_none());
+        assert!(active_task.agent_state.is_none());
+        assert!(active_task.session_status.is_none());
+        assert!(!active_task.waiting_on_vm);
+
+        let background_task = snapshot
+            .task_states
+            .get("task-42")
+            .expect("background task should remain");
+        assert_eq!(background_task.session_id.as_deref(), Some("thread-42"));
+        assert_eq!(
+            background_task.agent_state,
+            Some(AutomationAgentState::Working)
+        );
+        assert_eq!(
+            background_task.session_status,
+            Some(RootSessionStatus::Busy)
+        );
+        assert!(!background_task.waiting_on_vm);
+        assert!(snapshot.automation_session_id.is_none());
+        assert!(snapshot.automation_agent_state.is_none());
+        assert!(snapshot.automation_session_status.is_none());
     }
 
     #[test]
