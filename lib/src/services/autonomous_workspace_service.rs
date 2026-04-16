@@ -4045,12 +4045,16 @@ If the update is still a non-major version bump and CI is passing, rebase and me
 }
 
 fn dependency_upgrade_issue_search_queries(pr: &SelectedPullRequest) -> [String; 2] {
+    let pr_search_fragment = pr
+        .url
+        .strip_prefix("https://github.com/")
+        .unwrap_or(pr.url.as_str());
     [
         format!(
             "\"{DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX}{}\" in:title",
             pr.number
         ),
-        format!("\"{}\" in:body", pr.url),
+        format!("\"{pr_search_fragment}\" in:body"),
     ]
 }
 
@@ -7175,6 +7179,27 @@ mod tests {
         assert_eq!(
             extract_dependency_upgrade_pr_marker(&body),
             Some("https://github.com/example/repo/pull/91")
+        );
+    }
+
+    #[test]
+    fn dependency_upgrade_issue_search_queries_use_searchable_pr_url_fragment() {
+        let queries = dependency_upgrade_issue_search_queries(&test_pull_request(
+            728,
+            "fix(deps): update dependency io.lettuce:lettuce-core to v7.5.1.release",
+            "https://github.com/micronaut-projects/micronaut-redis/pull/728",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+            None,
+        ));
+
+        assert_eq!(
+            queries,
+            [
+                "\"Dependency upgrade follow-up for PR #728\" in:title".to_string(),
+                "\"micronaut-projects/micronaut-redis/pull/728\" in:body".to_string(),
+            ]
         );
     }
 
