@@ -360,6 +360,17 @@ pub(crate) fn attach_cli_args(agent_command: &str, target: &AttachTarget) -> Vec
             }
             args
         }
+        AttachTarget::CodexNew { uri, cwd, prompt } => {
+            let mut args = vec![agent_command.to_string(), "--remote".to_string(), uri.clone()];
+            if let Some(cwd) = cwd.as_deref() {
+                args.push("-C".to_string());
+                args.push(cwd.to_string());
+            }
+            if let Some(prompt) = prompt.as_deref() {
+                args.push(prompt.to_string());
+            }
+            args
+        }
     }
 }
 

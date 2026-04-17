@@ -16,10 +16,13 @@ mod tests {
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach,
+        should_start_fresh_codex_task_session_after_failed_attach,
+        should_retry_codex_task_attach_with_last_thread,
         should_queue_task_codex_resume_until_vm_available,
         should_restart_codex_task_for_pr_request,
         should_resume_codex_task_after_incomplete_attached_turn, snapshot_attach_cwd_for_selection,
         snapshot_attach_target_for_selection, starting_modal_failure_status,
+        working_codex_task_attach_target,
     };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
@@ -39,7 +42,7 @@ mod tests {
     };
     use multicode_lib::{
         PersistentWorkspaceSnapshot, RuntimeBackend, RuntimeHandleSnapshot,
-        TransientWorkspaceSnapshot,
+        TransientWorkspaceSnapshot, services::AgentProvider,
     };
     use std::{
         fs,
@@ -992,6 +995,186 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_attach_target_for_selection_uses_last_codex_thread_when_task_is_not_loaded() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-missing".to_string()),
+                agent_state: Some(AutomationAgentState::Review),
+                status: Some("NotLoaded".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
+            .expect("not-loaded codex task should attach via last thread");
+
+        assert_eq!(
+            target,
+            AttachTarget::Codex {
+                uri: "ws://127.0.0.1:3456/".to_string(),
+                thread_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn should_retry_codex_task_attach_with_last_thread_for_not_loaded_task() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-stale".to_string()),
+                agent_state: Some(AutomationAgentState::Review),
+                status: Some("NotLoaded".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let target = should_retry_codex_task_attach_with_last_thread(
+            AgentProvider::Codex,
+            Some(&started),
+            "ws",
+            Some("ws"),
+            Some("task-42"),
+            Some("thread-stale"),
+        );
+
+        assert_eq!(
+            target,
+            Some(AttachTarget::Codex {
+                uri: "ws://127.0.0.1:3456/".to_string(),
+                thread_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn should_not_retry_codex_task_attach_without_explicit_thread() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                status: Some("NotLoaded".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let target = should_retry_codex_task_attach_with_last_thread(
+            AgentProvider::Codex,
+            Some(&started),
+            "ws",
+            Some("ws"),
+            Some("task-42"),
+            None,
+        );
+
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn should_start_fresh_codex_task_session_after_failed_attach_for_aborted_only_thread() {
+        assert!(should_start_fresh_codex_task_session_after_failed_attach(
+            AgentProvider::Codex,
+            Some("ws"),
+            "ws",
+            Some("task-42"),
+            Some("thread-42"),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 0,
+                aborted: 4,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 0,
+                aborted: 4,
+            }),
+            Some(&CodexThreadStatus::NotLoaded),
+        ));
+    }
+
+    #[test]
+    fn should_not_start_fresh_codex_task_session_when_attach_changed_thread_metrics() {
+        assert!(!should_start_fresh_codex_task_session_after_failed_attach(
+            AgentProvider::Codex,
+            Some("ws"),
+            "ws",
+            Some("task-42"),
+            Some("thread-42"),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 0,
+                aborted: 1,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 5,
+                completed: 0,
+                aborted: 1,
+            }),
+            Some(&CodexThreadStatus::NotLoaded),
+        ));
+    }
+
+    #[test]
+    fn should_not_start_fresh_codex_task_session_when_thread_is_still_idle() {
+        assert!(!should_start_fresh_codex_task_session_after_failed_attach(
+            AgentProvider::Codex,
+            Some("ws"),
+            "ws",
+            Some("task-42"),
+            Some("thread-42"),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 0,
+                aborted: 4,
+            }),
+            Some(CodexSessionTurnMetrics {
+                started: 4,
+                completed: 0,
+                aborted: 4,
+            }),
+            Some(&CodexThreadStatus::Idle),
+        ));
+    }
+
+    #[test]
+    fn working_codex_task_attach_target_uses_fresh_observer_session() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-42".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+
+        let target = working_codex_task_attach_target(
+            &started,
+            Some("task-42"),
+            Some("/tmp/task-42".to_string()),
+        )
+        .expect("working codex task attach target should be computed");
+
+        assert_eq!(
+            target,
+            Some(AttachTarget::CodexNew {
+                uri: "ws://127.0.0.1:3456/".to_string(),
+                cwd: Some("/tmp/task-42".to_string()),
+                prompt: Some("Another Codex task session is already actively working on task-42. You are attached only for observation and user-directed inspection. Do not make repository changes, do not start duplicate work, and do not send autonomous follow-up prompts to the active task. Briefly confirm you are attached and then wait for the user.".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn snapshot_attach_target_for_selection_prefers_task_attach_when_task_session_exists() {
         let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
         started.root_session_id = Some("ses-root-1".to_string());
@@ -1052,6 +1235,27 @@ mod tests {
                 "--remote".to_string(),
                 "ws://127.0.0.1:3456".to_string(),
                 "--last".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_cli_args_start_fresh_remote_codex_session_in_task_checkout() {
+        let target = AttachTarget::CodexNew {
+            uri: "ws://127.0.0.1:3456".to_string(),
+            cwd: Some("/tmp/task".to_string()),
+            prompt: Some("Continue work on this task.".to_string()),
+        };
+
+        assert_eq!(
+            attach_cli_args("codex", &target),
+            vec![
+                "codex".to_string(),
+                "--remote".to_string(),
+                "ws://127.0.0.1:3456".to_string(),
+                "-C".to_string(),
+                "/tmp/task".to_string(),
+                "Continue work on this task.".to_string(),
             ]
         );
     }

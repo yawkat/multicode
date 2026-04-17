@@ -358,6 +358,101 @@ pub(crate) fn should_auto_resume_task_codex_after_attach(
     }
 }
 
+fn codex_observer_attach_prompt(task_id: &str) -> String {
+    format!(
+        "Another Codex task session is already actively working on {task_id}. You are attached only for observation and user-directed inspection. Do not make repository changes, do not start duplicate work, and do not send autonomous follow-up prompts to the active task. Briefly confirm you are attached and then wait for the user."
+    )
+}
+
+pub(crate) fn working_codex_task_attach_target(
+    snapshot: &WorkspaceSnapshot,
+    task_id: Option<&str>,
+    cwd: Option<String>,
+) -> io::Result<Option<AttachTarget>> {
+    let Some(task_id) = task_id else {
+        return Ok(None);
+    };
+    let Some(task_state) = task_runtime_snapshot(snapshot, task_id) else {
+        return Ok(None);
+    };
+    if task_effective_agent_state(Some(task_state)) != Some(AutomationAgentState::Working) {
+        return Ok(None);
+    }
+
+    let Some(uri) = codex_attach_uri(snapshot)? else {
+        return Ok(None);
+    };
+    Ok(Some(AttachTarget::CodexNew {
+        uri,
+        cwd,
+        prompt: Some(codex_observer_attach_prompt(task_id)),
+    }))
+}
+
+pub(crate) fn should_retry_codex_task_attach_with_last_thread(
+    provider: multicode_lib::services::AgentProvider,
+    snapshot: Option<&WorkspaceSnapshot>,
+    workspace_key: &str,
+    attached_workspace_key: Option<&str>,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<AttachTarget> {
+    if provider != multicode_lib::services::AgentProvider::Codex
+        || attached_workspace_key != Some(workspace_key)
+        || session_id.is_none()
+    {
+        return None;
+    }
+
+    let snapshot = snapshot?;
+    let task_state = task_runtime_snapshot(snapshot, task_id?)?;
+    if !matches!(task_state.status.as_deref(), Some("NotLoaded")) {
+        return None;
+    }
+
+    let Ok(Some(uri)) = codex_attach_uri(snapshot) else {
+        return None;
+    };
+    Some(AttachTarget::Codex {
+        uri,
+        thread_id: None,
+    })
+}
+
+pub(crate) fn should_start_fresh_codex_task_session_after_failed_attach(
+    provider: multicode_lib::services::AgentProvider,
+    attached_workspace_key: Option<&str>,
+    workspace_key: &str,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+    initial_turn_metrics: Option<CodexSessionTurnMetrics>,
+    current_turn_metrics: Option<CodexSessionTurnMetrics>,
+    current_thread_status: Option<&CodexThreadStatus>,
+) -> bool {
+    let Some(_task_id) = task_id else {
+        return false;
+    };
+    let Some(_session_id) = session_id else {
+        return false;
+    };
+    let Some(initial_turn_metrics) = initial_turn_metrics else {
+        return false;
+    };
+    let Some(current_turn_metrics) = current_turn_metrics else {
+        return false;
+    };
+
+    provider == multicode_lib::services::AgentProvider::Codex
+        && attached_workspace_key == Some(workspace_key)
+        && initial_turn_metrics.completed == 0
+        && initial_turn_metrics.aborted > 0
+        && current_turn_metrics == initial_turn_metrics
+        && matches!(
+            current_thread_status,
+            Some(CodexThreadStatus::NotLoaded | CodexThreadStatus::SystemError)
+        )
+}
+
 fn task_can_yield_vm_for_attach(task_state: &WorkspaceTaskRuntimeSnapshot) -> bool {
     matches!(
         task_effective_agent_state(Some(task_state)),
@@ -1396,11 +1491,22 @@ impl TuiState {
             .snapshots
             .get(key)
             .ok_or_else(|| io::Error::other(format!("workspace snapshot missing for '{key}'")))?;
+        if self.service.agent_provider() == multicode_lib::services::AgentProvider::Codex {
+            let cwd = self
+                .attach_cwd_for_workspace(key)
+                .map(|path| path.to_string_lossy().into_owned());
+            if let Some(target) =
+                working_codex_task_attach_target(snapshot, self.selected_task_id(), cwd)?
+            {
+                return Ok(target);
+            }
+        }
         snapshot_attach_target_for_selection(snapshot, self.selected_task_id())
     }
 
     fn record_attached_session(&mut self, key: &str, target: &AttachTarget) {
         let task_id = self.selected_task_id().map(str::to_string);
+        let fresh_codex_session = matches!(target, AttachTarget::CodexNew { .. });
         let initial_agent_state = self.snapshots.get(key).and_then(|snapshot| {
             task_id
                 .as_deref()
@@ -1417,16 +1523,21 @@ impl TuiState {
         let session_id = match target {
             AttachTarget::Opencode { session_id, .. } => session_id.clone(),
             AttachTarget::Codex { thread_id, .. } => thread_id.clone(),
+            AttachTarget::CodexNew { .. } => None,
         };
         let initial_turn_metrics =
             if self.service.agent_provider() == multicode_lib::services::AgentProvider::Codex {
-                session_id.as_deref().and_then(|session_id| {
-                    read_codex_session_turn_metrics(
-                        self.service.workspace_directory_path(),
-                        key,
-                        session_id,
-                    )
-                })
+                if fresh_codex_session && task_id.is_some() {
+                    Some(CodexSessionTurnMetrics::default())
+                } else {
+                    session_id.as_deref().and_then(|session_id| {
+                        read_codex_session_turn_metrics(
+                            self.service.workspace_directory_path(),
+                            key,
+                            session_id,
+                        )
+                    })
+                }
             } else {
                 None
             };
@@ -1444,6 +1555,7 @@ impl TuiState {
             session_id,
             initial_agent_state,
             initial_turn_metrics,
+            fresh_codex_session,
         });
     }
 
@@ -1675,7 +1787,15 @@ impl TuiState {
                 .await
                 {
                     Ok(_) => {
-                        self.handle_attach_exit(&key).await;
+                        if !self
+                            .retry_codex_task_attach_with_fresh_session(terminal, &key)
+                            .await
+                            && !self
+                            .retry_codex_task_attach_with_last_thread(terminal, &key)
+                            .await
+                        {
+                            self.handle_attach_exit(&key).await;
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1683,7 +1803,14 @@ impl TuiState {
                             error = %err,
                             "attach session exited with error"
                         );
-                        if !self.handle_attach_exit_after_error(&key, &err).await {
+                        if !self
+                            .retry_codex_task_attach_with_fresh_session(terminal, &key)
+                            .await
+                            && !self
+                            .retry_codex_task_attach_with_last_thread(terminal, &key)
+                            .await
+                            && !self.handle_attach_exit_after_error(&key, &err).await
+                        {
                             self.status = format!("Failed to attach to workspace '{key}': {err}");
                         }
                     }
@@ -1719,6 +1846,196 @@ impl TuiState {
             return true;
         }
         false
+    }
+
+    async fn retry_codex_task_attach_with_last_thread(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        key: &str,
+    ) -> bool {
+        let attached_session = self.attached_session.clone();
+        let Some(target) = should_retry_codex_task_attach_with_last_thread(
+            self.service.agent_provider(),
+            self.snapshots.get(key),
+            key,
+            attached_session
+                .as_ref()
+                .map(|attached| attached.workspace_key.as_str()),
+            attached_session
+                .as_ref()
+                .and_then(|attached| attached.task_id.as_deref()),
+            attached_session
+                .as_ref()
+                .and_then(|attached| attached.session_id.as_deref()),
+        ) else {
+            return false;
+        };
+
+        let previous_session_id = attached_session
+            .as_ref()
+            .and_then(|attached| attached.session_id.as_deref())
+            .unwrap_or("<none>");
+        let custom_description = self
+            .snapshots
+            .get(key)
+            .map(|snapshot| snapshot.persistent.description.clone())
+            .unwrap_or_default();
+        tracing::info!(
+            workspace_key = %key,
+            previous_session_id,
+            "retrying codex task attach with last thread after explicit thread exited"
+        );
+        self.record_attached_session(key, &target);
+        match attach_in_tmux(
+            terminal,
+            self.service.agent_command(),
+            &target,
+            self.attach_cwd_for_workspace(key).as_deref(),
+            &self.attach_env_for_workspace(key),
+            key,
+            &custom_description,
+        )
+        .await
+        {
+            Ok(_) => {
+                self.handle_attach_exit(key).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_key = %key,
+                    error = %err,
+                    "codex retry attach session exited with error"
+                );
+                if !self.handle_attach_exit_after_error(key, &err).await {
+                    self.status = format!("Failed to attach to workspace '{key}': {err}");
+                }
+            }
+        }
+        true
+    }
+
+    async fn retry_codex_task_attach_with_fresh_session(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        key: &str,
+    ) -> bool {
+        let attached_session = self.attached_session.clone();
+        let session_id = attached_session
+            .as_ref()
+            .and_then(|attached| attached.session_id.as_deref());
+        let current_turn_metrics = session_id.and_then(|session_id| {
+            read_codex_session_turn_metrics(
+                self.service.workspace_directory_path(),
+                key,
+                session_id,
+            )
+        });
+        let current_thread_status = match (
+            self.snapshots.get(key).and_then(|snapshot| snapshot.transient.as_ref()),
+            session_id,
+        ) {
+            (Some(transient), Some(session_id)) => CodexAppServerClient::new(transient.uri.clone())
+                .thread_read(session_id)
+                .await
+                .ok()
+                .and_then(|response| response.thread.status),
+            _ => None,
+        };
+        let should_start_fresh = should_start_fresh_codex_task_session_after_failed_attach(
+            self.service.agent_provider(),
+            attached_session
+                .as_ref()
+                .map(|attached| attached.workspace_key.as_str()),
+            key,
+            attached_session
+                .as_ref()
+                .and_then(|attached| attached.task_id.as_deref()),
+            session_id,
+            attached_session
+                .as_ref()
+                .and_then(|attached| attached.initial_turn_metrics),
+            current_turn_metrics,
+            current_thread_status.as_ref(),
+        );
+        tracing::info!(
+            workspace_key = %key,
+            session_id = session_id.unwrap_or("<none>"),
+            initial_turn_metrics = ?attached_session
+                .as_ref()
+                .and_then(|attached| attached.initial_turn_metrics),
+            current_turn_metrics = ?current_turn_metrics,
+            current_thread_status = ?current_thread_status,
+            should_start_fresh,
+            "evaluated fresh codex task session fallback after failed attach"
+        );
+        if !should_start_fresh {
+            return false;
+        }
+
+        let Some(snapshot) = self.snapshots.get(key) else {
+            return false;
+        };
+        let Ok(Some(uri)) = codex_attach_uri(snapshot) else {
+            return false;
+        };
+        let cwd = self
+            .attach_cwd_for_workspace(key)
+            .map(|path| path.to_string_lossy().into_owned());
+        let prompt = if let Some(session_id) = attached_session
+            .as_ref()
+            .and_then(|attached| attached.session_id.as_deref())
+        {
+            read_interrupted_codex_resume_prompt(
+                self.service.workspace_directory_path().to_path_buf(),
+                key.to_string(),
+                session_id.to_string(),
+            )
+            .await
+            .or_else(|| Some("Continue work on this task.".to_string()))
+        } else {
+            Some("Continue work on this task.".to_string())
+        };
+        let target = AttachTarget::CodexNew { uri, cwd, prompt };
+        let custom_description = self
+            .snapshots
+            .get(key)
+            .map(|snapshot| snapshot.persistent.description.clone())
+            .unwrap_or_default();
+        tracing::info!(
+            workspace_key = %key,
+            previous_session_id = attached_session
+                .as_ref()
+                .and_then(|attached| attached.session_id.as_deref())
+                .unwrap_or("<none>"),
+            "starting fresh codex task session after failed resume attach"
+        );
+        self.record_attached_session(key, &target);
+        match attach_in_tmux(
+            terminal,
+            self.service.agent_command(),
+            &target,
+            self.attach_cwd_for_workspace(key).as_deref(),
+            &self.attach_env_for_workspace(key),
+            key,
+            &custom_description,
+        )
+        .await
+        {
+            Ok(_) => {
+                self.handle_attach_exit(key).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_key = %key,
+                    error = %err,
+                    "fresh codex attach session exited with error"
+                );
+                if !self.handle_attach_exit_after_error(key, &err).await {
+                    self.status = format!("Failed to attach to workspace '{key}': {err}");
+                }
+            }
+        }
+        true
     }
 
     fn mark_task_resuming_in_background(&mut self, workspace_key: &str, task_id: &str) {
@@ -1976,11 +2293,35 @@ impl TuiState {
                 return false;
             };
 
+            let effective_task_session_id = match attached_session.as_ref() {
+                Some(AttachedSession {
+                    workspace_key,
+                    task_id: Some(task_id),
+                    session_id,
+                    fresh_codex_session,
+                    ..
+                }) if workspace_key == key => session_id.clone().or_else(|| {
+                    if *fresh_codex_session {
+                        task_runtime_snapshot(&snapshot, task_id).and_then(|task_state| {
+                            task_state.session_id.clone()
+                        })
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+            let resume_attached_session = attached_session.clone().map(|mut attached| {
+                if attached.fresh_codex_session && attached.session_id.is_none() {
+                    attached.session_id = effective_task_session_id.clone();
+                }
+                attached
+            });
+
             let interrupted_resume_prompt = match attached_session.as_ref() {
                 Some(AttachedSession {
                     workspace_key,
                     task_id: Some(_),
-                    session_id: Some(session_id),
                     initial_turn_metrics,
                     ..
                 }) if workspace_key == key => {
@@ -1988,17 +2329,21 @@ impl TuiState {
                         .should_resume_interrupted_task_codex_after_attach(
                             &snapshot,
                             workspace_key,
-                            Some(session_id.as_str()),
+                            effective_task_session_id.as_deref(),
                             *initial_turn_metrics,
                         )
                         .await;
                     if should_resume_interrupted {
-                        read_interrupted_codex_resume_prompt(
-                            self.service.workspace_directory_path().to_path_buf(),
-                            workspace_key.clone(),
-                            session_id.clone(),
-                        )
-                        .await
+                        if let Some(session_id) = effective_task_session_id.clone() {
+                            read_interrupted_codex_resume_prompt(
+                                self.service.workspace_directory_path().to_path_buf(),
+                                workspace_key.clone(),
+                                session_id,
+                            )
+                            .await
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -2010,13 +2355,12 @@ impl TuiState {
                 Some(AttachedSession {
                     workspace_key,
                     task_id: Some(task_id),
-                    session_id,
                     initial_agent_state,
                     ..
                 }) if workspace_key == key => {
                     should_auto_resume_task_codex_after_attach(
                         task_runtime_snapshot(&snapshot, task_id),
-                        session_id.as_deref(),
+                        effective_task_session_id.as_deref(),
                         *initial_agent_state,
                     ) || interrupted_resume_prompt.is_some()
                 }
@@ -2047,7 +2391,7 @@ impl TuiState {
                         self.queue_task_codex_resume_until_vm_available(
                             key.to_string(),
                             task_id.clone(),
-                            attached_session
+                            resume_attached_session
                                 .clone()
                                 .expect("attached task session should exist"),
                             interrupted_resume_prompt.clone(),
@@ -2064,7 +2408,7 @@ impl TuiState {
                 let service = self.service.clone();
                 let workspace_key = key.to_string();
                 let snapshot_for_resume = snapshot.clone();
-                let attached_session_for_resume = attached_session.clone();
+                let attached_session_for_resume = resume_attached_session.clone();
                 tokio::spawn(async move {
                     let resume_result = match attached_session_for_resume.as_ref() {
                         Some(AttachedSession {
@@ -2917,7 +3261,19 @@ impl TuiState {
                                     .await
                                     {
                                         Ok(_) => {
-                                            self.handle_attach_exit(&key).await;
+                                            if !self
+                                                .retry_codex_task_attach_with_fresh_session(
+                                                    terminal, &key,
+                                                )
+                                                .await
+                                                && !self
+                                                .retry_codex_task_attach_with_last_thread(
+                                                    terminal, &key,
+                                                )
+                                                .await
+                                            {
+                                                self.handle_attach_exit(&key).await;
+                                            }
                                         }
                                         Err(err) => {
                                             tracing::warn!(
@@ -2926,7 +3282,17 @@ impl TuiState {
                                                 "attach session exited with error"
                                             );
                                             if !self
-                                                .handle_attach_exit_after_error(&key, &err)
+                                                .retry_codex_task_attach_with_fresh_session(
+                                                    terminal, &key,
+                                                )
+                                                .await
+                                                && !self
+                                                .retry_codex_task_attach_with_last_thread(
+                                                    terminal, &key,
+                                                )
+                                                .await
+                                                && !self
+                                                    .handle_attach_exit_after_error(&key, &err)
                                                 .await
                                             {
                                                 self.status = format!(
@@ -3607,7 +3973,9 @@ pub(crate) fn snapshot_attach_target_for_selection(
             && (matches!(
                 task_effective_agent_state(task_state),
                 Some(AutomationAgentState::Stale)
-            ) || snapshot.persistent.automation_paused
+            ) || task_state.is_some_and(|task_state| {
+                matches!(task_state.status.as_deref(), Some("NotLoaded"))
+            }) || snapshot.persistent.automation_paused
                 && task_state
                     .and_then(|task_state| task_state.session_id.as_deref())
                     .is_none());

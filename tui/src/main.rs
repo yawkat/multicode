@@ -199,6 +199,7 @@ struct AttachedSession {
     session_id: Option<String>,
     initial_agent_state: Option<AutomationAgentState>,
     initial_turn_metrics: Option<CodexSessionTurnMetrics>,
+    fresh_codex_session: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -345,6 +346,11 @@ enum AttachTarget {
     Codex {
         uri: String,
         thread_id: Option<String>,
+    },
+    CodexNew {
+        uri: String,
+        cwd: Option<String>,
+        prompt: Option<String>,
     },
 }
 
