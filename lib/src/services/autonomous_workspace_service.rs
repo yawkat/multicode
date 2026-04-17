@@ -51,6 +51,7 @@ const DEPENDENCY_UPGRADE_PR_MARKER_PREFIX: &str = "<!-- multicode:dependency-upg
 const DEPENDENCY_UPGRADE_PR_BATCH_MARKER_PREFIX: &str = "<!-- multicode:dependency-upgrade-prs=";
 const IN_PROGRESS_LABEL: &str = "status: in progress";
 const IN_PROGRESS_LABEL_ALIASES: [&str; 2] = [IN_PROGRESS_LABEL, "status: in-progress"];
+const AWAITING_VALIDATION_LABEL: &str = "status: awaiting validation";
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -964,17 +965,23 @@ async fn start_assigned_issue_work(
         return Err(err);
     }
 
-    if let Err(err) = assign_issue_to_me(assigned_repository, &issue, &token).await {
-        tracing::warn!(
-            workspace_key,
-            issue_url = %issue.url,
-            error = %err,
-            "manual issue prompt started but assigning issue to current user failed"
-        );
-        return Err(err);
+    if should_assign_issue_to_current_user(&issue) {
+        if let Err(err) = assign_issue_to_me(assigned_repository, &issue, &token).await {
+            tracing::warn!(
+                workspace_key,
+                issue_url = %issue.url,
+                error = %err,
+                "manual issue prompt started but assigning issue to current user failed"
+            );
+            return Err(err);
+        }
     }
 
     Ok(Some(issue))
+}
+
+fn should_assign_issue_to_current_user(issue: &SelectedIssue) -> bool {
+    !issue.requires_validation()
 }
 
 async fn enqueue_next_issues(
@@ -3590,6 +3597,16 @@ fn build_issue_prompt(
     cwd: &std::path::Path,
     task_state_path: &std::path::Path,
 ) -> String {
+    if issue.requires_validation() {
+        return build_issue_validation_prompt(
+            assigned_repository,
+            issue,
+            task_session_id,
+            cwd,
+            task_state_path,
+        );
+    }
+
     let dependency_upgrade_pr_urls = issue.dependency_upgrade_pr_urls();
     let publish_instruction = if !dependency_upgrade_pr_urls.is_empty() {
         let renovate_pr_list = dependency_upgrade_pr_urls
@@ -3651,6 +3668,42 @@ Prefer an upstream pull request if you have write access. Keep going until the w
     )
 }
 
+fn build_issue_validation_prompt(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    task_session_id: &str,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+) -> String {
+    format!(
+        "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
+Start validation work on GitHub issue {issue_url}.\n\
+Issue title: {issue_title}\n\
+Primary checkout for this task: {cwd}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
+For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\
+You are acting as a QA engineer validating whether this issue is actionable.\n\
+Your job is to:\n\
+1. Use the existing checkout at `{cwd}` for this issue. Keep this task isolated to that checkout instead of sharing another task's repository state.\n\
+2. Understand the report and attempt to reproduce it using focused commands, builds, Gradle tasks, tests, or a minimal local reproducer as needed.\n\
+3. Do not implement a fix, do not commit, do not push, and do not create or update any pull request during this validation phase.\n\
+4. Do not assign the issue to anyone. This phase is only for verification and triage.\n\
+5. If the issue is reproducible, add a detailed GitHub comment with the reproduction steps, environment, and evidence, and attach or paste the reproducer when possible. Apply the most appropriate result label such as `status: bug`, `status: regression`, `status: docs`, or another repository-appropriate validation label.\n\
+6. If the issue is not reproducible or not actionable, add a GitHub comment summarizing the evidence and apply the most appropriate closing label such as `closed: question`, `closed: notabug`, `closed: duplicate`, or `closed: cannot reproduce`.\n\
+7. Replace `status: awaiting validation` and any temporary in-progress claim label with the final validation outcome labels before you finish.\n\
+8. Emit the machine-readable repository / issue tags while you work.\n\
+9. When validation is complete, leave the issue in review state for a human to make the final close / follow-up decision.\n\
+\n\
+Run repository commands, builds, and focused verification without asking for permission. Keep going until validation evidence is complete and the issue is ready for human review.",
+        issue_url = issue.url,
+        issue_title = issue.title,
+        task_session_id = task_session_id,
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+    )
+}
+
 async fn find_next_issue(
     assigned_repository: &str,
     excluded_issue_urls: &HashSet<String>,
@@ -3658,6 +3711,12 @@ async fn find_next_issue(
 ) -> Result<Option<QueuedIssueCandidate>, String> {
     if let Some(candidate) =
         find_next_dependency_upgrade_issue(assigned_repository, excluded_issue_urls, token).await?
+    {
+        return Ok(Some(candidate));
+    }
+
+    if let Some(candidate) =
+        find_next_validation_issue(assigned_repository, excluded_issue_urls, token).await?
     {
         return Ok(Some(candidate));
     }
@@ -3695,6 +3754,36 @@ async fn find_next_issue(
     }
 
     Ok(None)
+}
+
+async fn find_next_validation_issue(
+    assigned_repository: &str,
+    excluded_issue_urls: &HashSet<String>,
+    token: &str,
+) -> Result<Option<QueuedIssueCandidate>, String> {
+    let issues =
+        list_issues_for_label(assigned_repository, AWAITING_VALIDATION_LABEL, token).await?;
+    let Some(issue) = select_validation_issue_candidate(issues, excluded_issue_urls) else {
+        return Ok(None);
+    };
+
+    Ok(Some(QueuedIssueCandidate {
+        issue,
+        backing_pr_url: None,
+        dependency_upgrade_backing_pr: false,
+    }))
+}
+
+fn select_validation_issue_candidate(
+    issues: Vec<SelectedIssue>,
+    excluded_issue_urls: &HashSet<String>,
+) -> Option<SelectedIssue> {
+    issues
+        .into_iter()
+        .filter(SelectedIssue::requires_validation)
+        .filter(|issue| !issue.is_in_progress())
+        .filter(|issue| !excluded_issue_urls.contains(&issue.url))
+        .min_by(issue_priority_cmp)
 }
 
 async fn list_issues_for_label(
@@ -4642,6 +4731,10 @@ impl SelectedIssue {
             .any(|label| self.has_label(label))
     }
 
+    fn requires_validation(&self) -> bool {
+        self.has_label(AWAITING_VALIDATION_LABEL)
+    }
+
     fn has_priority_boost_label(&self) -> bool {
         ISSUE_PRIORITY_BOOST_LABELS
             .iter()
@@ -5365,6 +5458,67 @@ mod tests {
         );
 
         assert!(issue.is_in_progress());
+    }
+
+    #[test]
+    fn selected_issue_detects_awaiting_validation_label() {
+        let issue = test_issue(
+            12,
+            "needs validation",
+            "https://github.com/example/repo/issues/12",
+            "2026-04-09T12:00:00Z",
+            vec![SelectedIssueLabel {
+                name: AWAITING_VALIDATION_LABEL.to_string(),
+            }],
+        );
+
+        assert!(issue.requires_validation());
+        assert!(!should_assign_issue_to_current_user(&issue));
+    }
+
+    #[test]
+    fn select_validation_issue_candidate_skips_excluded_and_claimed_issues() {
+        let excluded = HashSet::from(["https://github.com/example/repo/issues/13".to_string()]);
+        let selected = select_validation_issue_candidate(
+            vec![
+                test_issue(
+                    13,
+                    "excluded validation issue",
+                    "https://github.com/example/repo/issues/13",
+                    "2026-04-09T12:00:00Z",
+                    vec![SelectedIssueLabel {
+                        name: AWAITING_VALIDATION_LABEL.to_string(),
+                    }],
+                ),
+                test_issue(
+                    14,
+                    "already claimed validation issue",
+                    "https://github.com/example/repo/issues/14",
+                    "2026-04-09T13:00:00Z",
+                    vec![
+                        SelectedIssueLabel {
+                            name: AWAITING_VALIDATION_LABEL.to_string(),
+                        },
+                        SelectedIssueLabel {
+                            name: IN_PROGRESS_LABEL.to_string(),
+                        },
+                    ],
+                ),
+                test_issue(
+                    15,
+                    "fresh validation issue",
+                    "https://github.com/example/repo/issues/15",
+                    "2026-04-09T11:00:00Z",
+                    vec![SelectedIssueLabel {
+                        name: AWAITING_VALIDATION_LABEL.to_string(),
+                    }],
+                ),
+            ],
+            &excluded,
+        )
+        .expect("one validation issue should remain");
+
+        assert_eq!(selected.number, 15);
     }
 
     #[test]
@@ -7472,6 +7626,38 @@ mod tests {
         assert!(prompt.contains("stage the full task checkout with `git add -A`"));
         assert!(!prompt.contains("backed by Renovate pull request"));
         assert!(!prompt.contains("merge it without waiting for human review"));
+    }
+
+    #[test]
+    fn build_issue_validation_prompt_enforces_qa_only_flow() {
+        let issue = test_issue(
+            983,
+            "awaiting validation",
+            "https://github.com/example/repo/issues/983",
+            "2026-04-09T10:00:00Z",
+            vec![SelectedIssueLabel {
+                name: AWAITING_VALIDATION_LABEL.to_string(),
+            }],
+        );
+
+        let prompt = build_issue_prompt(
+            "example/repo",
+            &issue,
+            None,
+            "thread-task-983",
+            std::path::Path::new("/tmp/work/example-repo-983"),
+            std::path::Path::new("/tmp/state/task-983.state"),
+        );
+
+        assert!(prompt.contains("acting as a QA engineer"));
+        assert!(prompt.contains("Do not implement a fix, do not commit, do not push"));
+        assert!(prompt.contains("Do not assign the issue to anyone."));
+        assert!(prompt.contains("status: bug"));
+        assert!(prompt.contains("closed: cannot reproduce"));
+        assert!(prompt.contains("Replace `status: awaiting validation`"));
+        assert!(prompt.contains("leave the issue in review state"));
+        assert!(!prompt.contains("explicitly approves publishing"));
+        assert!(!prompt.contains("3. Implement the fix."));
     }
 
     #[test]
