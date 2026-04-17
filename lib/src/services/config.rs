@@ -579,7 +579,7 @@ pub(super) fn validate_tool_config_entries(
     tools: &[ToolConfig],
 ) -> Result<(), CombinedServiceError> {
     let mut seen_keys = HashSet::new();
-    let reserved = ['q', 'a', 'd', 's'];
+    let reserved = ['q', 'a', 'd', 'f', 's'];
 
     for (index, tool) in tools.iter().enumerate() {
         if tool.name.trim().is_empty() {

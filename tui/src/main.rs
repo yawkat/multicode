@@ -1412,6 +1412,7 @@ fn help_line(
     selected_workspace_can_assign_issue: bool,
     selected_workspace_can_diff: bool,
     selected_workspace_can_edit: bool,
+    selected_task_can_fix_ci: bool,
     tool_progress_can_cancel: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
@@ -1460,6 +1461,9 @@ fn help_line(
                         }
                         if workspace_supports_task_approval(snapshot) {
                             push_hotkey(&mut spans, "a", " approve  ");
+                            if selected_task_can_fix_ci {
+                                push_hotkey(&mut spans, "f", " fix CI  ");
+                            }
                         }
                         for (tool_key, tool_name) in tool_hotkeys {
                             push_hotkey(&mut spans, tool_key.clone(), format!(" {}  ", tool_name));

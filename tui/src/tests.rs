@@ -15,7 +15,7 @@ mod tests {
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
-        should_auto_resume_task_codex_after_attach,
+        should_auto_resume_task_codex_after_attach, should_offer_codex_ci_fix,
         should_queue_task_codex_resume_until_vm_available,
         should_restart_codex_task_for_pr_request, should_restart_task_codex_after_attach,
         should_resume_codex_task_after_incomplete_attached_turn,
@@ -57,6 +57,89 @@ mod tests {
 
     struct TestDir {
         path: PathBuf,
+    }
+
+    fn help_line(
+        mode: UiMode,
+        selected_row: usize,
+        workspace_count: usize,
+        selected_workspace: Option<&WorkspaceSnapshot>,
+        selected_task_row: bool,
+        selected_workspace_link_count: usize,
+        selected_link_index: Option<usize>,
+        selected_link_is_custom: bool,
+        selected_link_is_placeholder: bool,
+        selected_link_kind: Option<WorkspaceLinkKind>,
+        selected_workspace_has_refreshable_github_link: bool,
+        selected_workspace_can_assign_issue: bool,
+        selected_workspace_can_diff: bool,
+        selected_workspace_can_edit: bool,
+        tool_progress_can_cancel: bool,
+        tool_hotkeys: &[(String, String)],
+        status: &str,
+    ) -> Line<'static> {
+        super::help_line(
+            mode,
+            selected_row,
+            workspace_count,
+            selected_workspace,
+            selected_task_row,
+            selected_workspace_link_count,
+            selected_link_index,
+            selected_link_is_custom,
+            selected_link_is_placeholder,
+            selected_link_kind,
+            selected_workspace_has_refreshable_github_link,
+            selected_workspace_can_assign_issue,
+            selected_workspace_can_diff,
+            selected_workspace_can_edit,
+            false,
+            tool_progress_can_cancel,
+            tool_hotkeys,
+            status,
+        )
+    }
+
+    fn help_line_with_task_fix(
+        mode: UiMode,
+        selected_row: usize,
+        workspace_count: usize,
+        selected_workspace: Option<&WorkspaceSnapshot>,
+        selected_task_row: bool,
+        selected_workspace_link_count: usize,
+        selected_link_index: Option<usize>,
+        selected_link_is_custom: bool,
+        selected_link_is_placeholder: bool,
+        selected_link_kind: Option<WorkspaceLinkKind>,
+        selected_workspace_has_refreshable_github_link: bool,
+        selected_workspace_can_assign_issue: bool,
+        selected_workspace_can_diff: bool,
+        selected_workspace_can_edit: bool,
+        selected_task_can_fix_ci: bool,
+        tool_progress_can_cancel: bool,
+        tool_hotkeys: &[(String, String)],
+        status: &str,
+    ) -> Line<'static> {
+        super::help_line(
+            mode,
+            selected_row,
+            workspace_count,
+            selected_workspace,
+            selected_task_row,
+            selected_workspace_link_count,
+            selected_link_index,
+            selected_link_is_custom,
+            selected_link_is_placeholder,
+            selected_link_kind,
+            selected_workspace_has_refreshable_github_link,
+            selected_workspace_can_assign_issue,
+            selected_workspace_can_diff,
+            selected_workspace_can_edit,
+            selected_task_can_fix_ci,
+            tool_progress_can_cancel,
+            tool_hotkeys,
+            status,
+        )
     }
 
     impl TestDir {
@@ -2731,6 +2814,74 @@ mod tests {
 
         assert!(text.contains("a approve"));
         assert!(!text.contains("a archive"));
+    }
+
+    #[test]
+    fn help_line_shows_fix_ci_hotkey_for_failing_task_row() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        let line = help_line_with_task_fix(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            true,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("a approve"));
+        assert!(text.contains("f fix CI"));
+    }
+
+    #[test]
+    fn should_offer_codex_ci_fix_requires_pr_link_and_open_non_green_pr() {
+        assert!(should_offer_codex_ci_fix(true, Some(GithubPrStatus {
+            state: GithubPrState::Open,
+            build: GithubPrBuildState::Failed,
+            review: GithubPrReviewState::Outstanding,
+            is_draft: false,
+            fetched_at: UNIX_EPOCH,
+        })));
+        assert!(should_offer_codex_ci_fix(true, Some(GithubPrStatus {
+            state: GithubPrState::Open,
+            build: GithubPrBuildState::Building,
+            review: GithubPrReviewState::Outstanding,
+            is_draft: false,
+            fetched_at: UNIX_EPOCH,
+        })));
+        assert!(!should_offer_codex_ci_fix(true, Some(GithubPrStatus {
+            state: GithubPrState::Open,
+            build: GithubPrBuildState::Succeeded,
+            review: GithubPrReviewState::Outstanding,
+            is_draft: false,
+            fetched_at: UNIX_EPOCH,
+        })));
+        assert!(!should_offer_codex_ci_fix(true, Some(GithubPrStatus {
+            state: GithubPrState::Merged,
+            build: GithubPrBuildState::Failed,
+            review: GithubPrReviewState::Outstanding,
+            is_draft: false,
+            fetched_at: UNIX_EPOCH,
+        })));
+        assert!(should_offer_codex_ci_fix(true, None));
+        assert!(!should_offer_codex_ci_fix(false, None));
     }
 
     #[test]
