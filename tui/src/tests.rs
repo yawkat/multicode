@@ -11,6 +11,7 @@ mod tests {
 
     use super::*;
     use crate::app::{
+        build_codex_fix_ci_prompt,
         compact_github_tooltip_target, count_codex_session_turn_metrics, github_repository_url,
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
         restored_selected_row, shell_command_in_repo,
@@ -2882,6 +2883,44 @@ mod tests {
         })));
         assert!(should_offer_codex_ci_fix(true, None));
         assert!(!should_offer_codex_ci_fix(false, None));
+    }
+
+    #[test]
+    fn build_codex_fix_ci_prompt_includes_autonomous_context_and_ci_instructions() {
+        let prompt = build_codex_fix_ci_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            Some("https://github.com/micronaut-projects/micronaut-kafka/pull/1308"),
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+
+        assert!(prompt.contains(
+            "You are operating in an autonomous multicode workspace for repository micronaut-projects/micronaut-kafka."
+        ));
+        assert!(prompt.contains("Continue autonomously from where you left off."));
+        assert!(prompt.contains(
+            "Start from the existing checkout for GitHub issue https://github.com/micronaut-projects/micronaut-kafka/issues/873."
+        ));
+        assert!(prompt.contains("Primary checkout for this task: /tmp/work/micronaut-kafka-873"));
+        assert!(prompt.contains(
+            "write autonomous state updates to `/tmp/state/task-873.state`"
+        ));
+        assert!(prompt.contains(
+            "write autonomous state updates in the format `<state>:thread-task-873`"
+        ));
+        assert!(prompt.contains("Use the existing pull request https://github.com/micronaut-projects/micronaut-kafka/pull/1308."));
+        assert!(prompt.contains("`machine-readable-pr`"));
+        assert!(prompt.contains("`autonomous-state`"));
+        assert!(prompt.contains(
+            "Run repository commands, builds, Gradle tasks, focused tests, git commits, branch pushes, and pull request updates as needed without asking for permission."
+        ));
+        assert!(prompt.contains(
+            "Existing tests must never be changed just to satisfy failing checks or to mask regressions; preserve the intended existing behavior."
+        ));
+        assert!(prompt.contains("Do not create a new pull request."));
+        assert!(prompt.contains("Do not merge the pull request."));
     }
 
     #[test]

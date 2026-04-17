@@ -10,7 +10,54 @@ use std::os::unix::fs::FileTypeExt;
 const NERD_FONT_GITHUB_GLYPH: &str = "\u{f408}";
 const CODEX_AUTO_RESUME_PROMPT: &str = "Continue autonomously from where you left off. Do not wait for approval for repository commands, builds, Gradle tasks, or focused tests. Only stop to ask before committing, pushing, commenting on GitHub, or opening or updating a pull request.";
 const CODEX_CREATE_PR_APPROVAL_PROMPT: &str = "The local changes for this task are approved for publishing. Create or update the pull request now from this task checkout. Push the branch if needed, use the correct upstream base branch, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements, assign the pull request to yourself, assign it automatically to the next Micronaut project release at the organization level under https://github.com/orgs/micronaut-projects/projects, prefer the next semantically versioned release project that is typically suffixed with a milestone such as `5.0.0-M2` and otherwise suffixed with `Release` such as `5.0.0 Release`, request Copilot review, emit the <multicode:pr> link, and stop once the PR is ready for human review. If a PR already exists, update it instead of creating a duplicate. Do not merge the PR.";
-const CODEX_FIX_CI_PROMPT: &str = "Use the existing pull request for this issue and fix any failing CI checks, including Sonar failures. Existing tests must never be changed just to satisfy failing checks or to mask regressions; preserve the intended existing behavior. Push fixes as needed, monitor the CI after each push, and continue addressing failures until the pull request is green. Stop only when all CI is passing or you need human input.";
+const CODEX_FIX_CI_INSTRUCTIONS: &str = "Fix any failing CI checks for this task's existing pull request, including Sonar failures. Existing tests must never be changed just to satisfy failing checks or to mask regressions; preserve the intended existing behavior. Push fixes as needed, monitor CI after each push, and continue until the pull request is green. Do not create a new pull request. Do not merge the pull request. Stop only when all CI is passing or you need human input.";
+
+pub(crate) fn build_codex_fix_ci_prompt(
+    assigned_repository: &str,
+    issue_url: &str,
+    backing_pr_url: Option<&str>,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+    task_session_id: Option<&str>,
+) -> String {
+    let pr_instruction = backing_pr_url.map_or_else(
+        || "If a pull request already exists for this issue, use that existing pull request instead of creating a duplicate.".to_string(),
+        |backing_pr_url| format!("Use the existing pull request {backing_pr_url}."),
+    );
+    let session_instruction = task_session_id.map_or_else(
+        String::new,
+        |task_session_id| {
+            format!(
+                "For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\\\n"
+            )
+        },
+    );
+    format!(
+        "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
+Continue autonomously from where you left off.\n\
+Start from the existing checkout for GitHub issue {issue_url}.\n\
+Primary checkout for this task: {cwd}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
+{session_instruction}\
+{pr_instruction}\n\
+Your job is to:\n\
+1. Inspect the current failing CI status for this task and understand every failing check.\n\
+2. Reproduce and fix the underlying problems in the existing checkout.\n\
+3. Run focused verification locally.\n\
+4. Commit and push branch updates as needed.\n\
+5. Monitor CI after each push and keep addressing failures until it is green.\n\
+6. Emit the machine-readable repository / issue / PR tags while you work.\n\
+7. Run repository commands, builds, Gradle tasks, focused tests, git commits, branch pushes, and pull request updates as needed without asking for permission.\n\
+{instructions}\n\
+\n\
+Keep going until CI is green or you need human feedback.",
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+        session_instruction = session_instruction,
+        instructions = CODEX_FIX_CI_INSTRUCTIONS
+    )
+}
 
 pub(crate) fn repository_diff_shell_command() -> &'static str {
     r#"tmp="$(mktemp -t multicode-diff.XXXXXX)" || exit 1
@@ -1658,6 +1705,35 @@ impl TuiState {
             )
     }
 
+    fn selected_task_ci_fix_prompt(&self) -> Option<String> {
+        let workspace_key = self.selected_workspace_key()?;
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        let task = task_persistent_snapshot(snapshot, task_id)?;
+        let assigned_repository = snapshot.persistent.assigned_repository.as_deref()?;
+        let cwd =
+            self.service
+                .workspace_task_checkout_path(workspace_key, assigned_repository, &task.issue_url);
+        let task_state_path = self
+            .service
+            .workspace_directory_path()
+            .join(".multicode")
+            .join("automation")
+            .join(workspace_key)
+            .join("tasks")
+            .join(format!("{task_id}.state"));
+        Some(build_codex_fix_ci_prompt(
+            assigned_repository,
+            &task.issue_url,
+            task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+                .or(task.backing_pr_url.as_deref()),
+            &cwd,
+            &task_state_path,
+            task_runtime_snapshot(snapshot, task_id)
+                .and_then(|task_state| task_state.session_id.as_deref()),
+        ))
+    }
+
     async fn approve_selected_task_for_pr_creation(&mut self) {
         if !self.selected_task_can_request_pr_creation() {
             return;
@@ -1707,6 +1783,18 @@ impl TuiState {
                         CODEX_CREATE_PR_APPROVAL_PROMPT,
                     )
                     .await
+            };
+
+            let result = match result {
+                Ok(()) => service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        CODEX_AUTO_RESUME_PROMPT,
+                    )
+                    .await,
+                Err(err) => Err(err),
             };
 
             if let Err(err) = result {
@@ -1791,29 +1879,49 @@ impl TuiState {
         let Some(task_id) = self.selected_task_id().map(str::to_string) else {
             return;
         };
+        let Some(prompt) = self.selected_task_ci_fix_prompt() else {
+            return;
+        };
         let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
             return;
         };
         let previous_snapshot = snapshot.clone();
+        let should_restart =
+            should_restart_codex_task_for_pr_request(task_runtime_snapshot(&snapshot, &task_id));
         let (progress_tx, progress_rx) = watch::channel("Preparing CI fix request...".to_string());
         let (result_tx, result_rx) = oneshot::channel();
         let service = self.service.clone();
         let workspace_key_for_task = workspace_key.clone();
         let task_id_for_task = task_id.clone();
+        self.persist_task_resume_prompt(&workspace_key, &task_id, &prompt);
 
         self.mark_task_resuming_in_background(&workspace_key, &task_id);
         tokio::spawn(async move {
-            let _ = progress_tx.send(
-                "Restarting the Codex task session before asking it to fix CI...".to_string(),
-            );
-            let result = service
-                .restart_task_session(
-                    &workspace_key_for_task,
-                    &snapshot,
-                    &task_id_for_task,
-                    CODEX_FIX_CI_PROMPT,
-                )
-                .await;
+            let progress_message = if should_restart {
+                "Restarting the Codex task session before asking it to fix CI..."
+            } else {
+                "Asking Codex to fix CI failures and continue in the background..."
+            };
+            let _ = progress_tx.send(progress_message.to_string());
+            let result = if should_restart {
+                service
+                    .restart_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            } else {
+                service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            };
 
             if let Err(err) = result {
                 if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
@@ -2375,9 +2483,27 @@ impl TuiState {
                             }
                         });
                     }
-                    service
-                        .restart_task_session(&workspace_key, &snapshot, &task_id, &resume_prompt)
-                        .await
+                    if should_restart_codex_task_for_pr_request(
+                        task_runtime_snapshot(&snapshot, &task_id),
+                    ) {
+                        service
+                            .restart_task_session(
+                                &workspace_key,
+                                &snapshot,
+                                &task_id,
+                                &resume_prompt,
+                            )
+                            .await
+                    } else {
+                        service
+                            .prompt_task_session(
+                                &workspace_key,
+                                &snapshot,
+                                &task_id,
+                                &resume_prompt,
+                            )
+                            .await
+                    }
                 } else if let Some(session_id) = attached_session.session_id.clone() {
                     let resume_prompt = read_last_codex_session_user_message(
                         service.workspace_directory_path().to_path_buf(),
