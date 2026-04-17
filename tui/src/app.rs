@@ -358,6 +358,13 @@ pub(crate) fn should_auto_resume_task_codex_after_attach(
     }
 }
 
+pub(crate) fn should_restart_task_codex_after_attach(
+    attached_session_id: Option<&str>,
+    fresh_codex_session: bool,
+) -> bool {
+    attached_session_id.is_some() && !fresh_codex_session
+}
+
 fn codex_observer_attach_prompt(task_id: &str) -> String {
     format!(
         "Another Codex task session is already actively working on {task_id}. You are attached only for observation and user-directed inspection. Do not make repository changes, do not start duplicate work, and do not send autonomous follow-up prompts to the active task. Briefly confirm you are attached and then wait for the user."
@@ -1791,8 +1798,8 @@ impl TuiState {
                             .retry_codex_task_attach_with_fresh_session(terminal, &key)
                             .await
                             && !self
-                            .retry_codex_task_attach_with_last_thread(terminal, &key)
-                            .await
+                                .retry_codex_task_attach_with_last_thread(terminal, &key)
+                                .await
                         {
                             self.handle_attach_exit(&key).await;
                         }
@@ -1807,8 +1814,8 @@ impl TuiState {
                             .retry_codex_task_attach_with_fresh_session(terminal, &key)
                             .await
                             && !self
-                            .retry_codex_task_attach_with_last_thread(terminal, &key)
-                            .await
+                                .retry_codex_task_attach_with_last_thread(terminal, &key)
+                                .await
                             && !self.handle_attach_exit_after_error(&key, &err).await
                         {
                             self.status = format!("Failed to attach to workspace '{key}': {err}");
@@ -1931,7 +1938,9 @@ impl TuiState {
             )
         });
         let current_thread_status = match (
-            self.snapshots.get(key).and_then(|snapshot| snapshot.transient.as_ref()),
+            self.snapshots
+                .get(key)
+                .and_then(|snapshot| snapshot.transient.as_ref()),
             session_id,
         ) {
             (Some(transient), Some(session_id)) => CodexAppServerClient::new(transient.uri.clone())
@@ -2221,7 +2230,7 @@ impl TuiState {
                     let resume_prompt = read_last_codex_session_user_message(
                         service.workspace_directory_path().to_path_buf(),
                         workspace_key.clone(),
-                        session_id,
+                        session_id.clone(),
                     )
                     .await
                     .unwrap_or_else(|| CODEX_AUTO_RESUME_PROMPT.to_string());
@@ -2240,9 +2249,28 @@ impl TuiState {
                             }
                         });
                     }
-                    service
-                        .prompt_task_session(&workspace_key, &snapshot, &task_id, &resume_prompt)
-                        .await
+                    if should_restart_task_codex_after_attach(
+                        Some(session_id.as_str()),
+                        attached_session.fresh_codex_session,
+                    ) {
+                        service
+                            .restart_task_session(
+                                &workspace_key,
+                                &snapshot,
+                                &task_id,
+                                &resume_prompt,
+                            )
+                            .await
+                    } else {
+                        service
+                            .prompt_task_session(
+                                &workspace_key,
+                                &snapshot,
+                                &task_id,
+                                &resume_prompt,
+                            )
+                            .await
+                    }
                 } else {
                     service
                         .prompt_task_session(
@@ -2302,9 +2330,8 @@ impl TuiState {
                     ..
                 }) if workspace_key == key => session_id.clone().or_else(|| {
                     if *fresh_codex_session {
-                        task_runtime_snapshot(&snapshot, task_id).and_then(|task_state| {
-                            task_state.session_id.clone()
-                        })
+                        task_runtime_snapshot(&snapshot, task_id)
+                            .and_then(|task_state| task_state.session_id.clone())
                     } else {
                         None
                     }
@@ -2415,6 +2442,7 @@ impl TuiState {
                             workspace_key: attached_workspace_key,
                             task_id: Some(task_id),
                             session_id: Some(session_id),
+                            fresh_codex_session,
                             ..
                         }) if attached_workspace_key == &workspace_key => {
                             if let Some(resume_prompt) = interrupted_resume_prompt.clone() {
@@ -2476,14 +2504,28 @@ impl TuiState {
                                         }
                                     });
                                 }
-                                service
-                                    .prompt_task_session(
-                                        &workspace_key,
-                                        &snapshot_for_resume,
-                                        task_id,
-                                        &resume_prompt,
-                                    )
-                                    .await
+                                if should_restart_task_codex_after_attach(
+                                    Some(session_id.as_str()),
+                                    *fresh_codex_session,
+                                ) {
+                                    service
+                                        .restart_task_session(
+                                            &workspace_key,
+                                            &snapshot_for_resume,
+                                            task_id,
+                                            &resume_prompt,
+                                        )
+                                        .await
+                                } else {
+                                    service
+                                        .prompt_task_session(
+                                            &workspace_key,
+                                            &snapshot_for_resume,
+                                            task_id,
+                                            &resume_prompt,
+                                        )
+                                        .await
+                                }
                             }
                         }
                         _ => {
@@ -3267,10 +3309,10 @@ impl TuiState {
                                                 )
                                                 .await
                                                 && !self
-                                                .retry_codex_task_attach_with_last_thread(
-                                                    terminal, &key,
-                                                )
-                                                .await
+                                                    .retry_codex_task_attach_with_last_thread(
+                                                        terminal, &key,
+                                                    )
+                                                    .await
                                             {
                                                 self.handle_attach_exit(&key).await;
                                             }
@@ -3287,13 +3329,13 @@ impl TuiState {
                                                 )
                                                 .await
                                                 && !self
-                                                .retry_codex_task_attach_with_last_thread(
-                                                    terminal, &key,
-                                                )
-                                                .await
+                                                    .retry_codex_task_attach_with_last_thread(
+                                                        terminal, &key,
+                                                    )
+                                                    .await
                                                 && !self
                                                     .handle_attach_exit_after_error(&key, &err)
-                                                .await
+                                                    .await
                                             {
                                                 self.status = format!(
                                                     "Failed to attach to workspace '{key}': {err}"

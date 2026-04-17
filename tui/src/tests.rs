@@ -16,13 +16,13 @@ mod tests {
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach,
-        should_start_fresh_codex_task_session_after_failed_attach,
-        should_retry_codex_task_attach_with_last_thread,
         should_queue_task_codex_resume_until_vm_available,
-        should_restart_codex_task_for_pr_request,
-        should_resume_codex_task_after_incomplete_attached_turn, snapshot_attach_cwd_for_selection,
-        snapshot_attach_target_for_selection, starting_modal_failure_status,
-        working_codex_task_attach_target,
+        should_restart_codex_task_for_pr_request, should_restart_task_codex_after_attach,
+        should_resume_codex_task_after_incomplete_attached_turn,
+        should_retry_codex_task_attach_with_last_thread,
+        should_start_fresh_codex_task_session_after_failed_attach,
+        snapshot_attach_cwd_for_selection, snapshot_attach_target_for_selection,
+        starting_modal_failure_status, working_codex_task_attach_target,
     };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
@@ -592,6 +592,23 @@ mod tests {
             Some("thread-4"),
             Some(AutomationAgentState::Working)
         ));
+    }
+
+    #[test]
+    fn direct_task_attach_restarts_background_codex_session_after_detach() {
+        assert!(should_restart_task_codex_after_attach(
+            Some("thread-4"),
+            false
+        ));
+    }
+
+    #[test]
+    fn fresh_task_attach_keeps_existing_background_codex_session() {
+        assert!(!should_restart_task_codex_after_attach(
+            Some("thread-4"),
+            true
+        ));
+        assert!(!should_restart_task_codex_after_attach(None, true));
     }
 
     #[test]
