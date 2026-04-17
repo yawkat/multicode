@@ -1293,7 +1293,20 @@ fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) 
             .as_deref()
             .filter(|task_id| active_task_lease_must_be_preserved(next, task_id))
             .map(ToOwned::to_owned)
-            .or_else(|| snapshot.resolved_active_task_id());
+            .or_else(|| {
+                let claimed_task_id = snapshot
+                    .persistent
+                    .automation_issue
+                    .as_deref()
+                    .and_then(|issue_url| task_id_for_issue(snapshot, issue_url));
+                match claimed_task_id.as_deref() {
+                    Some(task_id) if snapshot.active_task_id.as_deref() != Some(task_id) => {
+                        Some(task_id.to_string())
+                    }
+                    Some(task_id) if snapshot.active_task_id.is_none() => Some(task_id.to_string()),
+                    _ => None,
+                }
+            });
         if next.active_task_id != resolved_active_task_id {
             next.active_task_id = resolved_active_task_id.clone();
             changed = true;
@@ -1348,10 +1361,10 @@ fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) 
 
 fn active_task_lease_must_be_preserved(snapshot: &WorkspaceSnapshot, task_id: &str) -> bool {
     task_persistent_snapshot(snapshot, task_id).is_some()
-        && snapshot.task_states.get(task_id).is_some_and(|task_state| {
-            task_state.session_id.is_some()
-                && !task_can_yield_vm(normalized_task_agent_state(task_state))
-        })
+        && snapshot
+            .task_states
+            .get(task_id)
+            .is_some_and(|task_state| !task_can_yield_vm(normalized_task_agent_state(task_state)))
 }
 
 fn active_task_id_for_snapshot(snapshot: &WorkspaceSnapshot) -> Option<String> {
@@ -1674,6 +1687,8 @@ struct CodexRecoveredThreadCandidate {
     cwd: String,
     sort_key: String,
     has_user_event: bool,
+    autonomous_issue_urls: Vec<String>,
+    autonomous_pr_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1769,7 +1784,7 @@ async fn recover_codex_task_sessions(
         return;
     }
 
-    let missing_task_cwds = snapshot
+    let missing_tasks = snapshot
         .persistent
         .tasks
         .iter()
@@ -1780,26 +1795,25 @@ async fn recover_codex_task_sessions(
                 .and_then(|state| state.session_id.as_deref())
                 .is_none()
         })
-        .map(|task| {
-            (
-                task.id.clone(),
-                task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url)
-                    .to_string_lossy()
-                    .into_owned(),
-            )
+        .map(|task| CodexTaskRecoveryDescriptor {
+            task_id: task.id.clone(),
+            cwd: task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url)
+                .to_string_lossy()
+                .into_owned(),
+            issue_url: task.issue_url.clone(),
+            backing_pr_url: task.backing_pr_url.clone(),
         })
         .collect::<Vec<_>>();
-    if missing_task_cwds.is_empty() {
+    if missing_tasks.is_empty() {
         return;
     }
 
     let codex_home = synthetic_codex_home_source(service.workspace_directory_path(), workspace_key);
-    let recovered = spawn_blocking(move || {
-        recover_codex_thread_ids_from_state_db(&codex_home, &missing_task_cwds)
-    })
-    .await
-    .ok()
-    .and_then(Result::ok);
+    let recovered =
+        spawn_blocking(move || recover_codex_thread_ids_for_tasks(&codex_home, &missing_tasks))
+            .await
+            .ok()
+            .and_then(Result::ok);
     let Some(recovered) = recovered else {
         return;
     };
@@ -1864,6 +1878,8 @@ async fn reconcile_codex_task_runtime_states(
                         service.workspace_directory_path(),
                         workspace_key,
                         &task_cwd,
+                        &task.issue_url,
+                        task.backing_pr_url.as_deref(),
                         Some(&task_session_id),
                     )
                     .await
@@ -1925,6 +1941,8 @@ async fn reconcile_codex_task_runtime_states(
             service.workspace_directory_path(),
             workspace_key,
             &task_cwd,
+            &task.issue_url,
+            task.backing_pr_url.as_deref(),
             Some(&task_session_id),
         )
         .await
@@ -2291,7 +2309,16 @@ fn recover_latest_codex_thread_candidate_for_cwd(
 
     let log_candidate =
         recover_codex_thread_candidates_from_session_logs(codex_home, &[cwd.to_string()])
-            .remove(cwd);
+            .remove(cwd)
+            .and_then(|candidates| {
+                candidates.into_iter().reduce(|current, next| {
+                    if should_prefer_recovered_candidate(Some(&next), Some(&current)) {
+                        next
+                    } else {
+                        current
+                    }
+                })
+            });
     if should_prefer_recovered_candidate(log_candidate.as_ref(), candidate.as_ref()) {
         candidate = log_candidate;
     }
@@ -2299,26 +2326,50 @@ fn recover_latest_codex_thread_candidate_for_cwd(
     candidate
 }
 
-fn recover_codex_thread_ids_from_state_db(
-    codex_home: &Path,
-    task_cwds: &[(String, String)],
-) -> Result<HashMap<String, String>, String> {
-    let cwd_candidates = recover_codex_thread_candidates_from_state_db(
-        codex_home,
-        &task_cwds
-            .iter()
-            .map(|(_, cwd)| cwd.clone())
-            .collect::<Vec<_>>(),
-    )?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTaskRecoveryDescriptor {
+    task_id: String,
+    cwd: String,
+    issue_url: String,
+    backing_pr_url: Option<String>,
+}
 
-    Ok(task_cwds
+fn recover_codex_thread_ids_for_tasks(
+    codex_home: &Path,
+    tasks: &[CodexTaskRecoveryDescriptor],
+) -> Result<HashMap<String, String>, String> {
+    Ok(tasks
         .iter()
-        .filter_map(|(task_id, cwd)| {
-            cwd_candidates
-                .get(cwd)
-                .map(|candidate| (task_id.clone(), candidate.id.clone()))
+        .filter_map(|task| {
+            recover_latest_codex_task_thread_candidate(codex_home, task)
+                .map(|candidate| (task.task_id.clone(), candidate.id))
         })
         .collect())
+}
+
+fn recover_latest_codex_task_thread_candidate(
+    codex_home: &Path,
+    task: &CodexTaskRecoveryDescriptor,
+) -> Option<CodexRecoveredThreadCandidate> {
+    let mut owned_candidate = None;
+    let log_candidates = recover_codex_thread_candidates_from_session_logs(
+        codex_home,
+        std::slice::from_ref(&task.cwd),
+    );
+    if let Some(candidates) = log_candidates.get(task.cwd.as_str()) {
+        for candidate in candidates {
+            if recovered_candidate_matches_task(candidate, task)
+                && should_prefer_recovered_candidate(Some(candidate), owned_candidate.as_ref())
+            {
+                owned_candidate = Some(candidate.clone());
+            }
+        }
+    }
+    if owned_candidate.is_some() {
+        return owned_candidate;
+    }
+
+    recover_latest_codex_thread_candidate_for_cwd(codex_home, &task.cwd)
 }
 
 fn recover_codex_thread_candidates_from_state_db(
@@ -2354,6 +2405,8 @@ fn recover_codex_thread_candidates_from_state_db(
             cwd: row.cwd.clone(),
             sort_key: format!("{:020}", row.updated_at),
             has_user_event: row.has_user_event != 0,
+            autonomous_issue_urls: Vec::new(),
+            autonomous_pr_urls: Vec::new(),
         };
         let prefer_row = match threads_by_cwd.get(&row.cwd) {
             None => true,
@@ -2372,9 +2425,9 @@ fn recover_codex_thread_candidates_from_state_db(
 fn recover_codex_thread_candidates_from_session_logs(
     codex_home: &Path,
     task_cwds: &[String],
-) -> HashMap<String, CodexRecoveredThreadCandidate> {
+) -> HashMap<String, Vec<CodexRecoveredThreadCandidate>> {
     let sessions_dir = latest_codex_sessions_dir(codex_home);
-    let mut results = HashMap::<String, CodexRecoveredThreadCandidate>::new();
+    let mut results = HashMap::<String, Vec<CodexRecoveredThreadCandidate>>::new();
     let mut stack = vec![sessions_dir];
 
     while let Some(directory) = stack.pop() {
@@ -2401,12 +2454,10 @@ fn recover_codex_thread_candidates_from_session_logs(
             if !task_cwds.iter().any(|cwd| cwd == &candidate.cwd) {
                 continue;
             }
-            if should_prefer_recovered_candidate(
-                Some(&candidate),
-                results.get(candidate.cwd.as_str()),
-            ) {
-                results.insert(candidate.cwd.clone(), candidate);
-            }
+            results
+                .entry(candidate.cwd.clone())
+                .or_default()
+                .push(candidate);
         }
     }
 
@@ -2436,12 +2487,142 @@ fn recover_codex_thread_candidate_from_session_log(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let mut has_user_event = false;
+    let mut autonomous_issue_urls = Vec::new();
+    let mut autonomous_pr_urls = Vec::new();
+    for line in contents.lines().skip(1) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(text) = codex_session_log_user_text(&value) else {
+            continue;
+        };
+        has_user_event = true;
+        if !is_autonomous_multicode_task_prompt(text) {
+            continue;
+        }
+        let (issue_urls, pr_urls) = extract_github_issue_and_pr_urls(text);
+        autonomous_issue_urls.extend(issue_urls);
+        autonomous_pr_urls.extend(pr_urls);
+    }
     Some(CodexRecoveredThreadCandidate {
         id,
         cwd,
         sort_key: timestamp,
-        has_user_event: true,
+        has_user_event,
+        autonomous_issue_urls,
+        autonomous_pr_urls,
     })
+}
+
+fn codex_session_log_user_text<'a>(value: &'a serde_json::Value) -> Option<&'a str> {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("event_msg") {
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(serde_json::Value::as_str) == Some("user_message") {
+            return payload.get("message").and_then(serde_json::Value::as_str);
+        }
+    }
+
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("response_item") {
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(serde_json::Value::as_str) != Some("message")
+            || payload.get("role").and_then(serde_json::Value::as_str) != Some("user")
+        {
+            return None;
+        }
+        let content = payload.get("content")?.as_array()?;
+        return content.iter().find_map(|item| {
+            (item.get("type").and_then(serde_json::Value::as_str) == Some("input_text"))
+                .then(|| item.get("text").and_then(serde_json::Value::as_str))
+                .flatten()
+        });
+    }
+
+    None
+}
+
+fn is_autonomous_multicode_task_prompt(text: &str) -> bool {
+    text.contains("You are operating in an autonomous multicode workspace")
+        && text.contains("Start work on GitHub issue ")
+}
+
+fn extract_github_issue_and_pr_urls(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut issues = HashSet::new();
+    let mut prs = HashSet::new();
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']'
+            )
+        });
+        if let Some(issue_url) = normalize_github_issue_url(token) {
+            issues.insert(issue_url);
+        } else if let Some(pr_url) = normalize_github_pull_request_url(token) {
+            prs.insert(pr_url);
+        }
+    }
+
+    (issues.into_iter().collect(), prs.into_iter().collect())
+}
+
+fn normalize_github_issue_url(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))?;
+    let segments = rest
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim())
+        .collect::<Vec<_>>();
+    let [owner, repo, kind, number, ..] = segments.as_slice() else {
+        return None;
+    };
+    if *kind != "issues" {
+        return None;
+    }
+    let repository = normalize_github_repository_spec(&format!("{owner}/{repo}"))?;
+    let number = number.parse::<u64>().ok()?;
+    Some(format!("https://github.com/{repository}/issues/{number}"))
+}
+
+fn normalize_github_pull_request_url(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))?;
+    let segments = rest
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim())
+        .collect::<Vec<_>>();
+    let [owner, repo, kind, number, ..] = segments.as_slice() else {
+        return None;
+    };
+    if *kind != "pull" {
+        return None;
+    }
+    let repository = normalize_github_repository_spec(&format!("{owner}/{repo}"))?;
+    let number = number.parse::<u64>().ok()?;
+    Some(format!("https://github.com/{repository}/pull/{number}"))
+}
+
+fn recovered_candidate_matches_task(
+    candidate: &CodexRecoveredThreadCandidate,
+    task: &CodexTaskRecoveryDescriptor,
+) -> bool {
+    candidate.cwd == task.cwd
+        && (candidate
+            .autonomous_issue_urls
+            .iter()
+            .any(|issue_url| issue_url == &task.issue_url)
+            || task.backing_pr_url.as_ref().is_some_and(|backing_pr_url| {
+                candidate
+                    .autonomous_pr_urls
+                    .iter()
+                    .any(|pr_url| pr_url == backing_pr_url)
+            }))
 }
 
 fn should_prefer_recovered_candidate(
@@ -2463,13 +2644,20 @@ async fn recover_latest_codex_task_session_id(
     workspace_directory_path: &Path,
     workspace_key: &str,
     task_cwd: &Path,
+    task_issue_url: &str,
+    backing_pr_url: Option<&str>,
     current_session_id: Option<&str>,
 ) -> Option<String> {
     let codex_home = synthetic_codex_home_source(workspace_directory_path, workspace_key);
-    let cwd = task_cwd.to_string_lossy().into_owned();
+    let task = CodexTaskRecoveryDescriptor {
+        task_id: String::new(),
+        cwd: task_cwd.to_string_lossy().into_owned(),
+        issue_url: task_issue_url.to_string(),
+        backing_pr_url: backing_pr_url.map(ToOwned::to_owned),
+    };
     let current_session_id = current_session_id.map(ToOwned::to_owned);
     spawn_blocking(move || {
-        recover_latest_codex_thread_candidate_for_cwd(&codex_home, &cwd).and_then(|candidate| {
+        recover_latest_codex_task_thread_candidate(&codex_home, &task).and_then(|candidate| {
             (current_session_id.as_deref() != Some(candidate.id.as_str())).then_some(candidate.id)
         })
     })
@@ -4782,10 +4970,80 @@ mod tests {
 
         let recovered =
             recover_codex_thread_candidates_from_session_logs(&codex_home, &[cwd.to_string()]);
+        let recovered = recovered
+            .get(cwd)
+            .expect("matching cwd should be present")
+            .iter()
+            .cloned()
+            .reduce(|current, next| {
+                if should_prefer_recovered_candidate(Some(&next), Some(&current)) {
+                    next
+                } else {
+                    current
+                }
+            });
 
         assert_eq!(
-            recovered.get(cwd).map(|candidate| candidate.id.as_str()),
+            recovered.as_ref().map(|candidate| candidate.id.as_str()),
             Some("019d85ce")
+        );
+
+        let _ = fs::remove_dir_all(&codex_home);
+    }
+
+    #[test]
+    fn recover_latest_codex_task_thread_candidate_prefers_autonomous_worker_over_newer_observer() {
+        let codex_home = unique_test_dir("codex-task-session-recovery");
+        let worker_dir = latest_codex_sessions_dir(&codex_home).join("2026/04/16");
+        let observer_dir = latest_codex_sessions_dir(&codex_home).join("2026/04/17");
+        fs::create_dir_all(&worker_dir).expect("worker session dir should be created");
+        fs::create_dir_all(&observer_dir).expect("observer session dir should be created");
+
+        let cwd = "/Users/graemerocher/dev/multicode-workspaces/sql/work/micronaut-sql-815";
+        let issue_url = "https://github.com/micronaut-projects/micronaut-sql/issues/815";
+        let pr_url = "https://github.com/micronaut-projects/micronaut-sql/pull/1921";
+        let worker = worker_dir.join("rollout-2026-04-16T18-45-42-019d979d.jsonl");
+        let observer = observer_dir.join("rollout-2026-04-17T07-28-28-019d9a57.jsonl");
+
+        fs::write(
+            &worker,
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019d979d\",\"cwd\":\"{}\",\"timestamp\":\"2026-04-16T18:45:42.032Z\"}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"You are operating in an autonomous multicode workspace for repository micronaut-projects/micronaut-sql.\\nStart work on GitHub issue {}.\\nFor this task, write autonomous state updates to `/Users/graemerocher/dev/multicode-workspaces/.multicode/automation/sql/tasks/task-815.state`.\\nThis issue already has a PR associated {}.\"}}]}}}}\n"
+                ),
+                cwd,
+                issue_url,
+                pr_url,
+            ),
+        )
+        .expect("worker session log should be written");
+        fs::write(
+            &observer,
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019d9a57\",\"cwd\":\"{}\",\"timestamp\":\"2026-04-17T07:28:28.902Z\"}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"this issue already has a PR associated {} ensure that is communicated to multicode UI\"}}]}}}}\n"
+                ),
+                cwd,
+                pr_url,
+            ),
+        )
+        .expect("observer session log should be written");
+
+        let recovered = recover_latest_codex_task_thread_candidate(
+            &codex_home,
+            &CodexTaskRecoveryDescriptor {
+                task_id: "task-815".to_string(),
+                cwd: cwd.to_string(),
+                issue_url: issue_url.to_string(),
+                backing_pr_url: Some(pr_url.to_string()),
+            },
+        );
+
+        assert_eq!(
+            recovered.as_ref().map(|candidate| candidate.id.as_str()),
+            Some("019d979d")
         );
 
         let _ = fs::remove_dir_all(&codex_home);

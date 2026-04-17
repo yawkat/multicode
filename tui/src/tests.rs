@@ -11,19 +11,19 @@ mod tests {
 
     use super::*;
     use crate::app::{
-        build_codex_fix_ci_prompt,
-        compact_github_tooltip_target, count_codex_session_turn_metrics, github_repository_url,
+        build_codex_fix_ci_prompt, compact_github_tooltip_target, count_codex_session_turn_metrics,
+        github_repository_spec, github_repository_url,
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach, should_offer_codex_ci_fix,
-        should_queue_task_codex_resume_until_vm_available,
+        should_queue_task_codex_resume_until_vm_available, should_restart_codex_task_for_ci_fix,
         should_restart_codex_task_for_pr_request, should_restart_task_codex_after_attach,
         should_resume_codex_task_after_incomplete_attached_turn,
         should_retry_codex_task_attach_with_last_thread,
         should_start_fresh_codex_task_session_after_failed_attach,
         snapshot_attach_cwd_for_selection, snapshot_attach_target_for_selection,
-        starting_modal_failure_status, working_codex_task_attach_target,
+        starting_modal_failure_status, task_repository_spec, working_codex_task_attach_target,
     };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
@@ -2885,34 +2885,46 @@ mod tests {
 
     #[test]
     fn should_offer_codex_ci_fix_requires_pr_link_and_open_non_green_pr() {
-        assert!(should_offer_codex_ci_fix(true, Some(GithubPrStatus {
-            state: GithubPrState::Open,
-            build: GithubPrBuildState::Failed,
-            review: GithubPrReviewState::Outstanding,
-            is_draft: false,
-            fetched_at: UNIX_EPOCH,
-        })));
-        assert!(should_offer_codex_ci_fix(true, Some(GithubPrStatus {
-            state: GithubPrState::Open,
-            build: GithubPrBuildState::Building,
-            review: GithubPrReviewState::Outstanding,
-            is_draft: false,
-            fetched_at: UNIX_EPOCH,
-        })));
-        assert!(!should_offer_codex_ci_fix(true, Some(GithubPrStatus {
-            state: GithubPrState::Open,
-            build: GithubPrBuildState::Succeeded,
-            review: GithubPrReviewState::Outstanding,
-            is_draft: false,
-            fetched_at: UNIX_EPOCH,
-        })));
-        assert!(!should_offer_codex_ci_fix(true, Some(GithubPrStatus {
-            state: GithubPrState::Merged,
-            build: GithubPrBuildState::Failed,
-            review: GithubPrReviewState::Outstanding,
-            is_draft: false,
-            fetched_at: UNIX_EPOCH,
-        })));
+        assert!(should_offer_codex_ci_fix(
+            true,
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                build: GithubPrBuildState::Failed,
+                review: GithubPrReviewState::Outstanding,
+                is_draft: false,
+                fetched_at: UNIX_EPOCH,
+            })
+        ));
+        assert!(should_offer_codex_ci_fix(
+            true,
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                build: GithubPrBuildState::Building,
+                review: GithubPrReviewState::Outstanding,
+                is_draft: false,
+                fetched_at: UNIX_EPOCH,
+            })
+        ));
+        assert!(!should_offer_codex_ci_fix(
+            true,
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                build: GithubPrBuildState::Succeeded,
+                review: GithubPrReviewState::Outstanding,
+                is_draft: false,
+                fetched_at: UNIX_EPOCH,
+            })
+        ));
+        assert!(!should_offer_codex_ci_fix(
+            true,
+            Some(GithubPrStatus {
+                state: GithubPrState::Merged,
+                build: GithubPrBuildState::Failed,
+                review: GithubPrReviewState::Outstanding,
+                is_draft: false,
+                fetched_at: UNIX_EPOCH,
+            })
+        ));
         assert!(should_offer_codex_ci_fix(true, None));
         assert!(!should_offer_codex_ci_fix(false, None));
     }
@@ -2936,12 +2948,11 @@ mod tests {
             "Start from the existing checkout for GitHub issue https://github.com/micronaut-projects/micronaut-kafka/issues/873."
         ));
         assert!(prompt.contains("Primary checkout for this task: /tmp/work/micronaut-kafka-873"));
-        assert!(prompt.contains(
-            "write autonomous state updates to `/tmp/state/task-873.state`"
-        ));
-        assert!(prompt.contains(
-            "write autonomous state updates in the format `<state>:thread-task-873`"
-        ));
+        assert!(prompt.contains("write autonomous state updates to `/tmp/state/task-873.state`"));
+        assert!(
+            prompt
+                .contains("write autonomous state updates in the format `<state>:thread-task-873`")
+        );
         assert!(prompt.contains("Use the existing pull request https://github.com/micronaut-projects/micronaut-kafka/pull/1308."));
         assert!(prompt.contains("`machine-readable-pr`"));
         assert!(prompt.contains("`autonomous-state`"));
@@ -2953,6 +2964,56 @@ mod tests {
         ));
         assert!(prompt.contains("Do not create a new pull request."));
         assert!(prompt.contains("Do not merge the pull request."));
+    }
+
+    #[test]
+    fn github_repository_spec_accepts_repo_and_github_urls() {
+        assert_eq!(
+            github_repository_spec("micronaut-projects/micronaut-kafka").as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
+        assert_eq!(
+            github_repository_spec("https://github.com/micronaut-projects/micronaut-kafka")
+                .as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
+        assert_eq!(
+            github_repository_spec(
+                "https://github.com/micronaut-projects/micronaut-kafka/issues/873"
+            )
+            .as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
+        assert_eq!(
+            github_repository_spec(
+                "https://github.com/micronaut-projects/micronaut-kafka/pull/1308"
+            )
+            .as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
+        assert!(github_repository_spec("https://example.com/not-github/repo").is_none());
+    }
+
+    #[test]
+    fn task_repository_spec_falls_back_to_task_issue_when_workspace_repo_missing() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        let issue_url = "https://github.com/micronaut-projects/micronaut-kafka/issues/873";
+        let task_id = "task-873".to_string();
+        started
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                task_id.clone(),
+                issue_url.to_string(),
+                multicode_lib::WorkspaceTaskSource::Manual,
+            ));
+        started.active_task_id = Some(task_id.clone());
+
+        assert_eq!(
+            task_repository_spec(&started, &task_id).as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
     }
 
     #[test]
@@ -3992,6 +4053,45 @@ mod tests {
         };
 
         assert!(!should_restart_codex_task_for_pr_request(Some(&task_state)));
+    }
+
+    #[test]
+    fn ci_fix_restarts_idle_review_task_session() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("session-1".to_string()),
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            status: Some("Idle".to_string()),
+            ..Default::default()
+        };
+
+        assert!(should_restart_codex_task_for_ci_fix(Some(&task_state)));
+    }
+
+    #[test]
+    fn ci_fix_keeps_busy_working_task_session() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("session-1".to_string()),
+            agent_state: Some(AutomationAgentState::Working),
+            session_status: Some(RootSessionStatus::Busy),
+            status: Some("Active".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!should_restart_codex_task_for_ci_fix(Some(&task_state)));
+    }
+
+    #[test]
+    fn ci_fix_restarts_question_task_session() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("session-1".to_string()),
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Question),
+            status: Some("Idle".to_string()),
+            ..Default::default()
+        };
+
+        assert!(should_restart_codex_task_for_ci_fix(Some(&task_state)));
     }
 
     #[test]

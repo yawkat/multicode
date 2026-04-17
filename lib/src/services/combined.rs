@@ -1063,13 +1063,22 @@ impl CombinedService {
         let task = snapshot
             .task_persistent_snapshot(task_id)
             .ok_or_else(|| format!("workspace task '{task_id}' no longer exists"))?;
-        let assigned_repository = snapshot
-            .persistent
-            .assigned_repository
-            .as_deref()
-            .ok_or_else(|| {
-                format!("workspace '{workspace_key}' does not have an assigned repository")
-            })?;
+        let assigned_repository = resolve_task_repository(snapshot, task).ok_or_else(|| {
+            format!("workspace '{workspace_key}' does not have a repository for task '{task_id}'")
+        })?;
+        if snapshot.persistent.assigned_repository.as_deref() != Some(assigned_repository.as_str())
+        {
+            workspace.update(|next| {
+                if next.persistent.assigned_repository.as_deref()
+                    == Some(assigned_repository.as_str())
+                {
+                    false
+                } else {
+                    next.persistent.assigned_repository = Some(assigned_repository.clone());
+                    true
+                }
+            });
+        }
         let uri = snapshot
             .transient
             .as_ref()
@@ -1077,7 +1086,7 @@ impl CombinedService {
             .ok_or_else(|| {
                 format!("workspace '{workspace_key}' does not have an active runtime")
             })?;
-        self.ensure_workspace_task_checkout(workspace_key, assigned_repository, &task.issue_url)
+        self.ensure_workspace_task_checkout(workspace_key, &assigned_repository, &task.issue_url)
             .await
             .map_err(|err| err.summary())?;
         let existing_session_id = snapshot
@@ -1176,13 +1185,22 @@ impl CombinedService {
         let task = snapshot
             .task_persistent_snapshot(task_id)
             .ok_or_else(|| format!("workspace task '{task_id}' no longer exists"))?;
-        let assigned_repository = snapshot
-            .persistent
-            .assigned_repository
-            .as_deref()
-            .ok_or_else(|| {
-                format!("workspace '{workspace_key}' does not have an assigned repository")
-            })?;
+        let assigned_repository = resolve_task_repository(snapshot, task).ok_or_else(|| {
+            format!("workspace '{workspace_key}' does not have a repository for task '{task_id}'")
+        })?;
+        if snapshot.persistent.assigned_repository.as_deref() != Some(assigned_repository.as_str())
+        {
+            workspace.update(|next| {
+                if next.persistent.assigned_repository.as_deref()
+                    == Some(assigned_repository.as_str())
+                {
+                    false
+                } else {
+                    next.persistent.assigned_repository = Some(assigned_repository.clone());
+                    true
+                }
+            });
+        }
         let uri = snapshot
             .transient
             .as_ref()
@@ -1191,7 +1209,7 @@ impl CombinedService {
                 format!("workspace '{workspace_key}' does not have an active runtime")
             })?;
         let cwd = self
-            .ensure_workspace_task_checkout(workspace_key, assigned_repository, &task.issue_url)
+            .ensure_workspace_task_checkout(workspace_key, &assigned_repository, &task.issue_url)
             .await
             .map_err(|err| err.summary())?;
         let client = CodexAppServerClient::new(uri.clone());
@@ -1360,7 +1378,10 @@ impl CombinedService {
     }
 
     fn is_codex_thread_materialization_error(error: &str) -> bool {
-        error.contains("thread not found") || error.contains("thread not loaded")
+        error.contains("thread not found")
+            || error.contains("thread not loaded")
+            || error.contains("not ready yet")
+            || error.contains("timed out waiting for codex thread")
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2154,6 +2175,25 @@ fn normalize_repository_spec(repository: &str) -> Result<String, CombinedService
         .ok_or_else(|| CombinedServiceError::InvalidRepositorySpec(repository.trim().to_string()))
 }
 
+fn resolve_task_repository(
+    snapshot: &crate::WorkspaceSnapshot,
+    task: &crate::WorkspaceTaskPersistentSnapshot,
+) -> Option<String> {
+    snapshot
+        .persistent
+        .assigned_repository
+        .as_deref()
+        .and_then(super::autonomous_workspace_service::normalize_github_repository_spec)
+        .or_else(|| {
+            super::autonomous_workspace_service::normalize_github_repository_spec(&task.issue_url)
+        })
+        .or_else(|| {
+            task.backing_pr_url
+                .as_deref()
+                .and_then(super::autonomous_workspace_service::normalize_github_repository_spec)
+        })
+}
+
 fn normalize_issue_spec(
     assigned_repository: &str,
     issue: &str,
@@ -2364,6 +2404,7 @@ fn spawn_autonomous_workspace_service(service: CombinedService) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkspaceSnapshot;
     use crate::services::{
         CompareTool, GithubTokenConfig, ToolType,
         config::{CodexApprovalPolicy, CodexNetworkAccess, CodexSandboxMode},
@@ -2584,6 +2625,25 @@ command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
             config.compare.command.as_deref(),
             Some("~/Library/Application Support/JetBrains/Toolbox/scripts/idea")
         );
+    }
+
+    #[test]
+    fn codex_thread_materialization_errors_include_not_ready_variants() {
+        assert!(CombinedService::is_codex_thread_materialization_error(
+            "thread not found: 123"
+        ));
+        assert!(CombinedService::is_codex_thread_materialization_error(
+            "thread not loaded: 123"
+        ));
+        assert!(CombinedService::is_codex_thread_materialization_error(
+            "thread '123' read succeeded but is not ready yet"
+        ));
+        assert!(CombinedService::is_codex_thread_materialization_error(
+            "timed out waiting for codex thread '123' to materialize"
+        ));
+        assert!(!CombinedService::is_codex_thread_materialization_error(
+            "permission denied"
+        ));
     }
 
     #[test]
@@ -6360,6 +6420,40 @@ isolated = ["~/.config/opencode"]
             CombinedService::rewrite_codex_task_prompt_session_id(prompt, None, "new-session");
 
         assert_eq!(rewritten, prompt);
+    }
+
+    #[test]
+    fn resolve_task_repository_falls_back_to_task_issue_or_pr_when_workspace_repo_missing() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        let issue_task = WorkspaceTaskPersistentSnapshot::new(
+            "task-1".to_string(),
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873".to_string(),
+            WorkspaceTaskSource::Manual,
+        );
+        assert_eq!(
+            resolve_task_repository(&snapshot, &issue_task).as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
+
+        let pr_task = WorkspaceTaskPersistentSnapshot::new(
+            "task-2".to_string(),
+            "not-a-github-url".to_string(),
+            WorkspaceTaskSource::Manual,
+        )
+        .with_backing_pr_url(Some(
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308".to_string(),
+        ));
+        assert_eq!(
+            resolve_task_repository(&snapshot, &pr_task).as_deref(),
+            Some("micronaut-projects/micronaut-kafka")
+        );
+
+        snapshot.persistent.assigned_repository =
+            Some("https://github.com/example/repo.git".to_string());
+        assert_eq!(
+            resolve_task_repository(&snapshot, &issue_task).as_deref(),
+            Some("example/repo")
+        );
     }
 
     fn contains_sequence(args: &[String], sequence: &[&str]) -> bool {

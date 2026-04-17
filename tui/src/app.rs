@@ -269,6 +269,29 @@ pub(crate) fn should_restart_codex_task_for_pr_request(
     matches!(task_state.status.as_deref(), Some("NotLoaded"))
 }
 
+pub(crate) fn should_restart_codex_task_for_ci_fix(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> bool {
+    let Some(task_state) = task_state else {
+        return false;
+    };
+
+    if should_restart_codex_task_for_pr_request(Some(task_state)) {
+        return true;
+    }
+
+    if task_state.session_id.is_none() {
+        return false;
+    }
+
+    match task_state.session_status {
+        Some(RootSessionStatus::Busy) => false,
+        Some(RootSessionStatus::Idle) | Some(RootSessionStatus::Question) | None => {
+            task_state.agent_state != Some(AutomationAgentState::Working)
+        }
+    }
+}
+
 pub(crate) fn should_offer_codex_ci_fix(
     has_pr_link: bool,
     pr_status: Option<GithubPrStatus>,
@@ -306,6 +329,11 @@ pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
 }
 
 pub(crate) fn github_repository_url(repository: &str) -> Option<String> {
+    let repository = github_repository_spec(repository)?;
+    Some(format!("https://github.com/{repository}"))
+}
+
+pub(crate) fn github_repository_spec(repository: &str) -> Option<String> {
     let trimmed = repository.trim();
     if trimmed.is_empty() {
         return None;
@@ -318,7 +346,7 @@ pub(crate) fn github_repository_url(repository: &str) -> Option<String> {
         let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
         let owner = segments.next()?;
         let repo = segments.next()?;
-        return Some(format!("https://github.com/{owner}/{repo}"));
+        return Some(format!("{owner}/{repo}"));
     }
 
     let mut segments = trimmed.split('/').filter(|segment| !segment.is_empty());
@@ -328,7 +356,19 @@ pub(crate) fn github_repository_url(repository: &str) -> Option<String> {
         return None;
     }
 
-    Some(format!("https://github.com/{owner}/{repo}"))
+    Some(format!("{owner}/{repo}"))
+}
+
+pub(crate) fn task_repository_spec(snapshot: &WorkspaceSnapshot, task_id: &str) -> Option<String> {
+    if let Some(repository) = snapshot.persistent.assigned_repository.as_deref() {
+        return github_repository_spec(repository);
+    }
+
+    let task = task_persistent_snapshot(snapshot, task_id)?;
+    github_repository_spec(&task.issue_url).or_else(|| {
+        task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+            .and_then(github_repository_spec)
+    })
 }
 
 pub(crate) fn has_available_task_slot(
@@ -1696,6 +1736,7 @@ impl TuiState {
                 self.selected_task_pr_link().is_some(),
                 self.selected_task_pr_status(),
             )
+            && self.selected_task_ci_fix_prompt().is_some()
     }
 
     fn selected_task_ci_fix_prompt(&self) -> Option<String> {
@@ -1703,10 +1744,12 @@ impl TuiState {
         let snapshot = self.selected_workspace_snapshot()?;
         let task_id = self.selected_task_id()?;
         let task = task_persistent_snapshot(snapshot, task_id)?;
-        let assigned_repository = snapshot.persistent.assigned_repository.as_deref()?;
-        let cwd =
-            self.service
-                .workspace_task_checkout_path(workspace_key, assigned_repository, &task.issue_url);
+        let assigned_repository = task_repository_spec(snapshot, task_id)?;
+        let cwd = self.service.workspace_task_checkout_path(
+            workspace_key,
+            &assigned_repository,
+            &task.issue_url,
+        );
         let task_state_path = self
             .service
             .workspace_directory_path()
@@ -1716,7 +1759,7 @@ impl TuiState {
             .join("tasks")
             .join(format!("{task_id}.state"));
         Some(build_codex_fix_ci_prompt(
-            assigned_repository,
+            &assigned_repository,
             &task.issue_url,
             task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
                 .or(task.backing_pr_url.as_deref()),
@@ -1749,7 +1792,7 @@ impl TuiState {
         };
         let previous_snapshot = snapshot.clone();
         let should_restart =
-            should_restart_codex_task_for_pr_request(task_runtime_snapshot(&snapshot, &task_id));
+            should_restart_codex_task_for_ci_fix(task_runtime_snapshot(&snapshot, &task_id));
         let (progress_tx, progress_rx) =
             watch::channel("Preparing PR approval request...".to_string());
         let (result_tx, result_rx) = oneshot::channel();
@@ -1786,14 +1829,16 @@ impl TuiState {
             };
 
             let result = match result {
-                Ok(()) => service
-                    .prompt_task_session(
-                        &workspace_key_for_task,
-                        &snapshot,
-                        &task_id_for_task,
-                        CODEX_AUTO_RESUME_PROMPT,
-                    )
-                    .await,
+                Ok(()) => {
+                    service
+                        .prompt_task_session(
+                            &workspace_key_for_task,
+                            &snapshot,
+                            &task_id_for_task,
+                            CODEX_AUTO_RESUME_PROMPT,
+                        )
+                        .await
+                }
                 Err(err) => Err(err),
             };
 
@@ -1870,24 +1915,36 @@ impl TuiState {
     }
 
     async fn fix_selected_task_ci(&mut self) {
-        if !self.selected_task_can_request_pr_creation() {
+        if !self.selected_task_can_request_ci_fix() {
+            self.status = "Fix CI is unavailable for the selected task".to_string();
             return;
         }
         let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            self.status =
+                "Fix CI is unavailable because the selected workspace could not be resolved"
+                    .to_string();
             return;
         };
         let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            self.status =
+                "Fix CI is unavailable because the selected task could not be resolved".to_string();
             return;
         };
         let Some(prompt) = self.selected_task_ci_fix_prompt() else {
+            self.status = format!(
+                "Fix CI is unavailable for '{task_id}' in workspace '{workspace_key}' because its repository or checkout context could not be resolved"
+            );
             return;
         };
         let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
+            self.status = format!(
+                "Fix CI is unavailable for '{task_id}' in workspace '{workspace_key}' because the latest workspace snapshot is missing"
+            );
             return;
         };
         let previous_snapshot = snapshot.clone();
         let should_restart =
-            should_restart_codex_task_for_pr_request(task_runtime_snapshot(&snapshot, &task_id));
+            should_restart_codex_task_for_ci_fix(task_runtime_snapshot(&snapshot, &task_id));
         let (progress_tx, progress_rx) = watch::channel("Preparing CI fix request...".to_string());
         let (result_tx, result_rx) = oneshot::channel();
         let service = self.service.clone();
@@ -2483,9 +2540,9 @@ impl TuiState {
                             }
                         });
                     }
-                    if should_restart_codex_task_for_pr_request(
-                        task_runtime_snapshot(&snapshot, &task_id),
-                    ) {
+                    if should_restart_codex_task_for_pr_request(task_runtime_snapshot(
+                        &snapshot, &task_id,
+                    )) {
                         service
                             .restart_task_session(
                                 &workspace_key,
@@ -3705,6 +3762,10 @@ impl TuiState {
                     return;
                 }
                 if self.selected_task_id().is_none() {
+                    return;
+                }
+                if !self.selected_task_can_request_ci_fix() {
+                    self.status = "Fix CI is unavailable for the selected task".to_string();
                     return;
                 }
                 self.fix_selected_task_ci().await;
